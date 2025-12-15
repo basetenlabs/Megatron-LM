@@ -472,6 +472,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, context = checkpoint_handler(
                     custom(layer_idx, layer_idx + self.config.recompute_num_layers)
                 )
+                hidden_states.requires_grad_(True)
 
                 layer_idx += self.config.recompute_num_layers
 
@@ -676,6 +677,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
+                torch.cuda.empty_cache()
             else:
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
@@ -708,6 +710,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                    torch.cuda.empty_cache()
 
                     if (
                         torch.is_grad_enabled()
