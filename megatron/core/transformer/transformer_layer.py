@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -32,6 +33,39 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _whetstone_debug_build_enabled() -> bool:
+    return os.environ.get("WHETSTONE_MEGATRON_BUILD_DEBUG", "0") == "1"
+
+
+def _whetstone_log_layer_build(msg: str) -> None:
+    if not _whetstone_debug_build_enabled():
+        return
+    try:
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        global_rank = -1
+    try:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    except Exception:
+        tp_rank = -1
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    except Exception:
+        pp_rank = -1
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        allocated = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved = torch.cuda.memory_reserved(device) / (1024**3)
+        free, total = torch.cuda.mem_get_info(device)
+        mem = (
+            f"alloc_gb={allocated:.2f} reserved_gb={reserved:.2f} "
+            f"free_gb={free / (1024**3):.2f} total_gb={total / (1024**3):.2f}"
+        )
+    else:
+        mem = "cuda_unavailable"
+    print(f"[WHETSTONE_BUILD][rank={global_rank} tp={tp_rank} pp={pp_rank}] {msg} {mem}", flush=True)
 
 
 def get_transformer_layer_offset(
@@ -278,6 +312,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+        _whetstone_log_layer_build(
+            f"TransformerLayer:init_start layer_number={self.layer_number} "
+            f"hidden_size={self.config.hidden_size} num_layers={self.config.num_layers} "
+            f"pipeline_model_parallel_size={self.config.pipeline_model_parallel_size}"
+        )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -347,6 +386,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
+                _whetstone_log_layer_build(
+                    f"TransformerLayer:build_mlp layer_number={self.layer_number} mlp_module={submodules.mlp.module.__name__}"
+                )
                 additional_mlp_kwargs["pg_collection"] = pg_collection
             elif submodules.mlp.module == MLP:
                 assert hasattr(
@@ -367,6 +409,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
+        _whetstone_log_layer_build(
+            f"TransformerLayer:init_done layer_number={self.layer_number} mlp_type={type(self.mlp).__name__}"
+        )
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)

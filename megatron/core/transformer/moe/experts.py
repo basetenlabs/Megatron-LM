@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import os
 import itertools
 from copy import deepcopy
 from functools import partial, wraps
@@ -11,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
@@ -52,6 +53,50 @@ try:
 except ImportError:
 
     HAVE_TE = False
+
+
+def _whetstone_debug_build_enabled() -> bool:
+    return os.environ.get("WHETSTONE_MEGATRON_BUILD_DEBUG", "0") == "1"
+
+
+def _whetstone_rank_triplet() -> str:
+    try:
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        global_rank = -1
+    try:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    except Exception:
+        tp_rank = -1
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    except Exception:
+        pp_rank = -1
+    try:
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+    except Exception:
+        ep_rank = -1
+    return f"rank={global_rank} tp={tp_rank} pp={pp_rank} ep={ep_rank}"
+
+
+def _whetstone_cuda_mem() -> str:
+    if not torch.cuda.is_available():
+        return "cuda_unavailable"
+    device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device) / (1024**3)
+    free, total = torch.cuda.mem_get_info(device)
+    free_gb = free / (1024**3)
+    total_gb = total / (1024**3)
+    return (
+        f"alloc_gb={allocated:.2f} reserved_gb={reserved:.2f} "
+        f"free_gb={free_gb:.2f} total_gb={total_gb:.2f}"
+    )
+
+
+def _whetstone_log_build(msg: str) -> None:
+    if _whetstone_debug_build_enabled():
+        print(f"[WHETSTONE_BUILD][{_whetstone_rank_triplet()}] {msg} {_whetstone_cuda_mem()}", flush=True)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -112,6 +157,12 @@ class GroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.config: TransformerConfig = config
         self.num_local_experts = num_local_experts
+        _whetstone_log_build(
+            "GroupedMLP:init_start "
+            f"num_local_experts={num_local_experts} "
+            f"hidden_size={config.hidden_size} moe_ffn_hidden_size={config.moe_ffn_hidden_size} "
+            f"gated_linear_unit={config.gated_linear_unit} expert_model_parallel_size={config.expert_model_parallel_size}"
+        )
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
@@ -163,6 +214,12 @@ class GroupedMLP(MegatronModule):
 
         fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
+        _whetstone_log_build(
+            "GroupedMLP:partition_sizes "
+            f"tp_size={tp_size} tp_rank={tp_rank} "
+            f"fc1_output_size={fc1_output_size} fc1_output_size_per_partition={fc1_output_size_per_partition} "
+            f"fc2_input_size={fc2_input_size} fc2_input_size_per_partition={fc2_input_size_per_partition}"
+        )
 
         # Note: The current kernel implementations of grouped_gemm
         # does not support transposition with CUTLASS grouped GEMM
@@ -231,6 +288,11 @@ class GroupedMLP(MegatronModule):
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
+        _whetstone_log_build(
+            "GroupedMLP:init_done "
+            f"weight1_shape={tuple(self.weight1.shape)} weight2_shape={tuple(self.weight2.shape)} "
+            f"weight1_numel={self.weight1.numel()} weight2_numel={self.weight2.numel()}"
+        )
 
         def remove_extra_states_check(self, incompatible_keys):
             """
@@ -804,6 +866,25 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
             tp_group=pg_collection.expt_tp,
         )
+
+        if _whetstone_debug_build_enabled():
+            def _param_shapes(module):
+                shapes = []
+                for name, param in module.named_parameters(recurse=False):
+                    shapes.append(f"{name}={tuple(param.shape)}")
+                return ",".join(shapes) if shapes else "none"
+
+            expt_tp_size = utils.get_pg_size(pg_collection.expt_tp)
+            ep_size = utils.get_pg_size(pg_collection.ep)
+            _whetstone_log_build(
+                "TEGroupedMLP:module_shapes "
+                f"num_local_experts={self.num_local_experts} "
+                f"ep_size={ep_size} expt_tp_size={expt_tp_size} "
+                f"fc1_explicit_expert_comm={getattr(self.linear_fc1, 'explicit_expert_comm', None)} "
+                f"fc2_explicit_expert_comm={getattr(self.linear_fc2, 'explicit_expert_comm', None)} "
+                f"fc1_params={_param_shapes(self.linear_fc1)} "
+                f"fc2_params={_param_shapes(self.linear_fc2)}"
+            )
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'

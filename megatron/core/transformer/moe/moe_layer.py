@@ -87,6 +87,7 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        self.token_dispatcher.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -32,6 +33,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -70,6 +73,59 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+        self.layer_number: Optional[int] = None
+        self.debug_logging = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") == "1"
+        debug_ranks = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
+        self.debug_ranks = {
+            int(rank.strip()) for rank in debug_ranks.split(",") if rank.strip()
+        } if debug_ranks else None
+
+    def set_layer_number(self, layer_number: int) -> None:
+        """Set the owning MoE layer number for debug logging."""
+        self.layer_number = layer_number
+
+    def _should_log_debug(self) -> bool:
+        if not self.debug_logging:
+            return False
+        if self.debug_ranks is None:
+            return True
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_rank() in self.debug_ranks
+
+    def _log_alloc_debug(
+        self,
+        phase: str,
+        tensor: Optional[torch.Tensor] = None,
+        *,
+        input_splits: Optional[torch.Tensor] = None,
+        output_splits: Optional[torch.Tensor] = None,
+        output_splits_tp: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Emit lightweight per-layer routing/allocation diagnostics."""
+        if not self._should_log_debug():
+            return
+
+        def _to_list(value: Optional[torch.Tensor]) -> Optional[list[int]]:
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return [int(x) for x in value.tolist()]
+            return [int(x) for x in value]
+
+        tensor_shape = tuple(tensor.shape) if tensor is not None else None
+        tensor_bytes = tensor.numel() * tensor.element_size() if tensor is not None else None
+        logger.info(
+            "MoE alloc debug layer=%s phase=%s tensor_shape=%s tensor_bytes=%s "
+            "input_tokens=%s output_tokens=%s tp_tokens=%s",
+            self.layer_number,
+            phase,
+            tensor_shape,
+            tensor_bytes,
+            None if input_splits is None else sum(_to_list(input_splits)),
+            None if output_splits is None else sum(_to_list(output_splits)),
+            None if output_splits_tp is None else sum(_to_list(output_splits_tp)),
+        )
 
     @abstractmethod
     def dispatch_preprocess(
@@ -623,6 +679,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        self._log_alloc_debug(
+            "dispatch_a2a_input",
+            permutated_local_input_tokens,
+            input_splits=self.input_splits,
+            output_splits=self.output_splits,
+        )
         global_input_tokens = all_to_all(
             self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
@@ -653,6 +715,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 output_split_sizes = None
             else:
                 output_split_sizes = self.output_splits_tp.tolist()
+            self._log_alloc_debug(
+                "dispatch_tp_gather_input",
+                global_input_tokens,
+                output_splits_tp=self.output_splits_tp,
+            )
             global_input_tokens = gather_from_sequence_parallel_region(
                 global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
             )
@@ -689,6 +756,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
+                self._log_alloc_debug("dispatch_sort_input", global_input_tokens)
                 global_input_tokens, global_probs = sort_chunks_by_idxs(
                     global_input_tokens,
                     self.num_global_tokens_per_local_expert.ravel(),
@@ -724,6 +792,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
+                self._log_alloc_debug("combine_sort_input", hidden_states)
                 hidden_states, _ = sort_chunks_by_idxs(
                     hidden_states,
                     self.num_global_tokens_per_local_expert.T.ravel(),
@@ -767,6 +836,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
+        self._log_alloc_debug(
+            "combine_a2a_input",
+            hidden_states,
+            input_splits=self.output_splits,
+            output_splits=self.input_splits,
+        )
         permutated_local_input_tokens = all_to_all(
             self.ep_group, hidden_states, self.input_splits, self.output_splits
         )
