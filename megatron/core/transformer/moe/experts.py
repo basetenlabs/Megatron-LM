@@ -1029,10 +1029,70 @@ class TEGroupedMLP(MegatronModule):
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         else:
+            # --- Expert computation debug ---
+            import os
+            _expert_debug = (
+                os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") == "1"
+                and not getattr(self, '_expert_debug_done', False)
+            )
+            if _expert_debug:
+                self._expert_debug_done = True
+                import torch.distributed as dist
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                _dranks = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
+                _dranks = {int(r) for r in _dranks.split(",") if r.strip()} if _dranks else None
+                if _dranks is None or _rank in _dranks:
+                    def _ew(msg):
+                        df = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+                        if df:
+                            with open(df, "a") as f:
+                                f.write(msg + "\n")
+                        print(f"[WHETSTONE_MOE_ALLOC_DEBUG] {msg}", flush=True)
+                    if intermediate_parallel.numel() > 0:
+                        fc1_flat = intermediate_parallel.float().reshape(-1, intermediate_parallel.shape[-1])
+                        _ew(
+                            f"EXPERT_FC1_OUT rank={_rank} "
+                            f"shape={tuple(intermediate_parallel.shape)} "
+                            f"norm_mean={fc1_flat.norm(dim=1).mean().item():.4f} "
+                            f"norm_max={fc1_flat.norm(dim=1).max().item():.4f} "
+                            f"min={fc1_flat.min().item():.4f} max={fc1_flat.max().item():.4f} "
+                            f"tokens_per_expert={tokens_per_expert} "
+                            f"probs_shape={tuple(permuted_probs.shape)} "
+                            f"probs_min={permuted_probs.min().item():.4f} "
+                            f"probs_max={permuted_probs.max().item():.4f} "
+                            f"probs_first10={permuted_probs.flatten()[:10].tolist()} "
+                            f"token0[:20]={fc1_flat[0,:20].tolist()}"
+                        )
+                    else:
+                        _ew(f"EXPERT_FC1_OUT rank={_rank} shape={tuple(intermediate_parallel.shape)} EMPTY")
+
             intermediate_parallel = bias_act_func(
                 intermediate_parallel, bias_parallel, permuted_probs
             )
+
+            if _expert_debug and (_dranks is None or _rank in _dranks) and intermediate_parallel.numel() > 0:
+                act_flat = intermediate_parallel.float().reshape(-1, intermediate_parallel.shape[-1])
+                _ew(
+                    f"EXPERT_AFTER_ACT rank={_rank} "
+                    f"shape={tuple(intermediate_parallel.shape)} "
+                    f"norm_mean={act_flat.norm(dim=1).mean().item():.4f} "
+                    f"norm_max={act_flat.norm(dim=1).max().item():.4f} "
+                    f"min={act_flat.min().item():.4f} max={act_flat.max().item():.4f} "
+                    f"token0[:20]={act_flat[0,:20].tolist()}"
+                )
+
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+
+            if _expert_debug and (_dranks is None or _rank in _dranks) and output.numel() > 0:
+                out_flat = output.float().reshape(-1, output.shape[-1])
+                _ew(
+                    f"EXPERT_FC2_OUT rank={_rank} "
+                    f"shape={tuple(output.shape)} "
+                    f"norm_mean={out_flat.norm(dim=1).mean().item():.4f} "
+                    f"norm_max={out_flat.norm(dim=1).max().item():.4f} "
+                    f"min={out_flat.min().item():.4f} max={out_flat.max().item():.4f} "
+                    f"token0[:20]={out_flat[0,:20].tolist()}"
+                )
 
         # upad and concat the output
         if self.config.fp8:

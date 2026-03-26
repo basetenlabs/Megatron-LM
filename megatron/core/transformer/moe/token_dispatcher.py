@@ -73,12 +73,16 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+        self.ep_rank = utils.get_pg_rank(self.ep_group)
         self.layer_number: Optional[int] = None
         self.debug_logging = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") == "1"
         debug_ranks = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
         self.debug_ranks = {
             int(rank.strip()) for rank in debug_ranks.split(",") if rank.strip()
         } if debug_ranks else None
+        self._debug_step = 0
+        self._debug_max_steps = int(os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_STEPS", "1"))
+        self._debug_group_info_logged = False
 
     def set_layer_number(self, layer_number: int) -> None:
         """Set the owning MoE layer number for debug logging."""
@@ -113,19 +117,94 @@ class MoETokenDispatcher:
                 return [int(x) for x in value.tolist()]
             return [int(x) for x in value]
 
+        def _expected_output_bytes(
+            split_sizes: Optional[torch.Tensor], tensor: Optional[torch.Tensor]
+        ) -> Optional[int]:
+            if split_sizes is None or tensor is None:
+                return None
+            trailing_numel = 1
+            for dim in tensor.shape[1:]:
+                trailing_numel *= dim
+            return sum(_to_list(split_sizes)) * trailing_numel * tensor.element_size()
+
+        input_splits_list = _to_list(input_splits)
+        output_splits_list = _to_list(output_splits)
+        output_splits_tp_list = _to_list(output_splits_tp)
         tensor_shape = tuple(tensor.shape) if tensor is not None else None
         tensor_bytes = tensor.numel() * tensor.element_size() if tensor is not None else None
-        logger.info(
-            "MoE alloc debug layer=%s phase=%s tensor_shape=%s tensor_bytes=%s "
-            "input_tokens=%s output_tokens=%s tp_tokens=%s",
-            self.layer_number,
-            phase,
-            tensor_shape,
-            tensor_bytes,
-            None if input_splits is None else sum(_to_list(input_splits)),
-            None if output_splits is None else sum(_to_list(output_splits)),
-            None if output_splits_tp is None else sum(_to_list(output_splits_tp)),
+        rank = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+
+        message = (
+            "MoE alloc debug "
+            f"rank={rank} "
+            f"layer={self.layer_number} "
+            f"phase={phase} "
+            f"tensor_shape={tensor_shape} "
+            f"tensor_bytes={tensor_bytes} "
+            f"input_tokens={None if input_splits_list is None else sum(input_splits_list)} "
+            f"output_tokens={None if output_splits_list is None else sum(output_splits_list)} "
+            f"tp_tokens={None if output_splits_tp_list is None else sum(output_splits_tp_list)} "
+            f"input_splits={input_splits_list} "
+            f"output_splits={output_splits_list} "
+            f"output_splits_tp={output_splits_tp_list} "
+            f"expected_ep_output_bytes={_expected_output_bytes(output_splits, tensor)} "
+            f"expected_tp_output_bytes={_expected_output_bytes(output_splits_tp, tensor)}"
         )
+
+        debug_file = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+        if debug_file:
+            with open(debug_file, "a", encoding="utf-8") as f:
+                f.write(message)
+                f.write("\n")
+
+        print(
+            f"[WHETSTONE_MOE_ALLOC_DEBUG] wrote {phase} for rank={rank} layer={self.layer_number}",
+            flush=True,
+        )
+
+    def _write_debug(self, message: str) -> None:
+        """Write a debug message to the debug file AND full stdout (for truss logs)."""
+        debug_file = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+        if debug_file:
+            with open(debug_file, "a", encoding="utf-8") as f:
+                f.write(message)
+                f.write("\n")
+        # Print full message to stdout so it appears in truss train logs
+        print(f"[WHETSTONE_MOE_ALLOC_DEBUG] {message}", flush=True)
+
+    def _log_group_info(self) -> None:
+        """Log process group membership once per rank."""
+        if self._debug_group_info_logged or not self._should_log_debug():
+            return
+        self._debug_group_info_logged = True
+        rank = torch.distributed.get_rank()
+
+        # Get global ranks in each group
+        def _group_ranks(group):
+            try:
+                size = group.size()
+                # Translate local rank to global rank for each member
+                return [
+                    torch.distributed.distributed_c10d.get_global_rank(group, i)
+                    for i in range(size)
+                ]
+            except Exception as e:
+                return f"<error: {e}>"
+
+        ep_ranks = _group_ranks(self.ep_group)
+        tp_ranks = _group_ranks(self.tp_group)
+        tp_ep_ranks = _group_ranks(self.tp_ep_group)
+
+        msg = (
+            f"GROUP_INFO rank={rank} ep_rank={self.ep_rank} tp_rank={self.tp_rank} "
+            f"ep_size={self.ep_size} tp_size={self.tp_size} "
+            f"ep_group_ranks={ep_ranks} "
+            f"tp_group_ranks={tp_ranks} "
+            f"tp_ep_group_ranks={tp_ep_ranks}"
+        )
+        self._write_debug(msg)
 
     @abstractmethod
     def dispatch_preprocess(
@@ -526,6 +605,53 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
+        # --- Detailed preprocess debug logging ---
+        _do_preprocess_debug = (
+            self.debug_logging
+            and self._debug_step < self._debug_max_steps
+            and self._should_log_debug()
+        )
+        if _do_preprocess_debug:
+            self._log_group_info()
+            rank = torch.distributed.get_rank()
+            num_tokens = routing_map.size(0)
+            experts_per_token = routing_map.sum(dim=1)
+            tokens_per_expert = num_local_tokens_per_expert
+            nonzero_experts = (tokens_per_expert > 0).sum().item()
+            top10_vals, top10_idx = tokens_per_expert.topk(min(10, len(tokens_per_expert)))
+            # Group tokens by EP rank
+            grouped = tokens_per_expert.reshape(self.ep_size, self.num_local_experts).sum(dim=1)
+            ep_nonzero = (grouped > 0).sum().item()
+            # Sample first 5 tokens' expert selections
+            sample_routes = []
+            for t in range(min(5, num_tokens)):
+                selected = routing_map[t].nonzero(as_tuple=True)[0].tolist()
+                sample_routes.append(selected)
+            # Count unique expert sets across all tokens
+            unique_sets = set()
+            for t in range(min(1000, num_tokens)):
+                sel = tuple(sorted(routing_map[t].nonzero(as_tuple=True)[0].tolist()))
+                unique_sets.add(sel)
+            self._write_debug(
+                f"PREPROCESS rank={rank} layer={self.layer_number} step={self._debug_step} "
+                f"routing_map_shape={tuple(routing_map.shape)} "
+                f"num_local_tokens={num_tokens} "
+                f"num_experts={self.num_experts} num_local_experts={self.num_local_experts} "
+                f"ep_size={self.ep_size} tp_size={self.tp_size} "
+                f"local_expert_indices=[{self.local_expert_indices[0]}..{self.local_expert_indices[-1]}] "
+                f"experts_per_token_min={experts_per_token.min().item()} "
+                f"experts_per_token_max={experts_per_token.max().item()} "
+                f"experts_per_token_mean={experts_per_token.float().mean().item():.1f} "
+                f"total_token_expert_pairs={tokens_per_expert.sum().item()} "
+                f"nonzero_experts={nonzero_experts}/{self.num_experts} "
+                f"ep_ranks_with_tokens={ep_nonzero}/{self.ep_size} "
+                f"top10_expert_indices={top10_idx.tolist()} "
+                f"top10_expert_counts={top10_vals.tolist()} "
+                f"tokens_per_ep_rank={grouped.tolist()} "
+                f"sample_token_routes={sample_routes} "
+                f"unique_expert_sets_in_first_1k={len(unique_sets)}"
+            )
+
         if (
             self.config.moe_expert_capacity_factor is not None
             or self.config.moe_router_padding_for_fp8
@@ -551,13 +677,28 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
+            raw_gathered = gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert, group=self.tp_ep_group
+            )
             num_global_tokens_per_expert = (
-                gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
-                )
+                raw_gathered
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
+
+            if _do_preprocess_debug:
+                # Verify gather: raw_gathered has ep_size*tp_size chunks of num_experts
+                # Each chunk should sum to that source rank's total token-expert pairs
+                raw_reshaped = raw_gathered.reshape(self.ep_size * self.tp_size, self.num_experts)
+                per_source_sums = raw_reshaped.sum(dim=1)
+                self._write_debug(
+                    f"GATHER_VERIFY rank={rank} layer={self.layer_number} "
+                    f"raw_gathered_shape={tuple(raw_gathered.shape)} "
+                    f"reshaped_to=({self.ep_size}, {self.tp_size}, {self.num_experts}) "
+                    f"per_source_total_pairs={per_source_sums.tolist()} "
+                    f"grand_total_pairs={per_source_sums.sum().item()}"
+                )
+
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -574,6 +715,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits_tp = num_global_tokens_per_rank.sum(axis=1)
             # [tp_size, ep_size, num_local_experts] -> [num_local_experts]
             num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
+
+            if _do_preprocess_debug:
+                self._write_debug(
+                    f"SPLITS rank={rank} layer={self.layer_number} "
+                    f"input_splits={self.input_splits.tolist()} "
+                    f"input_splits_sum={self.input_splits.sum().item()} "
+                    f"output_splits={self.output_splits.tolist()} "
+                    f"output_splits_sum={self.output_splits.sum().item()} "
+                    f"output_splits_tp={self.output_splits_tp.tolist() if self.output_splits_tp is not None else None} "
+                    f"num_tokens_per_local_expert={num_tokens_per_local_expert.tolist()} "
+                    f"local_expert_indices=[{self.local_expert_indices[0]}..{self.local_expert_indices[-1]}]"
+                )
 
             # A synchronization is needed before expert parallel AlltoAll communication
             # to get the `input_splits` and `output_splits` CPU values.
@@ -864,6 +1017,39 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
             self.shared_experts.post_forward_comm()
 
+        # --- Debug: log what comes back from reverse all-to-all before unpermute ---
+        _do_combine_debug = (
+            self.debug_logging
+            and self._debug_step < self._debug_max_steps
+            and self._should_log_debug()
+        )
+        if _do_combine_debug:
+            rank = torch.distributed.get_rank()
+            pf = permutated_local_input_tokens.float()
+            pf_flat = pf.reshape(-1, pf.shape[-1])
+            # How many expert contributions per token?
+            routing_map = self.routing_map  # [num_local_tokens, num_experts]
+            experts_per_token = routing_map.sum(dim=1)  # should be topk=8 for each
+            self._write_debug(
+                f"COMBINE_PRE_UNPERMUTE rank={rank} layer={self.layer_number} "
+                f"permuted_shape={tuple(permutated_local_input_tokens.shape)} "
+                f"num_permuted_tokens={pf_flat.shape[0]} "
+                f"norm_mean={pf_flat.norm(dim=1).mean().item():.4f} "
+                f"norm_max={pf_flat.norm(dim=1).max().item():.4f} "
+                f"min={pf_flat.min().item():.6f} max={pf_flat.max().item():.6f} "
+                f"routing_map_shape={tuple(routing_map.shape)} "
+                f"experts_per_token_min={experts_per_token.min().item()} "
+                f"experts_per_token_max={experts_per_token.max().item()} "
+                f"experts_per_token_mean={experts_per_token.float().mean().item():.1f} "
+                f"restore_shape={self.hidden_shape_before_permute} "
+                f"reversed_mapping_shape={tuple(self.reversed_local_input_permutation_mapping.shape)} "
+                f"reversed_mapping_min={self.reversed_local_input_permutation_mapping.min().item()} "
+                f"reversed_mapping_max={self.reversed_local_input_permutation_mapping.max().item()} "
+                f"token0[:10]={pf_flat[0,:10].tolist()} "
+                f"token1[:10]={pf_flat[1,:10].tolist() if pf_flat.shape[0] > 1 else 'N/A'} "
+                f"per_token_norms_first20={pf_flat[:20].norm(dim=1).tolist()}"
+            )
+
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(
             permutated_local_input_tokens,
@@ -874,6 +1060,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             drop_and_pad=self.drop_and_pad,
         )
 
+        if _do_combine_debug:
+            out_flat = output.float().reshape(-1, output.shape[-1])
+            self._write_debug(
+                f"COMBINE_POST_UNPERMUTE rank={rank} layer={self.layer_number} "
+                f"output_shape={tuple(output.shape)} "
+                f"norm_mean={out_flat.norm(dim=1).mean().item():.4f} "
+                f"norm_max={out_flat.norm(dim=1).max().item():.4f} "
+                f"token0[:10]={out_flat[0,:10].tolist()} "
+                f"per_token_norms={out_flat[:20].norm(dim=1).tolist()}"
+            )
+
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
@@ -881,6 +1078,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        # Increment debug step counter after each complete forward pass through this layer
+        if self.debug_logging:
+            self._debug_step += 1
+
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

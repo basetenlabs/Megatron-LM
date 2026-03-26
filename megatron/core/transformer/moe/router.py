@@ -555,6 +555,85 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
+        # --- Router debug logging ---
+        import os
+        if (
+            os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") == "1"
+            and not getattr(self, '_router_debug_done', False)
+        ):
+            self._router_debug_done = True
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            debug_ranks_env = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
+            debug_ranks = {int(r) for r in debug_ranks_env.split(",") if r.strip()} if debug_ranks_env else None
+            if debug_ranks is None or rank in debug_ranks:
+                w = self.weight.data.float()
+                inp = input.float()
+                lg = logits.float()
+                bias = self.expert_bias if self.expert_bias is not None else None
+
+                def _write(msg):
+                    debug_file = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+                    if debug_file:
+                        with open(debug_file, "a") as f:
+                            f.write(msg + "\n")
+                    print(f"[WHETSTONE_MOE_ALLOC_DEBUG] {msg}", flush=True)
+
+                # Gate weight: first 5 experts, first 10 hidden dims
+                _write(
+                    f"ROUTER_WEIGHT rank={rank} layer={self.layer_number} "
+                    f"shape={tuple(w.shape)} dtype={self.weight.dtype} "
+                    f"weight[0,:10]={w[0,:10].tolist()} "
+                    f"weight[1,:10]={w[1,:10].tolist()} "
+                    f"weight[383,:10]={w[383,:10].tolist() if w.shape[0] > 383 else 'N/A'} "
+                    f"per_expert_norms={w.norm(dim=1).tolist()}"
+                )
+
+                # Expert bias values
+                if bias is not None:
+                    _write(
+                        f"ROUTER_BIAS rank={rank} layer={self.layer_number} "
+                        f"shape={tuple(bias.shape)} dtype={bias.dtype} "
+                        f"values={bias.float().tolist()}"
+                    )
+
+                # Input hidden states: first 3 tokens, first 10 dims
+                inp_flat = inp.reshape(-1, inp.shape[-1])
+                _write(
+                    f"ROUTER_INPUT rank={rank} layer={self.layer_number} "
+                    f"shape={tuple(input.shape)} num_tokens={inp_flat.shape[0]} "
+                    f"token0[:10]={inp_flat[0,:10].tolist()} "
+                    f"token1[:10]={inp_flat[1,:10].tolist() if inp_flat.shape[0] > 1 else 'N/A'} "
+                    f"token_last[:10]={inp_flat[-1,:10].tolist()} "
+                    f"per_token_norms_first20={inp_flat[:20].norm(dim=1).tolist()} "
+                    f"has_nan={torch.isnan(inp_flat).any().item()} "
+                    f"has_inf={torch.isinf(inp_flat).any().item()}"
+                )
+
+                # Logits: first 3 tokens, all 384 expert logits (this is what determines routing)
+                lg_flat = lg.reshape(-1, lg.shape[-1])
+                _write(
+                    f"ROUTER_LOGITS rank={rank} layer={self.layer_number} "
+                    f"shape={tuple(logits.shape)} "
+                    f"token0_logits={lg_flat[0].tolist()} "
+                    f"token1_logits={lg_flat[1].tolist() if lg_flat.shape[0] > 1 else 'N/A'} "
+                    f"token_last_logits={lg_flat[-1].tolist()}"
+                )
+
+                # Summary stats
+                expert_norms = w.norm(dim=1)
+                token_logit_std = lg_flat.std(dim=1)
+                _write(
+                    f"ROUTER_SUMMARY rank={rank} layer={self.layer_number} "
+                    f"weight_norm={w.norm().item():.2f} "
+                    f"expert_norms_min={expert_norms.min().item():.4f} max={expert_norms.max().item():.4f} "
+                    f"input_norm_mean={inp_flat.norm(dim=1).mean().item():.2f} "
+                    f"logits_min={lg_flat.min().item():.4f} max={lg_flat.max().item():.4f} "
+                    f"mean={lg_flat.mean().item():.4f} std={lg_flat.std().item():.4f} "
+                    f"token_logit_diversity_mean={token_logit_std.mean().item():.4f} "
+                    f"token_logit_diversity_min={token_logit_std.min().item():.4f}"
+                )
+
         probs, routing_map = self.routing(logits)
 
         return probs, routing_map

@@ -465,6 +465,52 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    def _log_collapse_debug(self, tag, hidden_states):
+        """Log pairwise cosine similarity and actual tensor values."""
+        import os
+        if (
+            os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") != "1"
+            or getattr(self, '_collapse_debug_done', False)
+        ):
+            return
+        import torch
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        debug_ranks_env = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
+        debug_ranks = {int(r) for r in debug_ranks_env.split(",") if r.strip()} if debug_ranks_env else None
+        if debug_ranks is not None and rank not in debug_ranks:
+            return
+
+        def _write(msg):
+            debug_file = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+            if debug_file:
+                with open(debug_file, "a") as f:
+                    f.write(msg + "\n")
+            print(f"[WHETSTONE_MOE_ALLOC_DEBUG] {msg}", flush=True)
+
+        hs = hidden_states.float().reshape(-1, hidden_states.shape[-1])
+        n = min(20, hs.shape[0])
+        sample = hs[:n]
+        norms = sample.norm(dim=1)
+        normed = sample / (norms.unsqueeze(1) + 1e-8)
+        cos = normed @ normed.T
+        mean_cos = (cos.sum() - n) / (n * (n - 1)) if n > 1 else 1.0
+        has_nan = torch.isnan(hs).any().item()
+        has_inf = torch.isinf(hs).any().item()
+        _write(
+            f"COLLAPSE rank={rank} layer={self.layer_number} tag={tag} "
+            f"shape={tuple(hidden_states.shape)} "
+            f"mean_cos={mean_cos:.6f} norm_mean={norms.mean().item():.4f} norm_std={norms.std().item():.4f} "
+            f"has_nan={has_nan} has_inf={has_inf} "
+            f"min={hs.min().item():.6f} max={hs.max().item():.6f} "
+            f"mean={hs.mean().item():.6f} std={hs.std().item():.6f} "
+            f"token0[:20]={hs[0,:20].tolist()} "
+            f"token1[:20]={hs[1,:20].tolist() if hs.shape[0] > 1 else 'N/A'} "
+            f"token2[:20]={hs[2,:20].tolist() if hs.shape[0] > 2 else 'N/A'} "
+            f"token_last[:20]={hs[-1,:20].tolist()} "
+            f"per_token_norms={norms.tolist()}"
+        )
+
     def forward(self, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
@@ -476,8 +522,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
+
+        self._log_collapse_debug("layer_input", args[0])
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        self._log_collapse_debug("after_attn_residual", hidden_states)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        self._log_collapse_debug("after_mlp_residual", output)
+        self._collapse_debug_done = True
         return output, context
 
     def _forward_attention(
@@ -539,6 +590,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
+        self._log_collapse_debug("after_input_layernorm", input_layernorm_output)
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -554,6 +607,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+        # Log raw attention output before residual add
+        self._log_collapse_debug("attn_output_raw", attention_output_with_bias[0])
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -620,6 +675,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
+        self._log_collapse_debug("after_pre_mlp_layernorm", pre_mlp_layernorm_output)
+
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
@@ -661,6 +718,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+
+        # Log raw MLP/MoE output before residual add
+        self._log_collapse_debug("mlp_output_raw", mlp_output_with_bias[0])
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

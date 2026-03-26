@@ -271,11 +271,121 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
+            # --- MoE layer debug: track hidden state norms ---
+            import os
+            _moe_debug = (
+                os.getenv("WHETSTONE_MOE_ALLOC_DEBUG", "0") == "1"
+                and not getattr(self, '_moe_layer_debug_done', False)
+            )
+            if _moe_debug:
+                self._moe_layer_debug_done = True
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                debug_ranks_env = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_RANKS", "").strip()
+                debug_ranks = {int(r) for r in debug_ranks_env.split(",") if r.strip()} if debug_ranks_env else None
+                if debug_ranks is None or rank in debug_ranks:
+                    def _write(msg):
+                        debug_file = os.getenv("WHETSTONE_MOE_ALLOC_DEBUG_FILE", "").strip()
+                        if debug_file:
+                            with open(debug_file, "a") as f:
+                                f.write(msg + "\n")
+                        print(f"[WHETSTONE_MOE_ALLOC_DEBUG] {msg}", flush=True)
+
+                    hs_flat = hidden_states.float().reshape(-1, hidden_states.shape[-1])
+                    in_norms = hs_flat.norm(dim=1)
+                    has_nan = torch.isnan(hs_flat).any().item()
+                    has_inf = torch.isinf(hs_flat).any().item()
+                    # Pairwise cosine similarity of first 20 tokens
+                    n_sample = min(20, hs_flat.shape[0])
+                    sample = hs_flat[:n_sample]
+                    sample_normed = sample / (sample.norm(dim=1, keepdim=True) + 1e-8)
+                    cos_matrix = sample_normed @ sample_normed.T
+                    mean_cos = (cos_matrix.sum() - n_sample) / (n_sample * (n_sample - 1)) if n_sample > 1 else 1.0
+
+                    _write(
+                        f"MOE_HIDDEN rank={rank} layer={self.layer_number} phase=input "
+                        f"shape={tuple(hidden_states.shape)} "
+                        f"norm_mean={in_norms.mean().item():.2f} norm_std={in_norms.std().item():.2f} "
+                        f"has_nan={has_nan} has_inf={has_inf} "
+                        f"mean_pairwise_cos={mean_cos:.4f} "
+                        f"token0[:20]={hs_flat[0,:20].tolist()} "
+                        f"token1[:20]={hs_flat[1,:20].tolist() if hs_flat.shape[0] > 1 else 'N/A'} "
+                        f"token_last[:20]={hs_flat[-1,:20].tolist()} "
+                        f"per_token_norms_first20={in_norms[:20].tolist()}"
+                    )
+
             shared_expert_output = self.shared_experts_compute(hidden_states)
+
+            # --- Log shared expert output and expert weights ---
+            if _moe_debug and (debug_ranks is None or rank in debug_ranks):
+                if shared_expert_output is not None:
+                    se = shared_expert_output.float().reshape(-1, shared_expert_output.shape[-1])
+                    se_norms = se.norm(dim=1)
+                    _write(
+                        f"MOE_SHARED_OUTPUT rank={rank} layer={self.layer_number} "
+                        f"shape={tuple(shared_expert_output.shape)} "
+                        f"norm_mean={se_norms.mean().item():.4f} norm_max={se_norms.max().item():.4f} "
+                        f"token0[:20]={se[0,:20].tolist()} "
+                        f"per_token_norms={se_norms[:20].tolist()}"
+                    )
+                else:
+                    _write(f"MOE_SHARED_OUTPUT rank={rank} layer={self.layer_number} shared_expert_output=None")
+
+                # Expert weights — enumerate all params to find the actual names
+                experts = self.experts
+                param_info = []
+                all_norms = {}
+                sample_values = {}
+                for name, param in experts.named_parameters():
+                    pf = param.data.float()
+                    all_norms[name] = pf.norm().item()
+                    if len(sample_values) < 6:  # first 6 params
+                        sample_values[name] = {
+                            'shape': tuple(param.shape),
+                            'dtype': str(param.dtype),
+                            'norm': pf.norm().item(),
+                            'values': pf.reshape(-1)[:10].tolist(),
+                        }
+                # Summary: group norms by param type
+                fc1_norms = {k: v for k, v in all_norms.items() if 'fc1' in k or 'weight1' in k}
+                fc2_norms = {k: v for k, v in all_norms.items() if 'fc2' in k or 'weight2' in k}
+                _write(
+                    f"MOE_EXPERT_WEIGHTS rank={rank} layer={self.layer_number} "
+                    f"num_local_experts={self.num_local_experts} "
+                    f"local_expert_indices=[{self.local_expert_indices[0]}..{self.local_expert_indices[-1]}] "
+                    f"total_params={len(all_norms)} "
+                    f"fc1_norms={fc1_norms} "
+                    f"fc2_norms={fc2_norms} "
+                    f"sample_params={sample_values}"
+                )
+
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+
+            # --- Log routed expert output BEFORE adding shared expert ---
+            if _moe_debug and (debug_ranks is None or rank in debug_ranks):
+                # output here is after token_combine + combine_postprocess but BEFORE combine adds shared
+                # Actually output is from routed_experts_compute which returns after combine_preprocess
+                # We need to look at the combine method... output at this point is PRE-combine (before a2a back)
+                # Let me log what combine() will produce
+                pass
+
             output = self.combine(output, shared_expert_output)
+
+            # --- Log routed+shared combined output ---
+            if _moe_debug and (debug_ranks is None or rank in debug_ranks):
+                out_flat = output.float().reshape(-1, output.shape[-1])
+                out_norms = out_flat.norm(dim=1)
+                _write(
+                    f"MOE_COMBINED_OUTPUT rank={rank} layer={self.layer_number} "
+                    f"shape={tuple(output.shape)} "
+                    f"norm_mean={out_norms.mean().item():.4f} norm_max={out_norms.max().item():.4f} "
+                    f"token0[:20]={out_flat[0,:20].tolist()} "
+                    f"token1[:20]={out_flat[1,:20].tolist() if out_flat.shape[0] > 1 else 'N/A'} "
+                    f"per_token_norms={out_norms[:20].tolist()}"
+                )
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
