@@ -588,8 +588,25 @@ class CheckpointFunction(torch.autograd.Function):
                 args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
             )
 
-        # Store everything.
-        ctx.save_for_backward(*args)
+        # Store tensor inputs through autograd and keep non-tensor metadata on
+        # the context.  Some model paths (for example Nemotron-H MTP with
+        # packed sequences) pass metadata objects such as PackedSeqParams
+        # through activation checkpointing.  torch.autograd.Function
+        # save_for_backward accepts tensors only, but the metadata is still
+        # needed to replay the forward during backward.
+        tensor_arg_indices = []
+        tensor_args = []
+        non_tensor_args = {}
+        for i, arg in enumerate(args):
+            if torch.is_tensor(arg):
+                tensor_arg_indices.append(i)
+                tensor_args.append(arg)
+            else:
+                non_tensor_args[i] = arg
+        ctx.num_args = len(args)
+        ctx.tensor_arg_indices = tensor_arg_indices
+        ctx.non_tensor_args = non_tensor_args
+        ctx.save_for_backward(*tensor_args)
 
         _unset_checkpointing()
         return outputs
@@ -605,7 +622,15 @@ class CheckpointFunction(torch.autograd.Function):
             )
         _set_checkpointing()
 
-        inputs = ctx.saved_tensors
+        inputs = [None] * ctx.num_args
+        saved_tensor_iter = iter(ctx.saved_tensors)
+        tensor_arg_indices = set(ctx.tensor_arg_indices)
+        for i in range(ctx.num_args):
+            if i in tensor_arg_indices:
+                inputs[i] = next(saved_tensor_iter)
+            else:
+                inputs[i] = ctx.non_tensor_args[i]
+        inputs = tuple(inputs)
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
@@ -628,7 +653,7 @@ class CheckpointFunction(torch.autograd.Function):
             *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
         )
         torch.autograd.backward(outputs, args)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs)
 
         _unset_checkpointing()
         return (None, None) + grads
