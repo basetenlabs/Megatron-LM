@@ -79,6 +79,22 @@ def _debug_optimizer(message: str, **kwargs) -> None:
     print(' '.join(str(p) for p in parts), flush=True)
 
 
+def _skip_grad_norm() -> bool:
+    """Return whether to skip ChainedOptimizer grad-norm collectives.
+
+    Nemotron-H LoRA smoke runs have been observed to wedge in the chained
+    optimizer's gradient-statistics all-reduce before the first optimizer step
+    completes. This escape hatch lets those runs progress while we keep the
+    narrower optimizer diagnostics in place.
+    """
+    return os.environ.get('SWIFT_SKIP_GRAD_NORM', '').strip().lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
+
+
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
 ):
@@ -1416,9 +1432,17 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        _debug_optimizer('chained_step_before_get_grad_norm')
-        grad_norm = self.get_grad_norm()
-        _debug_optimizer('chained_step_after_get_grad_norm', grad_norm=grad_norm)
+        skip_grad_norm = _skip_grad_norm()
+        if skip_grad_norm:
+            grad_norm = 0.0
+            _debug_optimizer(
+                'chained_step_skip_get_grad_norm',
+                reason='SWIFT_SKIP_GRAD_NORM',
+            )
+        else:
+            _debug_optimizer('chained_step_before_get_grad_norm')
+            grad_norm = self.get_grad_norm()
+            _debug_optimizer('chained_step_after_get_grad_norm', grad_norm=grad_norm)
 
         # Clip gradients.
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
@@ -1434,6 +1458,13 @@ class ChainedOptimizer(MegatronOptimizer):
                 clip_grad=getattr(optimizer.config, 'clip_grad', None),
             )
             if len(parameters) == 0:
+                continue
+            if skip_grad_norm:
+                _debug_optimizer(
+                    'chained_step_skip_clip_child',
+                    optimizer_idx=optimizer_idx,
+                    reason='SWIFT_SKIP_GRAD_NORM',
+                )
                 continue
             if optimizer.config.clip_grad > 0.0:
                 _debug_optimizer('chained_step_before_clip_child', optimizer_idx=optimizer_idx)
