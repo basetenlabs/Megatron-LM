@@ -5,6 +5,7 @@
 import copy
 import logging
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
@@ -53,6 +54,29 @@ from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+
+def _debug_optimizer(message: str, **kwargs) -> None:
+    """Print low-volume optimizer boundary logs for distributed hang debugging."""
+    enabled = os.environ.get('SWIFT_DEBUG_OPTIMIZER', os.environ.get('SWIFT_DEBUG_TRAIN_LOOP', ''))
+    if enabled.strip().lower() not in {'1', 'true', 'yes', 'on'}:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else int(os.environ.get('RANK', -1))
+    except Exception:
+        rank = os.environ.get('RANK', '?')
+    parts = [f'[SWIFT_DEBUG_OPTIMIZER rank={rank} local_rank={os.environ.get("LOCAL_RANK", "?")}]', message]
+    for key, value in kwargs.items():
+        try:
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    value = value.item()
+                else:
+                    value = f'tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})'
+        except Exception:
+            pass
+        parts.append(f'{key}={value}')
+    print(' '.join(str(p) for p in parts), flush=True)
 
 
 def _zero_grad_group_helper(
@@ -562,16 +586,20 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         """Step the optimizer with ready gradients, return successful."""
         timers = self.config.timers
         # Step the optimizer.
+        _debug_optimizer('mixed_precision_step_with_ready_grads_begin', optimizer_type=type(self).__name__, is_stub=getattr(self, 'is_stub_optimizer', None))
         if timers is not None:
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
+            _debug_optimizer('mixed_precision_before_inner_optimizer_step', inner_optimizer_type=type(self.optimizer).__name__)
             self.optimizer.step()
+            _debug_optimizer('mixed_precision_after_inner_optimizer_step')
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
         # Update params from main params.
+        _debug_optimizer('mixed_precision_before_copy_main_to_model_params')
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -588,17 +616,21 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
+        _debug_optimizer('mixed_precision_step_with_ready_grads_end')
         return True
 
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
 
+        _debug_optimizer('mixed_precision_step_begin', optimizer_type=type(self).__name__)
         found_inf_flag = self.prepare_grads()
+        _debug_optimizer('mixed_precision_after_prepare_grads', found_inf_flag=found_inf_flag)
         if found_inf_flag:
             return False, None, None
 
         # Clip the main gradients.
+        _debug_optimizer('mixed_precision_before_clip_grad_norm', clip_grad=self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -608,8 +640,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
+        _debug_optimizer('mixed_precision_after_clip_grad_norm', grad_norm=grad_norm)
 
         # Count the zeros in the grads.
+        _debug_optimizer('mixed_precision_before_count_zeros', log_num_zeros=self.config.log_num_zeros_in_grad)
         if timers is not None:
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -617,10 +651,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
         if timers is not None:
             timers('optimizer-count-zeros').stop()
+        _debug_optimizer('mixed_precision_after_count_zeros', num_zeros_in_grad=num_zeros_in_grad)
 
+        _debug_optimizer('mixed_precision_before_step_with_ready_grads')
         success = self.step_with_ready_grads()
+        _debug_optimizer('mixed_precision_after_step_with_ready_grads', success=success)
 
         # Successful update.
+        _debug_optimizer('mixed_precision_step_end', success=success, grad_norm=grad_norm)
         return success, grad_norm, num_zeros_in_grad
 
 
@@ -944,10 +982,12 @@ class FP32Optimizer(MegatronOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         if self.is_stub_optimizer:
+            _debug_optimizer('fp32_step_with_ready_grads_stub')
             return True
         timers = self.config.timers
 
         # Update parameters.
+        _debug_optimizer('fp32_step_with_ready_grads_begin', inner_optimizer_type=type(self.optimizer).__name__)
         if timers is not None:
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -956,6 +996,7 @@ class FP32Optimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
+        _debug_optimizer('fp32_step_with_ready_grads_end')
         return True
 
     @torch.no_grad()
@@ -964,11 +1005,14 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
         timers = self.config.timers
 
+        _debug_optimizer('fp32_step_begin', optimizer_type=type(self).__name__)
         found_inf_flag = self.prepare_grads()
+        _debug_optimizer('fp32_after_prepare_grads', found_inf_flag=found_inf_flag)
         if found_inf_flag:
             return False, None, None
 
         # Clip gradients.
+        _debug_optimizer('fp32_before_clip_grad_norm', clip_grad=self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -978,8 +1022,10 @@ class FP32Optimizer(MegatronOptimizer):
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
+        _debug_optimizer('fp32_after_clip_grad_norm', grad_norm=grad_norm)
 
         # Count the zeros in the grads.
+        _debug_optimizer('fp32_before_count_zeros', log_num_zeros=self.config.log_num_zeros_in_grad)
         if timers is not None:
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
@@ -987,10 +1033,14 @@ class FP32Optimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         if timers is not None:
             timers('optimizer-count-zeros').stop()
+        _debug_optimizer('fp32_after_count_zeros', num_zeros_in_grad=num_zeros_in_grad)
 
+        _debug_optimizer('fp32_before_step_with_ready_grads')
         success = self.step_with_ready_grads()
+        _debug_optimizer('fp32_after_step_with_ready_grads', success=success)
 
         # No overflow for FP32 optimizer.
+        _debug_optimizer('fp32_step_end', success=success, grad_norm=grad_norm)
         return success, grad_norm, num_zeros_in_grad
 
     def reload_model_params(self, state_dict=None):
@@ -1241,23 +1291,53 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
+        _debug_optimizer(
+            'chained_prepare_grads_begin',
+            n_optimizers=len(self.chained_optimizers),
+            optimizer_types=[type(opt).__name__ for opt in self.chained_optimizers],
+        )
         found_inf_flag = False
-        for optimizer in self.chained_optimizers:
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            _debug_optimizer(
+                'chained_prepare_grads_before_child',
+                optimizer_idx=optimizer_idx,
+                optimizer_type=type(optimizer).__name__,
+            )
             found_inf_flag |= optimizer.prepare_grads()
+            _debug_optimizer(
+                'chained_prepare_grads_after_child',
+                optimizer_idx=optimizer_idx,
+                found_inf_flag=found_inf_flag,
+            )
 
+        _debug_optimizer('chained_prepare_grads_end', found_inf_flag=found_inf_flag)
         return found_inf_flag
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
+        _debug_optimizer('chained_step_with_ready_grads_begin', n_optimizers=len(self.chained_optimizers))
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            _debug_optimizer(
+                'chained_step_with_ready_grads_before_child',
+                optimizer_idx=optimizer_idx,
+                optimizer_type=type(optimizer).__name__,
+            )
             success &= optimizer.step_with_ready_grads()
+            _debug_optimizer(
+                'chained_step_with_ready_grads_after_child',
+                optimizer_idx=optimizer_idx,
+                success=success,
+            )
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
                 assert success
                 assert len(optimizer.model_chunks) == 1
+                _debug_optimizer('chained_step_with_ready_grads_before_overlap_param_sync', optimizer_idx=optimizer_idx)
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+                _debug_optimizer('chained_step_with_ready_grads_after_overlap_param_sync', optimizer_idx=optimizer_idx)
 
+        _debug_optimizer('chained_step_with_ready_grads_end', success=success)
         return success
 
     def grads_states_parallel_group_is_shared(self):
@@ -1277,29 +1357,39 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
+        _debug_optimizer('chained_get_grad_norm_begin', n_optimizers=len(self.chained_optimizers))
         if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_grad_norm()
+            grad_norm = self.chained_optimizers[0].get_grad_norm()
+            _debug_optimizer('chained_get_grad_norm_end_single', grad_norm=grad_norm)
+            return grad_norm
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
                 grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+            _debug_optimizer('chained_get_grad_norm_before_shared_reduce', n_grads=len(grads_for_norm))
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
+            _debug_optimizer('chained_get_grad_norm_after_shared_reduce', grad_norm=grad_norm)
         else:
             grad_norms = []
-            for optimizer in self.chained_optimizers:
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                _debug_optimizer('chained_get_grad_norm_before_child', optimizer_idx=optimizer_idx)
                 _grad_norm = optimizer.get_grad_norm()
+                _debug_optimizer('chained_get_grad_norm_after_child', optimizer_idx=optimizer_idx, grad_norm=_grad_norm)
                 grad_norms += [_grad_norm if _grad_norm else 0.0]
             grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+        _debug_optimizer('chained_get_grad_norm_end', grad_norm=grad_norm)
         return grad_norm
 
     @torch.no_grad()
     def count_zeros(self):
+        _debug_optimizer('chained_count_zeros_begin')
         if self.grads_states_parallel_group_is_shared():
             params = []
             for optimizer in self.chained_optimizers:
                 params += optimizer.get_parameters()
+            _debug_optimizer('chained_count_zeros_before_shared_reduce', n_params=len(params))
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
@@ -1316,20 +1406,37 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        _debug_optimizer(
+            'chained_step_begin',
+            n_optimizers=len(self.chained_optimizers),
+            optimizer_types=[type(opt).__name__ for opt in self.chained_optimizers],
+        )
         found_inf_flag = self.prepare_grads()
+        _debug_optimizer('chained_step_after_prepare_grads', found_inf_flag=found_inf_flag)
         if found_inf_flag:
             return False, None, None
 
+        _debug_optimizer('chained_step_before_get_grad_norm')
         grad_norm = self.get_grad_norm()
+        _debug_optimizer('chained_step_after_get_grad_norm', grad_norm=grad_norm)
 
         # Clip gradients.
-        for optimizer in self.chained_optimizers:
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
+                _debug_optimizer('chained_step_skip_stub_optimizer', optimizer_idx=optimizer_idx)
                 continue
             parameters = optimizer.get_parameters()
+            _debug_optimizer(
+                'chained_step_clip_child_check',
+                optimizer_idx=optimizer_idx,
+                optimizer_type=type(optimizer).__name__,
+                n_parameters=len(parameters),
+                clip_grad=getattr(optimizer.config, 'clip_grad', None),
+            )
             if len(parameters) == 0:
                 continue
             if optimizer.config.clip_grad > 0.0:
+                _debug_optimizer('chained_step_before_clip_child', optimizer_idx=optimizer_idx)
                 clip_grad_by_total_norm_fp32(
                     parameters,
                     max_norm=optimizer.config.clip_grad,
@@ -1338,12 +1445,18 @@ class ChainedOptimizer(MegatronOptimizer):
                         optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                     ),
                 )
+                _debug_optimizer('chained_step_after_clip_child', optimizer_idx=optimizer_idx)
 
         # Count the zeros in the grads.
+        _debug_optimizer('chained_step_before_count_zeros', log_num_zeros=self.config.log_num_zeros_in_grad)
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        _debug_optimizer('chained_step_after_count_zeros', num_zeros_in_grad=num_zeros_in_grad)
 
+        _debug_optimizer('chained_step_before_step_with_ready_grads')
         update_successful = self.step_with_ready_grads()
+        _debug_optimizer('chained_step_after_step_with_ready_grads', update_successful=update_successful)
 
+        _debug_optimizer('chained_step_end', update_successful=update_successful, grad_norm=grad_norm)
         return update_successful, grad_norm, num_zeros_in_grad
 
     def save_parameter_state(self, filename: str):

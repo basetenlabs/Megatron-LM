@@ -53,7 +53,12 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    MixedPrecisionOptimizer,
+    _debug_optimizer,
+    _zero_grad_group_helper,
+    param_group_identifier_keys,
+)
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -2612,24 +2617,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        _debug_optimizer(
+            'distributed_step_with_ready_grads_begin',
+            n_model_chunks=len(getattr(self, 'model_chunks', [])),
+            overlap_param_gather=getattr(self.ddp_config, 'overlap_param_gather', None),
+            use_megatron_fsdp=getattr(self.ddp_config, 'use_megatron_fsdp', None),
+        )
         update_successful = super().step_with_ready_grads()
+        _debug_optimizer('distributed_after_super_step_with_ready_grads', update_successful=update_successful)
 
         timers = self.config.timers
         if timers is not None:
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
 
         if self.ddp_config.use_megatron_fsdp:
-            for model_chunk in self.model_chunks:
+            for chunk_idx, model_chunk in enumerate(self.model_chunks):
+                _debug_optimizer('distributed_before_fsdp_start_param_sync', chunk_idx=chunk_idx)
                 model_chunk.start_param_sync()
+                _debug_optimizer('distributed_after_fsdp_start_param_sync', chunk_idx=chunk_idx)
         else:
             # If not overlapping all-gather for parameters, launch synchronous all-gather
             # communication calls here. If overlapping all-gather for parameters, the following
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if not self.ddp_config.overlap_param_gather:
-                for model_chunk in self.model_chunks:
+                for chunk_idx, model_chunk in enumerate(self.model_chunks):
+                    _debug_optimizer('distributed_before_start_param_sync', chunk_idx=chunk_idx)
                     model_chunk.start_param_sync()
+                    _debug_optimizer('distributed_after_start_param_sync', chunk_idx=chunk_idx)
         if timers is not None:
             timers('params-all-gather').stop()
 
+        _debug_optimizer('distributed_step_with_ready_grads_end', update_successful=update_successful)
         return update_successful
