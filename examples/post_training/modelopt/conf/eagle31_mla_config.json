@@ -1,0 +1,14 @@
+{
+    "num_hidden_layers": 1,
+    "use_aux_hidden_state": true,
+    "eagle_aux_hidden_state_layer_ids": [2, 30, 58],
+    "use_input_layernorm_in_first_layer": true,
+    "use_last_layernorm": true,
+    "use_mtp_layernorm": false,
+    "fc_norm": true,
+    "norm_output": true,
+    "draft_vocab_size": null,
+    "has_lm_head": false,
+    "parallel_draft_step": 1,
+    "parallel_draft_heads_num_layers": 1
+}

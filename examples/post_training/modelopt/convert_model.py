@@ -32,6 +32,13 @@ from model_provider import model_provider
 ALGO_TO_CONFIG = {
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
+    "eagle3-kimik2": {
+        "algorithm": "eagle",
+        "config": {
+            "eagle_decoder_type": "kimik2",
+            "eagle_architecture_config": mtsp.config.kimik2_eagle_default_config,
+        },
+    },
 }
 
 
@@ -47,7 +54,7 @@ def add_convert_args(parser):
     group.add_argument(
         '--algorithm',
         type=str,
-        choices=["eagle3", "None"],
+        choices=["eagle3", "eagle3-kimik2", "eagle-mtp", "None"],
         default="None",
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
@@ -151,8 +158,9 @@ if __name__ == "__main__":
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    if args.algorithm == "eagle3":
-        mtsp_config = ALGO_TO_CONFIG[args.algorithm]
+    if args.algorithm in ALGO_TO_CONFIG:
+        import copy
+        mtsp_config = copy.deepcopy(ALGO_TO_CONFIG[args.algorithm])
         if args.eagle_config:
             with open(args.eagle_config) as f:
                 eagle_config = json.load(f)

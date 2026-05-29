@@ -37,7 +37,19 @@ def add_finetune_args(parser):
     """Add additional arguments for finetune."""
     group = parser.add_argument_group(title='Finetune')
     group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
-
+    group.add_argument("--eagle-decoder-type", type=str, default="llama",
+                       choices=["llama", "kimik2"],
+                       help="Eagle decoder architecture type. Use 'kimik2' for MLA-based models (DeepSeek/Kimi).")
+    group.add_argument("--eagle-ttt-steps", type=int, default=3,
+                       help="Number of train-time-test steps for Eagle 3.1 training loop.")
+    group.add_argument("--eagle-loss-decay-factor", type=float, default=0.9,
+                       help="Exponential decay factor for multi-step Eagle loss.")
+    group.add_argument("--eagle-mix-hidden-states", action="store_true", default=False,
+                       help="Mix hidden states across TTT steps (reduces training cost).")
+    group.add_argument("--eagle-self-logit-distillation", action="store_true", default=True,
+                       help="Use KL divergence logit distillation instead of classification loss.")
+    group.add_argument("--eagle-config-json", type=str, default=None,
+                       help="Path to eagle architecture config JSON (overrides defaults).")
 
     add_modelopt_args(parser)
     return parser
