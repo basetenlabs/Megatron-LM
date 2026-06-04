@@ -2736,6 +2736,14 @@ try:
     except ImportError:
         _get_workspace = None
 
+    # The importability of ``get_workspace`` is only a proxy for "``general_gemm``
+    # accepts a ``workspace`` arg" — true on NVIDIA TE, but AMD's ROCm TE (e.g.
+    # 2.12.0.dev in rocm/primus) exposes ``get_workspace`` yet manages the GEMM
+    # workspace internally, so its ``general_gemm`` has no ``workspace`` parameter.
+    # Gate on the real signature so workspace is passed only when accepted (no-op
+    # on NVIDIA TE; avoids a TypeError on ROCm TE).
+    _general_gemm_accepts_workspace = "workspace" in inspect.signature(general_gemm).parameters
+
     def te_general_gemm(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -2768,7 +2776,7 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
-        if _get_workspace is not None:
+        if _get_workspace is not None and _general_gemm_accepts_workspace:
             kwargs["workspace"] = _get_workspace()
         return general_gemm(A, B, **kwargs)
 
