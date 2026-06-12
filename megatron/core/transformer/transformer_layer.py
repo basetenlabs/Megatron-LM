@@ -1769,18 +1769,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         discard hook.
 
         Returns ``(input_layernorm_output, residual, (h_res, h_post))`` where
-        ``residual`` is the n-stream hidden state captured before
-        aggregation — it flows to ``_apply_self_attn_bda_step`` via the base
+        ``residual`` is the n-stream hidden-state view returned by the
+        hyper-connection — it flows to ``_apply_self_attn_bda_step`` via the base
         skeleton's ``residual`` argument, and ``(h_res, h_post)`` flows via
         ``attn_state``.
         """
-        # Capture the n-stream residual BEFORE self_attention_hyper_connection
-        # aggregates n-stream -> single-stream. The fused bda kernel needs the
-        # original n-stream tensor.
-        residual = hidden_states
-
         nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, h_res, h_post = self.self_attention_hyper_connection(
+        hidden_states, h_res, h_post, residual = self.self_attention_hyper_connection(
             hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -1871,18 +1866,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         ``mlp_state`` slot in the return tuple.
 
         Returns ``(pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post))``
-        where ``residual`` is the n-stream hidden state captured before
-        aggregation — it flows to ``_apply_mlp_bda_step`` via the base
+        where ``residual`` is the n-stream hidden-state view returned by the
+        hyper-connection — it flows to ``_apply_mlp_bda_step`` via the base
         skeleton's ``residual`` argument, and ``(mlp_h_res, mlp_hc_h_post)``
         flows via ``mlp_state``.
         """
-        # Capture the n-stream residual BEFORE mlp_hyper_connection
-        # aggregates n-stream -> single-stream. The fused bda kernel needs the
-        # original n-stream tensor.
-        residual = hidden_states
-
         nvtx_range_push(suffix="mlp_hyper_connection")
-        hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
+        hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
             hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
