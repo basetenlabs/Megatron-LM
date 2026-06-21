@@ -27,6 +27,29 @@ except ImportError:
     hadamard_transform = None
 
 
+def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    """Return whether a 1-indexed layer reuses a previous DSA top-k result.
+
+    Layers are 1-indexed. The first ``skip_topk_offset`` layers always compute their own
+    top-k (they own an indexer). After that, every ``topk_freq``-th layer computes its
+    own top-k; the layers in between reuse the top-k indices from the most recent
+    computing layer.
+    """
+    if layer_number < 1:
+        raise ValueError(f"layer_number must be 1-indexed and positive, got {layer_number}.")
+    if topk_freq < 1:
+        raise ValueError(f"topk_freq must be positive, got {topk_freq}.")
+    return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+
+
+def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    """Return the computing layer whose DSA top-k a skip layer reuses."""
+    is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq)
+    if layer_number <= skip_topk_offset:
+        return layer_number
+    return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
     Reference:
@@ -984,6 +1007,10 @@ class DSAttention(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
 
+    _HOLDER_ATTR = "_dsa_index_share_topk_holder"
+    """Attribute on ``PackedSeqParams`` carrying the per-microbatch DSA top-k holder when
+    cross-layer top-k sharing is enabled (``dsa_indexer_topk_freq > 1``)."""
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1002,15 +1029,65 @@ class DSAttention(MegatronModule):
 
         self.layer_number = layer_number
 
-        self.indexer = build_module(
-            submodules.indexer, config=self.config, pg_collection=pg_collection
+        # DSA cross-layer top-k sharing (GLM-5.2 "IndexShare"). Computing layers own an
+        # indexer; skip layers reuse top-k indices from the most recent computing layer in
+        # this pipeline stage via the per-microbatch holder on ``PackedSeqParams``.
+        self.index_topk = self.config.dsa_indexer_topk
+        self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
+        self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
+        self.index_share = self.index_topk_freq > 1
+        self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
+            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
+        self.source_layer = (
+            source_dsa_compute_layer(
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            )
+            if self.index_share
+            else self.layer_number
+        )
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp']
+            )
+        self.pg_collection = pg_collection
+
+        self.indexer = None
+        if not self.skip_topk:
+            self.indexer = build_module(
+                submodules.indexer, config=self.config, pg_collection=self.pg_collection
+            )
 
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+
+    def _get_index_share_topk_holder(
+        self, packed_seq_params: PackedSeqParams
+    ) -> "dict[int, torch.Tensor]":
+        """Return the per-microbatch top-k holder for DSA index sharing.
+
+        The holder is a ``layer_number -> topk_indices`` map stashed on the
+        ``PackedSeqParams`` instance so that skip layers in the same transformer block
+        execution can read the top-k indices produced by the most recent computing layer
+        in this pipeline stage. Cross-pipeline sharing is not supported (validated upstream
+        in ``_validate_dsa_index_share_pipeline_split``).
+        """
+        if packed_seq_params is None:
+            raise AssertionError(
+                "DSA index-share requires packed_seq_params to carry the per-microbatch "
+                "top-k holder. Disable dsa_indexer_topk_freq sharing or run with packed "
+                "sequence parameters."
+            )
+        holder = getattr(packed_seq_params, self._HOLDER_ATTR, None)
+        if holder is None:
+            holder = {}
+            setattr(packed_seq_params, self._HOLDER_ATTR, holder)
+        return holder
+
 
     def forward(
         self,
@@ -1068,57 +1145,109 @@ class DSAttention(MegatronModule):
                 mask, float('-inf')
             )
 
-        if self.training and torch.is_grad_enabled():
-            # ===================================
-            # Prepare inputs for indexer loss
-            # ===================================
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        # Resolve the per-microbatch top-k holder for DSA index sharing. Computing layers
+        # write their fresh top-k indices into the holder; skip layers read the indices
+        # previously produced by ``self.source_layer`` in this stage.
+        topk_holder = (
+            self._get_index_share_topk_holder(packed_seq_params) if self.index_share else None
+        )
+        topk_indices = None
 
-            # ===================================
-            # Attach indexer topk and loss
-            # ===================================
-            # Compute KL divergence loss between indexer scores and true attention scores
-            topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                q,
-                weights,
-                k,
-                query.detach(),
-                key.detach(),
-                self.softmax_scale,
-                self.indexer.index_topk,
-                indexer_loss_coeff,
-                float_mask,
-                getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                self.indexer.pg_collection,
-            )
-            # Save indexer loss for logging
-            if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
+        if self.training and torch.is_grad_enabled():
+            if self.skip_topk:
+                if topk_holder is None or self.source_layer not in topk_holder:
+                    raise AssertionError(
+                        "DSA index-share skip layer "
+                        f"(layer_number={self.layer_number}) needs top-k indices from source "
+                        f"computing layer {self.source_layer}, but that layer did not run before "
+                        "it in this pipeline stage. Cross-PP top-k sharing is not supported. "
+                        "Ensure each pipeline stage starts on a computing layer "
+                        f"(dsa_indexer_topk_freq={self.index_topk_freq}, "
+                        f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
+                        f"Holder has layers {sorted(topk_holder or {})}."
+                    )
+                topk_indices = topk_holder[self.source_layer]
+
+                # ===================================
+                # Run sparse attention kernel
+                # ===================================
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            else:
+                # ===================================
+                # Prepare inputs for indexer loss
+                # ===================================
+                assert self.indexer is not None
+                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+
+                # ===================================
+                # Attach indexer topk and loss
+                # ===================================
+                # Compute KL divergence loss between indexer scores and true attention scores
+                topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
+                    q,
+                    weights,
+                    k,
+                    query.detach(),
+                    key.detach(),
+                    self.softmax_scale,
+                    self.index_topk,
+                    indexer_loss_coeff,
+                    float_mask,
+                    getattr(self.config, "dsa_indexer_use_sparse_loss", False),
+                    self.pg_collection,
+                    self.config.calculate_per_token_loss,
+                )
+                # Save indexer loss for logging
+                if indexer_loss_coeff > 0:
+                    DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                        loss=indexer_loss,
+                        layer_number=self.layer_number,
+                        num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    )
+
+                # ===================================
+                # Run sparse attention kernel
+                # ===================================
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+
+                # Attach loss to output
+                output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        else:
+            if self.skip_topk:
+                if topk_holder is None or self.source_layer not in topk_holder:
+                    raise AssertionError(
+                        "DSA index-share skip layer "
+                        f"(layer_number={self.layer_number}) needs top-k indices from source "
+                        f"computing layer {self.source_layer}, but that layer did not run before "
+                        "it in this pipeline stage. Cross-PP top-k sharing is not supported. "
+                        "Ensure each pipeline stage starts on a computing layer "
+                        f"(dsa_indexer_topk_freq={self.index_topk_freq}, "
+                        f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
+                        f"Holder has layers {sorted(topk_holder or {})}."
+                    )
+                topk_indices = topk_holder[self.source_layer]
+
+                # ===================================
+                # Run sparse attention kernel
+                # ===================================
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            else:
+                # ===================================
+                # Get index scores and top-k indices
+                # ===================================
+                assert self.indexer is not None
+                _, topk_indices = self.indexer.forward_with_scores(
+                    x, qr, mask=float_mask, packed_seq_params=packed_seq_params
                 )
 
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+                # ===================================
+                # Run sparse attention kernel
+                # ===================================
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
-            # Attach loss to output
-            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
-
-        else:
-            # ===================================
-            # Get index scores and top-k indices
-            # ===================================
-            _, topk_indices = self.indexer.forward_with_scores(
-                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
-            )
-
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+        if self.index_share and not self.skip_topk:
+            assert topk_holder is not None and topk_indices is not None
+            topk_holder[self.layer_number] = topk_indices
 
         return output

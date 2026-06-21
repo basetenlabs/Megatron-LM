@@ -304,6 +304,25 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """Frequency of DSA indexer top-k computation across layers.
+
+    A value greater than 1 enables cross-layer top-k sharing ("GLM-5.2 IndexShare"): only
+    every ``dsa_indexer_topk_freq``-th layer runs the indexer to produce fresh top-k indices,
+    and the layers in between reuse the indices from the most recent computing layer. The
+    first ``dsa_indexer_skip_topk_offset`` layers (1-indexed) are always computing layers and
+    feed the skip layers that follow them in the same pipeline stage. Cross-pipeline sharing
+    of top-k indices is not supported; see ``_validate_dsa_index_share_pipeline_split`` in
+    ``experimental_attention_variant_module_specs``."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset for DSA cross-layer top-k sharing.
+
+    Boundary computing layers occupy ``[1, dsa_indexer_skip_topk_offset]`` (1-indexed); the
+    repeating ``dsa_indexer_topk_freq`` cadence begins after that offset. For GLM-5.2 this is
+    set to ``first_k_dense_replace`` so the dense prefix layers own their indexer and feed the
+    following skip DSA layers."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -1285,7 +1304,71 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, "
+                    f"got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
+        elif self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) == expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
+            self.hetereogenous_dist_checkpoint = True
+
+            if self.apply_dsa_kernel_fusion:
+                assert (
+                    torch.cuda.is_available()
+                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+                sm = torch.cuda.get_device_capability()
+                assert sm[0] >= 10, (
+                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+
+                _flash_mla_available = True
+                try:
+                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+                except ImportError:
+                    _flash_mla_available = False
+
+                _cudnn_dsa_available = True
+                try:
+                    from cudnn import DSA  # noqa: F401
+                except ImportError:
+                    _cudnn_dsa_available = False
+
+                if not _flash_mla_available or not _cudnn_dsa_available:
+                    missing = []
+                    if not _flash_mla_available:
+                        missing.append(
+                            "flash_mla (install from "
+                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
+                        )
+                    if not _cudnn_dsa_available:
+                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+                    raise ValueError(
+                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
+                        f"following packages are not available: {', '.join(missing)}. "
+                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
+                        f"PyTorch fallback."
+                    )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
