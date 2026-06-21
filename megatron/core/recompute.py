@@ -139,12 +139,19 @@ def checkpointed_forward(
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
+        # When staged attn/MLP recompute is enabled, each layer checkpoints its
+        # own attention and MLP halves separately (see TransformerLayer.forward).
+        # Run the chunk eagerly so we do not also wrap (and thus defeat / nest)
+        # the per-layer recompute. Quantized recipes keep the standard path.
+        split_attn_mlp = getattr(self.config, "recompute_split_attn_mlp", False) and not (
+            self.config.fp8 or self.config.fp4
+        )
         layer_idx = 0
         while layer_idx < self.num_layers_per_pipeline_rank:
             chunk_end = min(
                 layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
             )
-            chunk_runner(layer_idx, chunk_end, True)
+            chunk_runner(layer_idx, chunk_end, not split_attn_mlp)
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
