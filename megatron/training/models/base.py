@@ -2,8 +2,9 @@
 
 import abc
 import importlib
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -69,12 +70,16 @@ class ModelConfig:
     Must be serializable."""
 
     # === pre-wrap and post-wrap hooks ===
-    pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
+    pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(
+        default_factory=list
+    )
     """List of functions that are executed before the model is wrapped with DDP/FSDP.
     Should take the model as the only argument and return a new model as the only return value.
     """
 
-    post_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
+    post_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(
+        default_factory=list
+    )
     """List of functions that are executed after model initialization is complete.
     Should take the model as the only argument and return a new model as the only return value.
     """
@@ -98,13 +103,15 @@ class ModelConfig:
         """
 
         def _as_dict(config):
-            result = {
-                "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
-            }
+            result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
             for f in dataclass_fields(config):
                 value = getattr(config, f.name)
                 # Skip non-serializable fields
-                if callable(value) or f.name.startswith("_") or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]:
+                if (
+                    callable(value)
+                    or f.name.startswith("_")
+                    or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]
+                ):
                     continue
 
                 if is_dataclass(value):
@@ -144,7 +151,9 @@ class ModelConfig:
 
             # Filter to valid fields for this class
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
-            filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
+            filtered_data = {
+                k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")
+            }
 
             # recurse on serialized nested dataclasses
             subconfigs = {}
@@ -220,7 +229,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
@@ -244,7 +255,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
 
 def compose_hooks(
-    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]],
+    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]]
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Utility to compose pre/post-wrap hooks into a single function, preserving order.
 

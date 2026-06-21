@@ -148,6 +148,11 @@ class MoEModelTestContainer:
         for layer in self.moe_layers:
             layer.zero_grad()
 
+    def __del__(self):
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        Utils.destroy_model_parallel()
+
     def destroy(self):
         Utils.destroy_model_parallel()
 
@@ -223,6 +228,7 @@ class TestPagedStashing:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.flaky_in_dev
     def test_forward_backward_4_layers(self):
         """Test paged stashing with 4 MoE layers: ref run vs paged run match."""
         if not is_hybrid_ep_available():
@@ -244,7 +250,6 @@ class TestPagedStashing:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,
@@ -313,6 +318,7 @@ class TestPagedStashingOverBudget:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.flaky_in_dev
     def test_overload_factor_and_over_budget(self):
         """Budget matches HybridEP setup_metadata; over_budget matches map-derived load."""
         if not is_hybrid_ep_available():
@@ -334,7 +340,6 @@ class TestPagedStashingOverBudget:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,

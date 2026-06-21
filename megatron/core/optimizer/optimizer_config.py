@@ -142,7 +142,6 @@ class OptimizerConfig:
     ##############
     # General
     ##############
-
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
        iteration would be different.
@@ -365,6 +364,12 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    offload_optimizer_states: bool = False
+    """
+    If True, offload optimizer states to CPU after each optimizer step and
+    reload them before the next optimizer step.
+    """
+
     ################
     # Miscellaneous
     ################
@@ -420,6 +425,12 @@ class OptimizerConfig:
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
                     "recommended for mxfp8 training."
                 )
+
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
 
         if self.use_precision_aware_optimizer:
             assert (

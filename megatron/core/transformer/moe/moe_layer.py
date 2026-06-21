@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -13,11 +14,13 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    record_dispatch_token_counts,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -254,10 +257,14 @@ class MoELayer(BaseMoELayer):
         )
 
         self.tp_group = pg_collection.tp
+        self.tp_ep_group = pg_collection.tp_ep
 
         # Initialize router.
         self.router = self.submodules.router(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
         )
         self.tp_group = pg_collection.tp
 
@@ -379,6 +386,11 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
+        if self.config.log_moe_overload_factor:
+            get_moe_overload_factor_tracker().set_process_groups(
+                tp_ep_group=self.tp_ep_group, expt_dp_group=pg_collection.expt_dp
+            )
+
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
@@ -435,13 +447,18 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, input_ids)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -486,6 +503,16 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
+    @staticmethod
+    def _num_token_rows_from_moe_hidden_states(hidden_states: torch.Tensor) -> int:
+        """Product of all dims except the hidden/last (same as view(-1, H) row count)."""
+        if hidden_states.dim() < 2:
+            raise ValueError(
+                "MoE hidden_states must be at least 2D [..., hidden_size], "
+                f"got shape {tuple(hidden_states.shape)}"
+            )
+        return int(math.prod(hidden_states.shape[:-1]))
+
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
@@ -525,6 +552,39 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
+    def _maybe_record_overload_factor(
+        self, dispatched_input: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> torch.Tensor:
+        """Wrap dispatched_input with overload logging when log_moe_overload_factor is set.
+
+        Uses _overload_log_num_local_tokens captured from forward hidden_states and
+        applies AllGather fair-share scaling so report()'s SUM over TP×EP matches one
+        global balanced count when the map is replicated on every rank.
+
+        Recording is skipped when not in training mode (e.g. Megatron validation uses
+        model.eval()) so eval forwards do not pollute train-only overload stats.
+        """
+        if not self.config.log_moe_overload_factor or not self.training:
+            return dispatched_input
+        num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
+        if num_local_tokens is None:
+            return dispatched_input
+        tp_ep_world_size = float(self.tp_ep_group.size())
+        local_balanced_count = float(num_local_tokens) * float(self.config.moe_router_topk)
+        token_dispatcher = self.token_dispatcher
+        if isinstance(token_dispatcher, MoEAllGatherTokenDispatcher) and (
+            token_dispatcher.tp_size > 1 or token_dispatcher.ep_size > 1
+        ):
+            local_balanced_count = local_balanced_count / tp_ep_world_size
+        local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
+        local_balanced.fill_(local_balanced_count)
+        return record_dispatch_token_counts(
+            tensor=dispatched_input,
+            tokens_per_expert=tokens_per_expert,
+            local_balanced_token_count=local_balanced,
+            layer_number=self.layer_number,
+        )
+
     @internal_api
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
@@ -537,10 +597,16 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
+
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
+        dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
+        if (
+            hasattr(self, "_inference_token_dispatcher")
+            and getattr(self, "is_inference_cuda_graphed_iteration", True)
+            and InferenceMode.is_active()
+        ):
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -600,6 +666,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -614,6 +681,8 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
+                                                Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -643,7 +712,11 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    if self.config.log_moe_overload_factor and self.training:
+                        self._overload_log_num_local_tokens = (
+                            self._num_token_rows_from_moe_hidden_states(hidden_states)
+                        )
+                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

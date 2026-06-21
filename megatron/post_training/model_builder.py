@@ -39,8 +39,7 @@ def count_parameters_in_layer(model, layer_name):
 
 
 def _add_load_convert_hooks(model: MCoreGPTModel):
-    """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
-    """
+    """Register some load_state_dict prehooks to handle some known state_dict key mismatch."""
     args = get_args()
     if args.export_te_mcore_model:
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
@@ -115,14 +114,18 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
-    if (args_dict.get('hybrid_override_pattern') is not None
-            and args_dict.get('hybrid_layer_pattern') is None):
+    if (
+        args_dict.get('hybrid_override_pattern') is not None
+        and args_dict.get('hybrid_layer_pattern') is None
+    ):
         args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
 
     return Namespace(**args_dict)
 
 
-def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _build_teacher_model(
+    config, config_raw: Namespace, model_kwargs: Dict[str, Any]
+) -> MCoreGPTModel:
     """Teacher model creator."""
     args = get_args()
 
@@ -137,13 +140,14 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
             model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
-                config=config,
-                use_te=(args.transformer_impl == "transformer_engine"),
+                config=config, use_te=(args.transformer_impl == "transformer_engine")
             )
         else:
             model_kwargs["transformer_layer_spec"] = get_gpt_modelopt_spec(
                 config=config,
-                local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
+                local_core_attention=(
+                    False if config.context_parallel_size > 1 else args.export_force_local_attention
+                ),
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
                 use_arbitrary_attention_mask=False,
@@ -210,7 +214,9 @@ def modelopt_gpt_hybrid_builder(
         config.yarn_correction_range_round_to_int = False
 
     if vp_stage is not None:
-        raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
+        raise ValueError(
+            "ModelOpt integration does not currently support virtual pipeline parallel."
+        )
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
@@ -229,8 +235,7 @@ def modelopt_gpt_hybrid_builder(
             config.sequence_parallel = False
         if config.heterogeneous_block_specs:
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
-                config=config,
-                use_te=args.transformer_impl == "transformer_engine",
+                config=config, use_te=args.transformer_impl == "transformer_engine"
             )
         elif args.export_default_te_spec:
             # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
@@ -248,9 +253,9 @@ def modelopt_gpt_hybrid_builder(
         else:
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
-                local_core_attention=False
+                local_core_attention = False
             else:
-                local_core_attention=args.export_force_local_attention
+                local_core_attention = args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
@@ -276,7 +281,10 @@ def modelopt_gpt_hybrid_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+    elif (
+        args.export_model_type in ("HybridModel", "MambaModel")
+        or getattr(args, 'hybrid_layer_pattern', None) is not None
+    ):
         if args.export_model_type == "MambaModel":
             import warnings
 
@@ -362,7 +370,9 @@ def modelopt_gpt_hybrid_builder(
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
-        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
+        teacher_config = core_transformer_config_from_args(
+            teacher_config_raw
+        )  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
@@ -378,7 +388,9 @@ def modelopt_gpt_hybrid_builder(
         # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
-        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
+        mto.ModeloptStateManager(
+            model
+        ).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
 
     print_distributed_quant_summary(model)
     return model

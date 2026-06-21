@@ -1,5 +1,4 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import functools
 import math
 from dataclasses import dataclass
@@ -20,7 +19,10 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -1006,6 +1008,82 @@ def clear_aux_losses_tracker() -> None:
     get_moe_metrics_tracker().clear()
 
 
+class RecordDispatchTokenCountsFunction(torch.autograd.Function):
+    """Autograd hook: post-dispatch token totals for overload reporting (see report())."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
+        layer_number: Optional[int],
+    ):
+        """Record actual token total and balanced count on forward; pass tensor through.
+
+        Args:
+            tensor: Tensor in the autograd graph (e.g. dispatched_input) — pass-through.
+            tokens_per_expert: Per-local-expert counts from dispatch_postprocess (any
+                device).
+            local_balanced_token_count: Scalar float, num_local_tokens * topk (token
+                rows from forward hidden_states).
+            layer_number: Layer index (1-based).
+
+        Returns:
+            tensor unchanged.
+        """
+        if layer_number is None:
+            return tensor
+
+        tokens_on_rank = (
+            tokens_per_expert.detach().sum().to(device=tensor.device, dtype=torch.float32)
+        )
+
+        balanced = local_balanced_token_count.detach().to(device=tensor.device, dtype=torch.float32)
+
+        tracker = get_moe_overload_factor_tracker()
+        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
+
+        ctx.save_for_backward(tokens_on_rank, balanced)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: append negated actual and balanced count for paired cumsums."""
+        if ctx.saved_tensors:
+            tokens_on_rank, balanced = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
+        return grad_output, None, None, None
+
+
+def record_dispatch_token_counts(
+    tensor: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    local_balanced_token_count: torch.Tensor,
+    layer_number: Optional[int],
+) -> torch.Tensor:
+    """Wrap tensor with an autograd hook for dispatch token counts (overload metrics).
+
+    Records tokens_per_expert.sum() on this rank and the balanced token count scalar.
+    Overload factors are computed later in MoEOverloadFactorTracker.report(). Process groups
+    must already be registered on the global tracker (MoELayer does this in __init__
+    when log_moe_overload_factor is enabled).
+
+    Args:
+        tensor: Tensor in the autograd graph (typically dispatched_input).
+        tokens_per_expert: Output of dispatch_postprocess (per-expert counts).
+        local_balanced_token_count: Scalar float, num_local_tokens * moe_router_topk
+            (num_local_tokens from MoE forward hidden_states shape).
+        layer_number: Layer index (1-based).
+
+    Returns:
+        tensor unchanged.
+    """
+    return RecordDispatchTokenCountsFunction.apply(
+        tensor, tokens_per_expert, local_balanced_token_count, layer_number
+    )
+
+
 @deprecated(
     version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker()._sync_metrics()"
 )
@@ -1434,12 +1512,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
             outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
             valid_cudagraph_attrs = []
             for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
-                hier_attr_name = attr_name.split('.')
-                attr = self.moe_layer.token_dispatcher
-                for name in hier_attr_name:
-                    attr = getattr(attr, name, None)
-                    if attr is None:
-                        break
+                attr = self.moe_layer.token_dispatcher.get_cudagraph_attr(attr_name)
                 if isinstance(attr, torch.Tensor):
                     outputs.append(attr)
                     valid_cudagraph_attrs.append(attr_name)

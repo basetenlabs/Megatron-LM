@@ -58,10 +58,7 @@ def add_prune_args(parser):
     """Add additional arguments for ModelOpt pruning."""
     group = parser.add_argument_group(title="ModelOpt pruning")
     group.add_argument(
-        "--calib-size",
-        type=int,
-        default=1024,
-        help="Samples to use for pruning calibration.",
+        "--calib-size", type=int, default=1024, help="Samples to use for pruning calibration."
     )
     group.add_argument(
         "--calib-dataset",
@@ -92,10 +89,7 @@ def add_prune_args(parser):
         help="Reference texts. Please use | to separate different batches.",
     )
     group.add_argument(
-        "--pretrained-model-path",
-        type=str,
-        default=None,
-        help="HuggingFace pretrained model",
+        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
     )
     group.add_argument(
         "--skip-generate",
@@ -147,9 +141,7 @@ def check_arguments(args):
     # Default the intermediate-checkpoint location to <save>/modelopt_pruning_scores
     # so that re-running on the same --save target reuses cached per-rank scores
     if args.prune_intermediate_ckpt is None and args.save is not None:
-        args.prune_intermediate_ckpt = os.path.join(
-            args.save, "modelopt_pruning_scores"
-        )
+        args.prune_intermediate_ckpt = os.path.join(args.save, "modelopt_pruning_scores")
         print_rank_0(
             "No directory provided to cache per-rank intermediate pruning scores. "
             f"Setting to: {args.prune_intermediate_ckpt}"
@@ -159,12 +151,8 @@ def check_arguments(args):
 def get_params(model):
     params = sum(p.numel() for p in model.parameters())
     reduced_params = torch.Tensor([params]).to(device=next(model.parameters()).device)
-    torch.distributed.all_reduce(
-        reduced_params, group=get_pipeline_model_parallel_group()
-    )
-    torch.distributed.all_reduce(
-        reduced_params, group=get_tensor_model_parallel_group()
-    )
+    torch.distributed.all_reduce(reduced_params, group=get_pipeline_model_parallel_group())
+    torch.distributed.all_reduce(reduced_params, group=get_tensor_model_parallel_group())
     return reduced_params.item()
 
 
@@ -187,31 +175,21 @@ if __name__ == "__main__":
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    prune_builder = functools.partial(
-        modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
-    )
-    model = get_model(
-        functools.partial(model_provider, prune_builder),
-        wrap_with_ddp=False,
-    )
+    prune_builder = functools.partial(modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True)
+    model = get_model(functools.partial(model_provider, prune_builder), wrap_with_ddp=False)
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
 
     report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(
-            model, strict=not args.untie_embeddings_and_output_weights
-        )
+        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_kwargs = {
-            "dtype": import_dtype,
-            "trust_remote_code": args.trust_remote_code,
-        }
+        import_kwargs = {"dtype": import_dtype, "trust_remote_code": args.trust_remote_code}
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
@@ -223,9 +201,7 @@ if __name__ == "__main__":
         else:
             all_references = args.references.split("|")
 
-        for idx, prompt in tqdm(
-            enumerate(all_prompts), disable=torch.distributed.get_rank()
-        ):
+        for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             # enable_kv_cache=False to skip the static KV-cache pre-allocation; this is a
             # sanity-check generation (32 tokens) and skipping the cache keeps memory headroom.

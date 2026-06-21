@@ -13,6 +13,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0
+
 from .utils import print_distributed_quant_summary
 
 logger = logging.getLogger(__name__)

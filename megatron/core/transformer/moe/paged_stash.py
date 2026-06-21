@@ -320,7 +320,7 @@ class PipelinePreScheduleFunction(torch.autograd.Function):
             if next_schedule_layer < 0:
                 ctx.stash_manager.reload_paged_tensors(-next_schedule_layer)
 
-        return grad_output + (None,)
+        return grad_output + (None, None)
 
 
 class PipelinePostScheduleFunction(torch.autograd.Function):
@@ -373,7 +373,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             current_stream.wait_stream(ctx.stash_manager.unpack_stream)
             ctx.stash_manager._unpack_stream_status = 'idle'
 
-        return grad_output + (None,)
+        return grad_output + (None, None)
 
 
 class PagedStashManager:
@@ -1194,6 +1194,7 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
+            # if no overflow, set the expert_rank_capacity_factor to the original value
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:
                     log_single_rank(

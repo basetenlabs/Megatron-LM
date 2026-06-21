@@ -42,8 +42,8 @@ from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import is_te_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -1202,7 +1202,7 @@ class TestPartialCudaGraph:
             args.num_layers_at_end_in_bf16 = 1
 
         for key, value in kwargs.items():
-            assert hasattr(args, key)
+            assert hasattr(args, key) or hasattr(TransformerConfig, key), f"Unknown argument: {key}"
             setattr(args, key, value)
 
         validate_args(args)
@@ -1359,6 +1359,63 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize("ep_size", [1, 4])
+    def test_mhc_moe_partial_cudagraph(self, ep_size):
+        """Test that mHC (Hyper Connection) layers produce identical loss curves
+        with and without TE partial CUDA graph capture.
+
+        This validates the fix where HyperConnectionTransformerLayer overrides
+        _te_cuda_graph_replay_impl (not _te_cuda_graph_replay) so that the parent's
+        delay_offload_until_cuda_graph lifecycle and overlap_moe_expert_parallel_comm
+        handling are preserved.
+        """
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1 if ep_size > 1 else self.tp_size,
+            expert_model_parallel_size=ep_size,
+        )
+
+        extra_kwargs = {
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,  # mHC is incompatible with MTP
+        }
+
+        loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
+        for cuda_graph_modules in [
+            [CudaGraphModule.attn],
+            [CudaGraphModule.mlp, CudaGraphModule.moe_router],
+            [
+                CudaGraphModule.attn,
+                CudaGraphModule.mlp,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            ],
+        ]:
+            cuda_graph_warmup_steps = 3
+            loss_list = self._run_test_helper(
+                ep_size,
+                "transformer_engine",
+                cuda_graph_modules,
+                cuda_graph_warmup_steps,
+                **extra_kwargs,
+            )
+            assert torch.equal(loss_list, loss_list_ref), (
+                f"mHC loss mismatch with cuda_graph_modules={cuda_graph_modules}, ep_size={ep_size}. "
+                f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
+            )
+
         Utils.destroy_model_parallel()
 
 
@@ -1585,4 +1642,9 @@ if __name__ == "__main__":
     test = TestPartialCudaGraph()
     test.setup_method(method=None)
     test.test_moe_partial_cudagraph(4, True, "alltoall")
+    test.teardown_method(method=None)
+
+    test = TestPartialCudaGraph()
+    test.setup_method(method=None)
+    test.test_mhc_moe_partial_cudagraph(4)
     test.teardown_method(method=None)
