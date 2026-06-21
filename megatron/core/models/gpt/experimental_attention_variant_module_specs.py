@@ -23,6 +23,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+    is_dsa_skip_topk_layer,
+    source_dsa_compute_layer,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -390,6 +392,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
+    _validate_dsa_index_share_pipeline_split(config, local_layer_ids)
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
@@ -410,6 +413,55 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = ["gated_delta_net"]
     return experimental_attention_variant in linear_attention_variants
+
+
+def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
+    """Ensure DSA top-k sharing does not require top-k indices from another PP stage.
+
+    When ``dsa_indexer_topk_freq > 1``, computing layers produce fresh top-k indices and
+    skip layers read those indices from the holder on ``PackedSeqParams``. The holder is
+    per-microbatch and is not exchanged across pipeline stages, so each pipeline stage must
+    start on a computing layer and contain the computing layer whose top-k any skip layer
+    in the same stage reuses. This function checks that property for the per-stage layer
+    id list passed in by ``get_transformer_block_with_experimental_attention_variant_spec``.
+
+    ``local_layer_ids`` are 0-indexed layer ids on the global ``num_layers`` axis. Layer
+    numbers used by the DSA IndexShare math are 1-indexed (``layer_number = layer_id + 1``).
+    """
+    if (
+        config.experimental_attention_variant != "dsa"
+        or getattr(config, "dsa_indexer_topk_freq", 1) <= 1
+    ):
+        return
+
+    local_layer_ids = list(local_layer_ids)
+    local_layer_positions = {
+        layer_id: position for position, layer_id in enumerate(local_layer_ids)
+    }
+    for position, layer_id in enumerate(local_layer_ids):
+        layer_number = layer_id + 1
+        if not is_dsa_skip_topk_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        ):
+            continue
+
+        source_layer_number = source_dsa_compute_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        )
+        source_layer_id = source_layer_number - 1
+        if (
+            source_layer_id not in local_layer_positions
+            or local_layer_positions[source_layer_id] > position
+        ):
+            raise AssertionError(
+                "DSA index-share pipeline split is invalid: local layer "
+                f"{layer_number} reuses top-k indices from computing layer "
+                f"{source_layer_number}, but that source layer is not earlier in this "
+                "pipeline stage. Cross-layer top-k sharing does not cross PP boundaries. "
+                "Choose a pipeline layout where each stage starts on a computing layer "
+                f"(dsa_indexer_topk_freq={config.dsa_indexer_topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={config.dsa_indexer_skip_topk_offset})."
+            )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
