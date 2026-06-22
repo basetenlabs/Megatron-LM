@@ -41,6 +41,8 @@ from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
     unwrap_model,
