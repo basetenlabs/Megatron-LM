@@ -1173,8 +1173,8 @@ class DSAttention(MegatronModule):
         # indexer; skip layers reuse top-k indices from the most recent computing layer in
         # this pipeline stage via the per-microbatch holder on ``PackedSeqParams``.
         self.index_topk = self.config.dsa_indexer_topk
-        self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
-        self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
+        self.index_topk_freq = self.config.dsa_indexer_topk_freq
+        self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset
         self.index_share = self.index_topk_freq > 1
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
@@ -1227,7 +1227,6 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(packed_seq_params, self._HOLDER_ATTR, holder)
         return holder
-
 
     def forward(
         self,
