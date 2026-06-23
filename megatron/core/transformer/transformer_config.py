@@ -270,6 +270,15 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams for mHC (multi-hyper-connection) residuals."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
