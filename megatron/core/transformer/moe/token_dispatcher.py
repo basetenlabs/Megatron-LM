@@ -1312,6 +1312,21 @@ class _DeepepManager(_DispatchManager):
         # Manually release the metadata to avoid memory leak.
         self.dispatched_indices = None
         self.dispatched_probs = None
+        # Also release the permutation state set in
+        # get_permuted_hidden_states_by_experts and consumed by
+        # get_restored_hidden_states_by_experts (which runs before combine()).
+        # These are forward-only hand-off references: permute()/unpermute() are
+        # autograd Functions that save what their backward needs in their own
+        # ctx, so dropping the module-level refs here is safe (same lifetime as
+        # the dispatched_indices/dispatched_probs clears above). Without this,
+        # each per-layer dispatcher pins its permute mapping (reversed map +
+        # routing map, hundreds of MiB) for the whole backward pass; under
+        # activation recompute every layer's state coexists, causing O(num_layers)
+        # accumulation and OOM.
+        self.reversed_mapping_for_combine = None
+        self.pad_offsets = None
+        self.dispatched_routing_map = None
+        self.hidden_shape_before_permute = None
         return hidden_states
 
     def _pad_routing_map(
