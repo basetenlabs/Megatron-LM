@@ -729,6 +729,23 @@ class CheckpointFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
+        # DEBUG (throwaway): test eager per-layer release. Drop the recompute
+        # graph + ctx closures and run cyclic gc so this layer's saved activation
+        # frees NOW instead of at the pass boundary. If this flattens the
+        # +512MiB/layer ramp, the accumulation was a reclaimable reference cycle.
+        # Gated; only on the measured first passes (per-layer gc.collect is slow).
+        import os as _os
+
+        if _os.environ.get("DEBUG_CKPT_BWD_FREE") and _CKPT_BWD_PROBE_N < 180:
+            import gc as _gc
+
+            ctx.run_function = None
+            ctx.rng_states = None
+            outputs = None
+            detached_inputs = None
+            inputs = None
+            _gc.collect()
+
         _ckpt_bwd_probe()
         _unset_checkpointing()
         return (None, None) + grads
