@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
@@ -356,6 +358,60 @@ def fused_qk_topk_naive(
     return index_scores, topk_indices
 
 
+@triton.jit
+def _dsa_indexer_score_kernel(
+    q_ptr, k_ptr, w_ptr, o_ptr,
+    q_start, q_len, seqlen_k,
+    stride_qm, stride_qh, stride_qd,
+    stride_kn, stride_kd,
+    stride_wm, stride_wh,
+    stride_om, stride_on,
+    H: tl.constexpr, D: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Fused lightning-indexer score for one ``[BLOCK_M, BLOCK_N]`` output tile.
+
+    ``score[m, n] = sum_h relu(q[m, h, :] . k[n, :]) * w[m, h]`` with a causal mask. ``k`` is
+    shared across heads (multi-query), so it is loaded once per tile; the per-head relu and
+    weighted head-sum are accumulated in fp32 registers, so the ``[H, M, N]`` intermediate is
+    never materialized.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    m_valid = offs_m < q_len
+    n_valid = offs_n < seqlen_k
+
+    # k tile [BLOCK_N, D], shared across all query heads
+    k = tl.load(
+        k_ptr + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+        mask=n_valid[:, None], other=0.0,
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for h in range(H):
+        q = tl.load(
+            q_ptr + offs_m[:, None] * stride_qm + h * stride_qh + offs_d[None, :] * stride_qd,
+            mask=m_valid[:, None], other=0.0,
+        )
+        s = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)  # per-head relu, fp32 accumulate
+        w = tl.load(w_ptr + offs_m * stride_wm + h * stride_wh, mask=m_valid, other=0.0)
+        acc += s * w[:, None]
+
+    # causal: key n valid for the query at global position (q_start + m) iff n <= q_start + m
+    keep = (offs_n[None, :] <= (q_start + offs_m)[:, None]) & n_valid[None, :]
+    acc = tl.where(keep, acc, float("-inf"))
+
+    tl.store(
+        o_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc,
+        mask=m_valid[:, None] & n_valid[None, :],
+    )
+
+
 def _chunked_dsa_topk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -365,80 +421,57 @@ def _chunked_dsa_topk(
     mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     query_block_size: int = 512,
-    key_block_size: int = 512,
 ) -> torch.Tensor:
-    """Compute DSA top-k without materializing dense ``[batch, seqlen, seqlen]`` scores.
+    """Compute DSA frozen-indexer top-k with a fused Triton scoring kernel.
 
-    This path is for frozen-indexer training/post-training where only deterministic top-k
-    indices are needed. It computes score tiles, applies ``torch.topk`` per tile, then
-    merges per-row candidates into a running global top-k.
+    ``score[m, n] = sum_h w[m, h] * relu(q[m, h] . k[n])`` over a causal range.
+    ``_dsa_indexer_score_kernel`` fuses the per-head relu + weighted head-sum, accumulating over
+    heads in fp32 so the ``[H, S, S]`` intermediate is never materialized. Chunking over the query
+    dimension only gives one kernel-launch grid per query block (instead of ``(seqlen / 512) ** 2``
+    Python-driven tiles), with dense logits bounded by ``query_block_size``; ``torch.topk`` then
+    selects the indices (cheap; non-differentiable).
+
+    Frozen-indexer assumptions (explicit, no fallback): microbatch size 1 and a causal mask.
+    Violations raise rather than silently degrade.
     """
-    seqlen_q, bsz, _, _ = q.shape
+    seqlen_q, bsz, n_heads, head_dim = q.shape
     seqlen_k = k.size(0)
     topk_k = min(index_topk, seqlen_k)
     if topk_k < 1:
         raise ValueError(f"index_topk must be positive, got {index_topk}.")
+    if bsz != 1:
+        raise RuntimeError(f"fused DSA indexer requires microbatch size 1, got {bsz}.")
+    if not causal or mask is not None:
+        raise RuntimeError(
+            "fused DSA indexer supports causal-only selection (mask must be None); "
+            f"got causal={causal}, mask={'set' if mask is not None else None}."
+        )
 
-    if mask is not None and mask.dim() == 4:
-        # [batch, 1, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
-        mask = mask.squeeze(1)
+    BLOCK_M, BLOCK_N = 64, 128
+    # Drop the size-1 batch dim: q -> [Sq, H, D], k -> [Sk, D], weights -> [Sq, H].
+    q2 = q[:, 0].contiguous()
+    k2 = k[:, 0].contiguous()
+    w2 = weights[:, 0].float().contiguous()
 
     output_chunks = []
     for q_start in range(0, seqlen_q, query_block_size):
         q_end = min(q_start + query_block_size, seqlen_q)
-        q_block = q[q_start:q_end]
-        weights_block = weights[q_start:q_end].float()
         q_len = q_end - q_start
-
-        top_scores = torch.full(
-            (bsz, q_len, topk_k),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
+        qs, ws = q2[q_start:q_end], w2[q_start:q_end]
+        logits = torch.empty((q_len, seqlen_k), dtype=torch.float32, device=q.device)
+        grid = (triton.cdiv(q_len, BLOCK_M), triton.cdiv(seqlen_k, BLOCK_N))
+        _dsa_indexer_score_kernel[grid](
+            qs, k2, ws, logits,
+            q_start, q_len, seqlen_k,
+            qs.stride(0), qs.stride(1), qs.stride(2),
+            k2.stride(0), k2.stride(1),
+            ws.stride(0), ws.stride(1),
+            logits.stride(0), logits.stride(1),
+            H=n_heads, D=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         )
-        top_indices = torch.zeros((bsz, q_len, topk_k), dtype=torch.long, device=q.device)
+        output_chunks.append(logits.topk(topk_k, dim=-1)[1])  # [q_len, topk_k]
 
-        for k_start in range(0, seqlen_k, key_block_size):
-            k_end = min(k_start + key_block_size, seqlen_k)
-            k_block = k[k_start:k_end]
-
-            # [q_block, batch, heads, dim] x [k_block, batch, dim]
-            #   -> [batch, q_block, k_block]
-            scores = torch.einsum('qbhd,kbd->qbhk', q_block.float(), k_block.float())
-            scores = torch.relu(scores)
-            scores = (scores * weights_block.unsqueeze(-1)).sum(dim=2).transpose(0, 1)
-
-            if causal:
-                q_positions = torch.arange(q_start, q_end, device=q.device).view(1, q_len, 1)
-                k_positions = torch.arange(k_start, k_end, device=q.device).view(
-                    1, 1, k_end - k_start
-                )
-                scores = scores.masked_fill(k_positions > q_positions, float("-inf"))
-
-            if mask is not None:
-                if mask.dim() == 2:
-                    mask_block = mask[q_start:q_end, k_start:k_end].unsqueeze(0)
-                elif mask.dim() == 3:
-                    mask_block = mask[:, q_start:q_end, k_start:k_end]
-                else:
-                    raise AssertionError(f"Unsupported DSA top-k mask shape: {mask.shape}")
-                if mask_block.dtype == torch.bool:
-                    scores = scores.masked_fill(mask_block, float("-inf"))
-                else:
-                    scores = scores + mask_block
-
-            block_topk = min(topk_k, k_end - k_start)
-            block_scores, block_indices = scores.topk(block_topk, dim=-1)
-            block_indices = block_indices + k_start
-
-            candidate_scores = torch.cat((top_scores, block_scores), dim=-1)
-            candidate_indices = torch.cat((top_indices, block_indices), dim=-1)
-            top_scores, gather_indices = candidate_scores.topk(topk_k, dim=-1)
-            top_indices = candidate_indices.gather(-1, gather_indices)
-
-        output_chunks.append(top_indices)
-
-    return torch.cat(output_chunks, dim=1)
+    return torch.cat(output_chunks, dim=0).unsqueeze(0)  # [1, Sq, topk_k]
 
 
 class FlashMLASparseAttentionFunc(torch.autograd.Function):
