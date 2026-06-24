@@ -594,18 +594,24 @@ def _ckpt_bwd_probe():
             big = []
             for o in gc.get_objects():
                 try:
-                    if (
-                        torch.is_tensor(o)
-                        and o.is_cuda
-                        and o.numel() * o.element_size() >= 256 * 1024 * 1024
-                    ):
+                    # REAL cuda tensors only: skip FakeTensor/FunctionalTensor and
+                    # meta tensors (the model is torch.compile'd, so the graph holds
+                    # symbolic-shape fakes that otherwise dominate the scan), and
+                    # size by real storage bytes, which fakes do not have.
+                    if not torch.is_tensor(o):
+                        continue
+                    if type(o).__name__ in ("FakeTensor", "FunctionalTensor"):
+                        continue
+                    if o.is_meta or o.device.type != "cuda":
+                        continue
+                    if o.untyped_storage().nbytes() >= 256 * 1024 * 1024:
                         big.append(o)
                 except Exception:
                     continue
-            big.sort(key=lambda t: -t.numel() * t.element_size())
+            big.sort(key=lambda t: -t.untyped_storage().nbytes())
             lines[0] += " live>=256MiB=%d" % len(big)
             for t in big[:6]:
-                nb = t.numel() * t.element_size()
+                nb = t.untyped_storage().nbytes()
                 refs = []
                 for r in gc.get_referrers(t):
                     if r is big:
