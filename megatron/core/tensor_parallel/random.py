@@ -552,6 +552,99 @@ _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
 
+# ---------------------------------------------------------------------------
+# DEBUG (throwaway): per-layer checkpoint-backward retention probe.
+# Gated by env DEBUG_CKPT_BWD_PROBE. After each layer's CheckpointFunction
+# backward, records the live >=256MiB CUDA tensor count (does it drain per
+# layer, or accumulate?) and, on a few sampled units, who holds them
+# (gc referrers + grad_fn — grad_fn covers the C++/autograd-held case that gc
+# cannot see). Writes to /tmp/checkpoints so it survives pytest output capture.
+# Do not merge.
+# ---------------------------------------------------------------------------
+_CKPT_BWD_PROBE_N = 0
+
+
+def _ckpt_bwd_probe():
+    """Best-effort; never raises into the backward pass."""
+    global _CKPT_BWD_PROBE_N
+    import os
+
+    if not os.environ.get("DEBUG_CKPT_BWD_PROBE"):
+        return
+    i = _CKPT_BWD_PROBE_N
+    _CKPT_BWD_PROBE_N += 1
+    if i >= 180:  # ~two backward passes of an 80-layer model, then go quiet
+        return
+    try:
+        import gc
+
+        try:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else int(os.environ.get("RANK", "0"))
+            )
+        except Exception:
+            rank = int(os.environ.get("RANK", "0"))
+
+        lines = ["CKPT_BWD[unit=%d] mem_alloc=%dMiB" % (i, torch.cuda.memory_allocated() >> 20)]
+
+        # Full gc referrer scan is expensive; only run it on a few sampled units.
+        if i in (1, 3, 6, 12, 24, 48):
+            big = []
+            for o in gc.get_objects():
+                try:
+                    if (
+                        torch.is_tensor(o)
+                        and o.is_cuda
+                        and o.numel() * o.element_size() >= 256 * 1024 * 1024
+                    ):
+                        big.append(o)
+                except Exception:
+                    continue
+            big.sort(key=lambda t: -t.numel() * t.element_size())
+            lines[0] += " live>=256MiB=%d" % len(big)
+            for t in big[:6]:
+                nb = t.numel() * t.element_size()
+                refs = []
+                for r in gc.get_referrers(t):
+                    if r is big:
+                        continue
+                    rt = type(r).__name__
+                    try:
+                        if isinstance(r, dict):
+                            keys = [k for k, v in r.items() if v is t]
+                            owners = {type(o).__name__ for o in gc.get_referrers(r)}
+                            refs.append("dict(keys=%s,owners=%s)" % (keys, owners))
+                        elif isinstance(r, (list, tuple)):
+                            owners = {type(o).__name__ for o in gc.get_referrers(r)}
+                            refs.append("%s(len=%d,owners=%s)" % (rt, len(r), owners))
+                        elif rt == "frame":
+                            c = r.f_code
+                            refs.append(
+                                "frame(%s:%d:%s)"
+                                % (c.co_filename.split("/")[-1], r.f_lineno, c.co_name)
+                            )
+                        else:
+                            refs.append(rt)
+                    except Exception:
+                        refs.append(rt)
+                    if len(refs) >= 8:
+                        break
+                gf = type(t.grad_fn).__name__ if t.grad_fn is not None else None
+                lines.append(
+                    "    HOLD %dMiB shape=%s grad_fn=%s refs=%s"
+                    % (nb >> 20, tuple(t.shape), gf, refs)
+                )
+
+        root = os.environ.get("BT_CHECKPOINT_DIR") or "/tmp/checkpoints"
+        if os.path.isdir(root):
+            with open(os.path.join(root, "ckpt_bwd_probe.rank%d.log" % rank), "a") as fh:
+                fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -630,6 +723,7 @@ class CheckpointFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
+        _ckpt_bwd_probe()
         _unset_checkpointing()
         return (None, None) + grads
 
