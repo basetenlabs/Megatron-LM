@@ -6,6 +6,10 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -110,10 +114,19 @@ def get_dsa_module_spec_for_backend(
         backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
 
+    attention_module = (
+        AbsorbedMLASelfAttention if config.apply_dsa_kernel_fusion else MLASelfAttention
+    )
+    attention_submodules = (
+        AbsorbedMLASelfAttentionSubmodules
+        if config.apply_dsa_kernel_fusion
+        else MLASelfAttentionSubmodules
+    )
+
     attention = ModuleSpec(
-        module=MLASelfAttention,
+        module=attention_module,
         params={"attn_mask_type": AttnMaskType.causal},
-        submodules=MLASelfAttentionSubmodules(
+        submodules=attention_submodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),

@@ -26,6 +26,16 @@ try:
 except ImportError:
     hadamard_transform = None
 
+try:
+    from flash_mla import flash_mla_sparse_fwd
+except ImportError:
+    flash_mla_sparse_fwd = None
+
+try:
+    from cudnn import DSA
+except ImportError:
+    DSA = None
+
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA top-k result.
@@ -344,6 +354,158 @@ def fused_qk_topk_naive(
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
     return index_scores, topk_indices
+
+
+def _chunked_dsa_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    query_block_size: int = 512,
+    key_block_size: int = 512,
+) -> torch.Tensor:
+    """Compute DSA top-k without materializing dense ``[batch, seqlen, seqlen]`` scores.
+
+    This path is for frozen-indexer training/post-training where only deterministic top-k
+    indices are needed. It computes score tiles, applies ``torch.topk`` per tile, then
+    merges per-row candidates into a running global top-k.
+    """
+    seqlen_q, bsz, _, _ = q.shape
+    seqlen_k = k.size(0)
+    topk_k = min(index_topk, seqlen_k)
+    if topk_k < 1:
+        raise ValueError(f"index_topk must be positive, got {index_topk}.")
+
+    if mask is not None and mask.dim() == 4:
+        # [batch, 1, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
+        mask = mask.squeeze(1)
+
+    output_chunks = []
+    for q_start in range(0, seqlen_q, query_block_size):
+        q_end = min(q_start + query_block_size, seqlen_q)
+        q_block = q[q_start:q_end]
+        weights_block = weights[q_start:q_end].float()
+        q_len = q_end - q_start
+
+        top_scores = torch.full(
+            (bsz, q_len, topk_k),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        top_indices = torch.zeros((bsz, q_len, topk_k), dtype=torch.long, device=q.device)
+
+        for k_start in range(0, seqlen_k, key_block_size):
+            k_end = min(k_start + key_block_size, seqlen_k)
+            k_block = k[k_start:k_end]
+
+            # [q_block, batch, heads, dim] x [k_block, batch, dim]
+            #   -> [batch, q_block, k_block]
+            scores = torch.einsum('qbhd,kbd->qbhk', q_block.float(), k_block.float())
+            scores = torch.relu(scores)
+            scores = (scores * weights_block.unsqueeze(-1)).sum(dim=2).transpose(0, 1)
+
+            if causal:
+                q_positions = torch.arange(q_start, q_end, device=q.device).view(1, q_len, 1)
+                k_positions = torch.arange(k_start, k_end, device=q.device).view(
+                    1, 1, k_end - k_start
+                )
+                scores = scores.masked_fill(k_positions > q_positions, float("-inf"))
+
+            if mask is not None:
+                if mask.dim() == 2:
+                    mask_block = mask[q_start:q_end, k_start:k_end].unsqueeze(0)
+                elif mask.dim() == 3:
+                    mask_block = mask[:, q_start:q_end, k_start:k_end]
+                else:
+                    raise AssertionError(f"Unsupported DSA top-k mask shape: {mask.shape}")
+                if mask_block.dtype == torch.bool:
+                    scores = scores.masked_fill(mask_block, float("-inf"))
+                else:
+                    scores = scores + mask_block
+
+            block_topk = min(topk_k, k_end - k_start)
+            block_scores, block_indices = scores.topk(block_topk, dim=-1)
+            block_indices = block_indices + k_start
+
+            candidate_scores = torch.cat((top_scores, block_scores), dim=-1)
+            candidate_indices = torch.cat((top_indices, block_indices), dim=-1)
+            top_scores, gather_indices = candidate_scores.topk(topk_k, dim=-1)
+            top_indices = candidate_indices.gather(-1, gather_indices)
+
+        output_chunks.append(top_indices)
+
+    return torch.cat(output_chunks, dim=1)
+
+
+class FlashMLASparseAttentionFunc(torch.autograd.Function):
+    """Autograd bridge for FlashMLA sparse forward and cuDNN DSA sparse backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        softmax_scale: float,
+        d_v: int,
+    ) -> torch.Tensor:
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError("flash_mla_sparse_fwd is required for FlashMLA sparse attention.")
+
+        output = flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            softmax_scale,
+            d_v=d_v,
+            topk_length=topk_length,
+        )
+        if not isinstance(output, (tuple, list)) or len(output) < 3:
+            raise RuntimeError("flash_mla_sparse_fwd must return at least (output, max_logits, lse).")
+
+        out = output[0].contiguous()
+        lse = output[2].contiguous()
+        ctx.softmax_scale = softmax_scale
+        ctx.kv_had_head_dim = kv.dim() == 3
+        ctx.has_topk_length = topk_length is not None
+        saved_topk_length = topk_length if topk_length is not None else torch.empty(0, device=q.device)
+        ctx.save_for_backward(q, kv, out, lse, indices, saved_topk_length)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        if DSA is None:
+            raise RuntimeError("cuDNN DSA sparse attention backward is not importable.")
+
+        q, kv, out, lse, indices, saved_topk_length = ctx.saved_tensors
+        topk_length = saved_topk_length if ctx.has_topk_length else None
+        kv_for_backward = kv.squeeze(1).contiguous() if kv.dim() == 3 else kv.contiguous()
+        topk_idxs = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices.contiguous()
+        attn_sink = torch.full((q.size(1),), float("-inf"), dtype=torch.float32, device=q.device)
+
+        result = DSA.sparse_attention_backward_wrapper(
+            q.contiguous(),
+            kv_for_backward,
+            out,
+            dout.contiguous(),
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=topk_length,
+        )
+        torch.cuda.synchronize()
+
+        dq = result["dq"]
+        dkv = result["dkv"]
+        if ctx.kv_had_head_dim:
+            dkv = dkv.unsqueeze(1)
+        return dq, dkv, None, None, None, None
 
 
 def fwd_fused_indexer_loss_naive(
@@ -1008,8 +1170,12 @@ class DSAttention(MegatronModule):
     """
 
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
-    """Attribute on ``PackedSeqParams`` carrying the per-microbatch DSA top-k holder when
-    cross-layer top-k sharing is enabled (``dsa_indexer_topk_freq > 1``)."""
+    """Attribute carrying the DSA top-k holder when cross-layer top-k sharing is enabled.
+
+    Packed batches store this on ``PackedSeqParams`` so each microbatch owns an isolated
+    holder. Non-packed batches do not construct ``PackedSeqParams``; they store it on the
+    shared transformer config object for the duration of the forward.
+    """
 
     def __init__(
         self,
@@ -1028,6 +1194,15 @@ class DSAttention(MegatronModule):
         super().__init__(config=config)
 
         self.layer_number = layer_number
+
+        if self.config.apply_dsa_kernel_fusion and self.config.tensor_model_parallel_size != 1:
+            raise ValueError("DSA FlashMLA sparse attention currently requires TP=1.")
+        if self.config.apply_dsa_kernel_fusion and self.config.context_parallel_size != 1:
+            raise ValueError(
+                "DSA FlashMLA sparse attention currently requires CP=1. Context parallelism "
+                "needs global KV exchange and global-sequence top-k indices, which this fused "
+                "path does not implement."
+            )
 
         # DSA cross-layer top-k sharing (GLM-5.2 "IndexShare"). Computing layers own an
         # indexer; skip layers reuse top-k indices from the most recent computing layer in
@@ -1065,27 +1240,78 @@ class DSAttention(MegatronModule):
             )
         self.softmax_scale = softmax_scale
 
+    def _run_sparse_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: Optional[torch.Tensor],
+        topk_indices: torch.Tensor,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        """Run either the fused FlashMLA sparse path or the unfused PyTorch fallback."""
+        if not self.config.apply_dsa_kernel_fusion:
+            assert value is not None, "Unfused DSA attention requires explicit value states."
+            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError(
+                "apply_dsa_kernel_fusion=True requires flash_mla_sparse_fwd, but flash_mla "
+                "is not importable. Install FlashMLA from the nv_dev branch."
+            )
+
+        # Absorbed MLA passes query as [seqlen, batch, heads, qk_dim] and compressed KV as
+        # [seqlen, batch, qk_dim]. FlashMLA sparse prefill expects THD-style tensors:
+        # q [seqlen, heads, qk_dim], kv [seqlen, kv_heads, qk_dim], indices
+        # [seqlen, kv_heads, topk]. The current trainer uses microbatch size 1.
+        if query.size(1) != 1 or key.size(1) != 1 or topk_indices.size(0) != 1:
+            raise RuntimeError("DSA FlashMLA sparse attention currently requires batch size 1.")
+        q = query.squeeze(1).contiguous()
+        kv = key.squeeze(1).contiguous()
+        if kv.dim() == 2:
+            kv = kv.unsqueeze(1)
+        indices = topk_indices.squeeze(0).unsqueeze(1).to(torch.int32).contiguous()
+        topk_length = None
+        if causal:
+            topk_length = torch.arange(1, q.size(0) + 1, device=q.device, dtype=torch.int32)
+            topk_length = torch.clamp(topk_length, max=indices.size(-1)).contiguous()
+
+        if torch.is_grad_enabled() and (q.requires_grad or kv.requires_grad):
+            output = FlashMLASparseAttentionFunc.apply(
+                q,
+                kv,
+                indices,
+                topk_length,
+                self.softmax_scale,
+                self.config.kv_lora_rank,
+            )
+        else:
+            output = flash_mla_sparse_fwd(
+                q,
+                kv,
+                indices,
+                self.softmax_scale,
+                d_v=self.config.kv_lora_rank,
+                topk_length=topk_length,
+            )
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+        return output.reshape(output.size(0), 1, -1).contiguous()
+
     def _get_index_share_topk_holder(
-        self, packed_seq_params: PackedSeqParams
+        self, packed_seq_params: Optional[PackedSeqParams]
     ) -> "dict[int, torch.Tensor]":
         """Return the per-microbatch top-k holder for DSA index sharing.
 
-        The holder is a ``layer_number -> topk_indices`` map stashed on the
-        ``PackedSeqParams`` instance so that skip layers in the same transformer block
-        execution can read the top-k indices produced by the most recent computing layer
-        in this pipeline stage. Cross-pipeline sharing is not supported (validated upstream
-        in ``_validate_dsa_index_share_pipeline_split``).
+        The holder is a ``layer_number -> topk_indices`` map so skip layers in the same
+        transformer block execution can read the top-k indices produced by the most recent
+        computing layer in this pipeline stage. Cross-pipeline sharing is not supported
+        (validated upstream in ``_validate_dsa_index_share_pipeline_split``).
         """
-        if packed_seq_params is None:
-            raise AssertionError(
-                "DSA index-share requires packed_seq_params to carry the per-microbatch "
-                "top-k holder. Disable dsa_indexer_topk_freq sharing or run with packed "
-                "sequence parameters."
-            )
-        holder = getattr(packed_seq_params, self._HOLDER_ATTR, None)
+        holder_owner = packed_seq_params if packed_seq_params is not None else self.config
+        holder = getattr(holder_owner, self._HOLDER_ATTR, None)
         if holder is None:
             holder = {}
-            setattr(packed_seq_params, self._HOLDER_ATTR, holder)
+            setattr(holder_owner, self._HOLDER_ATTR, holder)
         return holder
 
     def forward(
@@ -1099,6 +1325,8 @@ class DSAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        up_v_weight: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1119,30 +1347,10 @@ class DSAttention(MegatronModule):
         """
         sq, b, np, hn = query.size()
         skv = key.size(0)
-        hnv = value.size(3)
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
         qr = qr.detach()
-
-        # Get a FP32 mask with -inf for masked positions.
-        if attn_mask_type is not None:
-            assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
-            # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
-            # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
-            # float_mask [sq, skv]
-            float_mask = torch.triu(
-                torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
-                diagonal=1,
-            )
-        else:
-            assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
-            # [b, 1, sq, skv] -> [b, sq, skv]
-            mask = attention_mask.squeeze()
-            # float_mask [b, sq, skv]
-            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
-                mask, float('-inf')
-            )
 
         # Resolve the per-microbatch top-k holder for DSA index sharing. Computing layers
         # write their fresh top-k indices into the holder; skip layers read the indices
@@ -1170,33 +1378,100 @@ class DSAttention(MegatronModule):
                 # ===================================
                 # Run sparse attention kernel
                 # ===================================
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+                output = self._run_sparse_attention(
+                    query, key, value, topk_indices, causal=attn_mask_type == AttnMaskType.causal
+                )
             else:
                 # ===================================
                 # Prepare inputs for indexer loss
                 # ===================================
                 assert self.indexer is not None
-                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
                 indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
 
-                # ===================================
-                # Attach indexer topk and loss
-                # ===================================
-                # Compute KL divergence loss between indexer scores and true attention scores
-                topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                    q,
-                    weights,
-                    k,
-                    query.detach(),
-                    key.detach(),
-                    self.softmax_scale,
-                    self.index_topk,
-                    indexer_loss_coeff,
-                    float_mask,
-                    getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                    self.pg_collection,
-                    self.config.calculate_per_token_loss,
-                )
+                if indexer_loss_coeff == 0:
+                    if attn_mask_type is not None:
+                        assert (
+                            attn_mask_type == AttnMaskType.causal
+                        ), 'Only causal mask is supported for now'
+                    with torch.no_grad():
+                        q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                        topk_indices = _chunked_dsa_topk(
+                            q,
+                            k,
+                            weights,
+                            self.index_topk,
+                            mask=attention_mask if attn_mask_type is None else None,
+                            causal=attn_mask_type == AttnMaskType.causal,
+                        )
+
+                    output = self._run_sparse_attention(
+                        query,
+                        key,
+                        value,
+                        topk_indices,
+                        causal=attn_mask_type == AttnMaskType.causal,
+                    )
+                    indexer_loss = output.new_zeros(())
+                else:
+                    q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+
+                    # Get a FP32 mask with -inf for masked positions. This is only needed
+                    # for indexer loss; frozen-indexer top-k masks each score tile instead.
+                    if attn_mask_type is not None:
+                        assert (
+                            attn_mask_type == AttnMaskType.causal
+                        ), 'Only causal mask is supported for now'
+                        float_mask = torch.triu(
+                            torch.full(
+                                (sq, skv), float('-inf'), dtype=torch.float32, device=x.device
+                            ),
+                            diagonal=1,
+                        )
+                    else:
+                        assert attention_mask.shape == (
+                            b,
+                            1,
+                            sq,
+                            skv,
+                        ), 'attention_mask shape mismatch'
+                        mask = attention_mask.squeeze()
+                        float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
+                            mask, float('-inf')
+                        )
+
+                    # ===================================
+                    # Attach indexer topk and loss
+                    # ===================================
+                    # Compute KL divergence loss between indexer scores and true attention scores
+                    topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
+                        q,
+                        weights,
+                        k,
+                        query.detach(),
+                        key.detach(),
+                        self.softmax_scale,
+                        self.index_topk,
+                        indexer_loss_coeff,
+                        float_mask,
+                        getattr(self.config, "dsa_indexer_use_sparse_loss", False),
+                        self.pg_collection,
+                        self.config.calculate_per_token_loss,
+                    )
+
+                    # ===================================
+                    # Run sparse attention kernel
+                    # ===================================
+                    output = self._run_sparse_attention(
+                        query,
+                        key,
+                        value,
+                        topk_indices,
+                        causal=attn_mask_type == AttnMaskType.causal,
+                    )
+
+                    # Attach loss to output
+                    output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
                 # Save indexer loss for logging
                 if indexer_loss_coeff > 0:
                     DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1204,14 +1479,6 @@ class DSAttention(MegatronModule):
                         layer_number=self.layer_number,
                         num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
                     )
-
-                # ===================================
-                # Run sparse attention kernel
-                # ===================================
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
-                # Attach loss to output
-                output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         else:
             if self.skip_topk:
                 if topk_holder is None or self.source_layer not in topk_holder:
@@ -1230,20 +1497,31 @@ class DSAttention(MegatronModule):
                 # ===================================
                 # Run sparse attention kernel
                 # ===================================
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+                output = self._run_sparse_attention(
+                    query, key, value, topk_indices, causal=attn_mask_type == AttnMaskType.causal
+                )
             else:
                 # ===================================
                 # Get index scores and top-k indices
                 # ===================================
                 assert self.indexer is not None
-                _, topk_indices = self.indexer.forward_with_scores(
-                    x, qr, mask=float_mask, packed_seq_params=packed_seq_params
+                if attn_mask_type is not None:
+                    assert (
+                        attn_mask_type == AttnMaskType.causal
+                    ), 'Only causal mask is supported for now'
+                topk_indices = _chunked_dsa_topk(
+                    *self.indexer.forward_before_topk(x, qr, packed_seq_params),
+                    self.index_topk,
+                    mask=attention_mask if attn_mask_type is None else None,
+                    causal=attn_mask_type == AttnMaskType.causal,
                 )
 
                 # ===================================
                 # Run sparse attention kernel
                 # ===================================
-                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+                output = self._run_sparse_attention(
+                    query, key, value, topk_indices, causal=attn_mask_type == AttnMaskType.causal
+                )
 
         if self.index_share and not self.skip_topk:
             assert topk_holder is not None and topk_indices is not None

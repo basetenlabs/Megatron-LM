@@ -673,14 +673,36 @@ class AbsorbedMLASelfAttention(Attention):
         _, v_up_weight = self._get_kv_up_weights()
         return v_up_weight
 
+    def _get_effective_kv_up_weight(self) -> torch.Tensor:
+        """Return KV up-projection weight, including LoRA delta when wrapped."""
+        linear = self.linear_kv_up_proj
+        if hasattr(linear, "weight"):
+            return linear.weight
+
+        if not (hasattr(linear, "to_wrap") and hasattr(linear, "adapter")):
+            raise AttributeError("linear_kv_up_proj does not expose a weight or LoRA wrapper.")
+
+        if self.config.tensor_model_parallel_size != 1:
+            raise RuntimeError("Absorbed MLA KV-up LoRA merge currently requires TP=1.")
+
+        adapter = linear.adapter
+        if not (hasattr(adapter, "linear_in") and hasattr(adapter, "linear_out")):
+            raise AttributeError("linear_kv_up_proj LoRA adapter does not expose linear_in/linear_out.")
+
+        base_weight = linear.to_wrap.weight
+        lora_in = adapter.linear_in.weight
+        lora_out = adapter.linear_out.weight
+        return base_weight + (adapter.alpha / adapter.dim) * (lora_out @ lora_in)
+
     def _get_kv_up_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return K and V up-projection weights from the combined per-head MLA layout."""
         expected_rows = self.num_attention_heads_per_partition * (
             self.config.qk_head_dim + self.config.v_head_dim
         )
-        assert self.linear_kv_up_proj.weight.size(0) == expected_rows
-        assert self.linear_kv_up_proj.weight.size(1) == self.config.kv_lora_rank
-        kv_up_weight = self.linear_kv_up_proj.weight.view(
+        effective_weight = self._get_effective_kv_up_weight()
+        assert effective_weight.size(0) == expected_rows
+        assert effective_weight.size(1) == self.config.kv_lora_rank
+        kv_up_weight = effective_weight.view(
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
             self.config.kv_lora_rank,
