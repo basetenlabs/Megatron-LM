@@ -651,6 +651,61 @@ def _ckpt_bwd_probe():
         pass
 
 
+@contextlib.contextmanager
+def _checkpointing_context():
+    """Mark execution as activation checkpointing for the duration of a call."""
+    _set_checkpointing()
+    try:
+        yield
+    finally:
+        _unset_checkpointing()
+
+
+def _env_enabled(name: str) -> bool:
+    """Return true for opt-in debug/experimental environment flags."""
+    import os
+
+    value = os.environ.get(name)
+    return value is not None and value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _checkpoint_non_reentrant(
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+) -> _R:
+    """Run PyTorch non-reentrant checkpointing with Megatron RNG state tracking."""
+    if distribute_saved_activations:
+        raise RuntimeError(
+            "MEGATRON_TP_NON_REENTRANT_CHECKPOINT=1 does not support "
+            "distribute_saved_activations. Native non-reentrant checkpointing "
+            "does not preserve Megatron's activation chunking semantics."
+        )
+
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    forward_rng_states = None
+
+    def wrapped_function(*inner_args):
+        nonlocal forward_rng_states
+        if forward_rng_states is None:
+            forward_rng_states = _get_all_rng_states()
+            with _checkpointing_context():
+                return function(*inner_args)
+
+        with _fork_rng():
+            _set_all_rng_states(*forward_rng_states)
+            with _checkpointing_context():
+                return function(*inner_args)
+
+    return torch_checkpoint(
+        wrapped_function,
+        *args,
+        use_reentrant=False,
+        preserve_rng_state=False,
+        determinism_check="default",
+        early_stop=True,
+    )
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -763,6 +818,8 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
+    if _env_enabled("MEGATRON_TP_NON_REENTRANT_CHECKPOINT"):
+        return _checkpoint_non_reentrant(function, distribute_saved_activations, *args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
