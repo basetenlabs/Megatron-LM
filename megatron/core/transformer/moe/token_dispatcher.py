@@ -207,6 +207,12 @@ class MoETokenDispatcher:
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
 
+    def _clear_forward_state(self, *attr_names: str) -> None:
+        """Drop per-forward hand-off references once the dispatcher has consumed them."""
+        for attr_name in attr_names:
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, None)
+
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
@@ -876,6 +882,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        self._clear_forward_state(
+            "hidden_shape",
+            "hidden_shape_before_permute",
+            "probs",
+            "routing_map",
+            "reversed_local_input_permutation_mapping",
+            "tokens_per_expert",
+            "input_splits",
+            "output_splits",
+            "output_splits_tp",
+            "num_out_tokens",
+            "num_global_tokens_per_local_expert",
+            "capacity",
+            "d2h_event",
+        )
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
@@ -1107,6 +1129,11 @@ class _HybridEPManager(_DispatchManager):
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
+        self.routing_map = None
+        self.token_probs = None
+        self.dispatched_probs = None
+        self.tokens_per_expert = None
+        self.pad_multiple = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1283,6 +1310,15 @@ class _DeepepManager(_DispatchManager):
         # Manually release the metadata to avoid memory leak.
         self.dispatched_indices = None
         self.dispatched_probs = None
+        # These are forward-only hand-off references; autograd Functions own
+        # anything needed for backward after combine/restoration has consumed them.
+        self.reversed_mapping_for_combine = None
+        self.pad_offsets = None
+        self.dispatched_routing_map = None
+        self.hidden_shape_before_permute = None
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
         return hidden_states
 
     def _pad_routing_map(
@@ -1572,4 +1608,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
             hidden_states += self.shared_experts.get_output()
-        return hidden_states.view(self.hidden_shape)
+        hidden_states = hidden_states.view(self.hidden_shape)
+        self._clear_forward_state("hidden_shape")
+        return hidden_states
