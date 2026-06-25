@@ -706,6 +706,23 @@ def _checkpoint_non_reentrant(
     )
 
 
+def _te_checkpoint_non_reentrant(
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+) -> _R:
+    """Run TransformerEngine non-reentrant checkpointing as an opt-in experiment."""
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
+
+    return te_checkpoint(
+        function,
+        distribute_saved_activations,
+        get_cuda_rng_tracker,
+        get_tensor_model_parallel_group(),
+        *args,
+        use_reentrant=False,
+    )
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -818,6 +835,8 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
+    if _env_enabled("MEGATRON_TP_TE_NON_REENTRANT_CHECKPOINT"):
+        return _te_checkpoint_non_reentrant(function, distribute_saved_activations, *args)
     if _env_enabled("MEGATRON_TP_NON_REENTRANT_CHECKPOINT"):
         return _checkpoint_non_reentrant(function, distribute_saved_activations, *args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
