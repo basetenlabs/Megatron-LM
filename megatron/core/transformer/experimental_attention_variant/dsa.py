@@ -532,7 +532,6 @@ class FlashMLASparseAttentionFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
         )
-        torch.cuda.synchronize()
 
         dq = result["dq"]
         dkv = result["dkv"]
