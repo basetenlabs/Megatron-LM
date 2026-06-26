@@ -1434,24 +1434,28 @@ class DSAttentionFused(MegatronModule):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        value: torch.Tensor,
-        x: torch.Tensor,
-        qr: torch.Tensor,
+        value: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
+        x: torch.Tensor = None,
+        qr: torch.Tensor = None,
+        up_v_weight: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
     ):
         """Fused frozen-indexer sparse attention with IndexShare.
 
-        Argument order matches ``AbsorbedMLASelfAttention``'s core_attention call
-        (``query, key, value, x, qr, attention_mask``). ``query``: ``[sq, b, np, hn]``
-        absorbed query; ``key``: ``[sq, b, 1, v_head_dim]`` single-head compressed KV
-        (value == key under MQA). The outer absorbed-MLA applies the V up-projection to
-        the returned ``[sq, b, np*v_head_dim]`` output.
+        Keyword names match ``AbsorbedMLASelfAttention``'s core_attention call, which passes
+        ``value``/``attention_mask``/``x``/``qr``/``up_v_weight``/``position_ids``/
+        ``packed_seq_params``/``attn_mask_type`` by keyword. ``query``: ``[sq, b, np,
+        k_channels]`` absorbed query (k_channels = kv_lora_rank + rope); ``key``: ``[sq, b, 1,
+        k_channels]`` single-head compressed KV (value == key under MQA). ``up_v_weight`` and
+        ``position_ids`` are unused here: the outer absorbed-MLA applies the V up-projection
+        after core attention, and the indexer derives RoPE positions internally.
         """
         b = query.size(1)
-        kv = key.squeeze(-2) if key.dim() == 4 else key  # [sq, b, v_head_dim]
+        kv = key.squeeze(-2) if key.dim() == 4 else key  # [sq, b, k_channels]
         seqlen_kv = kv.size(0)
 
         holder = (
@@ -1488,6 +1492,10 @@ class DSAttentionFused(MegatronModule):
         flat_idxs, flat_tlen = build_flat_topk_idxs(
             topk_local, batch_size=b, seqlen_kv=seqlen_kv, compact=True
         )
+        # dsa_sparse_attn (FlashMLA convention) attends with the full absorbed query/key dim
+        # (kv_lora_rank + rope) but returns only the latent value subspace
+        # [sq, b, np * kv_lora_rank], which is exactly what the outer absorbed-MLA V
+        # up-projection consumes.
         output = dsa_sparse_attn(
             query,
             kv,
