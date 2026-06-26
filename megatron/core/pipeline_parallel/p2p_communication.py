@@ -25,7 +25,8 @@ _P2P_CHUNK_NUMEL = 1 << 30             # ~1.07e9 elems/chunk, safely < INT_MAX
 
 
 def _split_for_p2p(tensor):
-    if tensor.numel() <= _P2P_SPLIT_THRESHOLD:
+    import os
+    if os.environ.get("DSV4_NCCL_NOCHUNK") == "1" or tensor.numel() <= _P2P_SPLIT_THRESHOLD:
         return [tensor]
     n0 = tensor.shape[0]
     per_row = tensor.numel() // n0 if n0 else tensor.numel()

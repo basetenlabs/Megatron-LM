@@ -228,9 +228,17 @@ class MoETokenDispatcher:
 
     def _clear_forward_state(self, *attr_names: str) -> None:
         """Drop per-forward hand-off references once the dispatcher has consumed them."""
+        _freed = 0; _nc = 0
         for attr_name in attr_names:
             if hasattr(self, attr_name):
+                _v = getattr(self, attr_name)
+                if isinstance(_v, torch.Tensor):
+                    _freed += _v.numel() * _v.element_size(); _nc += 1
                 setattr(self, attr_name, None)
+        _k = getattr(type(self), "_clrlog", 0)
+        if _nc and _k < 16:
+            print(f"[VERIFY-DISP-CLEAR] {type(self).__name__} cleared {_nc} tensors freed {_freed/1e6:.1f}MB", flush=True)
+            type(self)._clrlog = _k + 1
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
@@ -1013,9 +1021,17 @@ class _DispatchManager(ABC):
 
     def _clear_forward_state(self, *attr_names: str) -> None:
         """Drop per-forward hand-off references once the dispatcher has consumed them."""
+        _freed = 0; _nc = 0
         for attr_name in attr_names:
             if hasattr(self, attr_name):
+                _v = getattr(self, attr_name)
+                if isinstance(_v, torch.Tensor):
+                    _freed += _v.numel() * _v.element_size(); _nc += 1
                 setattr(self, attr_name, None)
+        _k = getattr(type(self), "_clrlog", 0)
+        if _nc and _k < 16:
+            print(f"[VERIFY-DISP-CLEAR] {type(self).__name__} cleared {_nc} tensors freed {_freed/1e6:.1f}MB", flush=True)
+            type(self)._clrlog = _k + 1
 
 class _HybridEPManager(_DispatchManager):
     """

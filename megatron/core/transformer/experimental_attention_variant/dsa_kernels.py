@@ -406,13 +406,17 @@ def _dsa_indexer_score_kernel(
     )
 
 
+import os as _os
+_DSV4_INDEXER_QBLOCK = int(_os.environ.get("DSV4_INDEXER_QBLOCK", "4096"))
+
+
 def _chunked_indexer_topk_bshd(
     q_bshd: Tensor,
     k_bsd: Tensor,
     w_bsh: Tensor,
     topk: int,
     ratio: int = 4,
-    query_block_size: int = 2048,
+    query_block_size: int = _DSV4_INDEXER_QBLOCK,
 ) -> Tuple[Tensor, Tensor]:
     """Frozen-indexer top-k without materializing the dense ``(b, sq, sk)`` scores.
 

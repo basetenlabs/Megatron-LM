@@ -455,6 +455,10 @@ class _AllToAll(torch.autograd.Function):
                     input_split_sizes=input_split_sizes, group=group,
                 )
 
+        import os as _os
+        if _os.environ.get("DSV4_NCCL_NOCHUNK") == "1":
+            _a2a(output, input)
+            return output
         # int64-safe: a single all_to_all_single of >= 2**31 elements overflows the
         # int32 per-pair count in c10d and deadlocks (DSv4 mHC dispatch at 131k = 2**31).
         # Split along the feature (last) dim into sub-2**31 ops; token split_sizes are
