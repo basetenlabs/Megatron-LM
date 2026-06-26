@@ -14,6 +14,25 @@ from megatron.core.utils import nvtx_decorator
 Shape = Union[List[int], torch.Size]
 
 
+# --- int64-safe p2p: NCCL/c10d use a 32-bit element count per op; a single
+# isend/irecv of >= 2**31 elements overflows and deadlocks. DSv4-Flash's
+# mHC-expanded pipeline activation at 131k seq is exactly 2**31 elements
+# (131072 x 16384), so split into sub-2**31 contiguous dim-0 chunks. Sender and
+# receiver split identically (same tensor shape) -> matching ops pair up in
+# batch_isend_irecv. ---
+_P2P_SPLIT_THRESHOLD = (1 << 31) - 1   # INT_MAX
+_P2P_CHUNK_NUMEL = 1 << 30             # ~1.07e9 elems/chunk, safely < INT_MAX
+
+
+def _split_for_p2p(tensor):
+    if tensor.numel() <= _P2P_SPLIT_THRESHOLD:
+        return [tensor]
+    n0 = tensor.shape[0]
+    per_row = tensor.numel() // n0 if n0 else tensor.numel()
+    max_rows = max(1, _P2P_CHUNK_NUMEL // max(1, per_row))
+    return [tensor[i:i + max_rows] for i in range(0, n0, max_rows)]
+
+
 def _batched_p2p_ops(
     *,
     tensor_send_prev: Optional[torch.Tensor],
@@ -25,26 +44,17 @@ def _batched_p2p_ops(
     next_pipeline_rank: int,
 ):
     ops = []
-    if tensor_send_prev is not None:
-        send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
-        )
-        ops.append(send_prev_op)
-    if tensor_recv_prev is not None:
-        recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
-        )
-        ops.append(recv_prev_op)
-    if tensor_send_next is not None:
-        send_next_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
-        )
-        ops.append(send_next_op)
-    if tensor_recv_next is not None:
-        recv_next_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
-        )
-        ops.append(recv_next_op)
+
+    def _add(op_fn, tensor, peer):
+        if tensor is None:
+            return
+        for chunk in _split_for_p2p(tensor):
+            ops.append(torch.distributed.P2POp(op_fn, chunk, peer, group))
+
+    _add(torch.distributed.isend, tensor_send_prev, prev_pipeline_rank)
+    _add(torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank)
+    _add(torch.distributed.isend, tensor_send_next, next_pipeline_rank)
+    _add(torch.distributed.irecv, tensor_recv_next, next_pipeline_rank)
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:

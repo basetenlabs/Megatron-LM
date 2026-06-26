@@ -730,6 +730,11 @@ class _AttnMlpSplitCheckpointFunction(torch.autograd.Function):
                 output = ctx.run_mlp(boundary_leaf)
             torch.autograd.backward(output, grad_output)
             grad_boundary = boundary_leaf.grad
+            # Drop the MLP-stage activations before recomputing attention so the
+            # two halves never co-reside: the autograd graphs already don't, but
+            # the n-stream output and grad_output tensors (~4 GiB each at 131k)
+            # otherwise linger through the step-3 attention recompute below.
+            del output, grad_output, boundary_leaf, boundary_value
 
             # 3) Recompute attention with grad and backprop into the layer input.
             _set_all_rng_states(*ctx.rng_states_attn)
