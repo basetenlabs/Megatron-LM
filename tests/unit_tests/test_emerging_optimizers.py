@@ -1320,7 +1320,12 @@ def test_soap_optimizer_smoke():
     model.weight.data.fill_(1.0)
 
     optimizer = SOAP(
-        params=[model.weight], lr=0.01, betas=(0.9, 0.999), shampoo_beta=0.95, weight_decay=0.01
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        weight_decay=0.01,
+        precondition_frequency=1,
     )
 
     # Test basic properties
@@ -1368,7 +1373,12 @@ def test_soap_optimizer_multiple_steps():
     model.weight.data.fill_(1.0)
 
     optimizer = SOAP(
-        params=[model.weight], lr=0.01, betas=(0.9, 0.999), shampoo_beta=0.95, weight_decay=0.01
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        weight_decay=0.01,
+        precondition_frequency=1,
     )
 
     weights_history = [model.weight.data.clone()]
@@ -1391,6 +1401,36 @@ def test_soap_optimizer_multiple_steps():
 
 
 @skip_no_soap
+@pytest.mark.parametrize("precondition_frequency", [1, 5, 10])
+def test_soap_optimizer_precondition_frequency(precondition_frequency):
+    """Test SOAP optimizer with different precondition frequencies."""
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=0.95,
+        precondition_frequency=precondition_frequency,
+    )
+
+    input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), f"Weight should be updated with precondition_frequency={precondition_frequency}"
+
+
+@skip_no_soap
 @pytest.mark.parametrize("use_kl_shampoo", [True, False])
 def test_soap_optimizer_kl_shampoo(use_kl_shampoo):
     """Test SOAP optimizer with and without KL-Shampoo preconditioner."""
@@ -1405,6 +1445,7 @@ def test_soap_optimizer_kl_shampoo(use_kl_shampoo):
         betas=(0.9, 0.999),
         shampoo_beta=0.95,
         use_kl_shampoo=use_kl_shampoo,
+        precondition_frequency=1,
     )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
@@ -1429,7 +1470,13 @@ def test_soap_optimizer_shampoo_beta(shampoo_beta):
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
 
-    optimizer = SOAP(params=[model.weight], lr=0.01, betas=(0.9, 0.999), shampoo_beta=shampoo_beta)
+    optimizer = SOAP(
+        params=[model.weight],
+        lr=0.01,
+        betas=(0.9, 0.999),
+        shampoo_beta=shampoo_beta,
+        precondition_frequency=1,
+    )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
     output = model(input_tensor)
@@ -1480,6 +1527,7 @@ class TestSoapOptimizerMultiRank:
             bf16=True,
             use_distributed_optimizer=False,
             soap_shampoo_beta=0.95,
+            soap_precondition_frequency=1,
             soap_use_kl_shampoo=True,
         )
 

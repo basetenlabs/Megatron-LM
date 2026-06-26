@@ -1206,7 +1206,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
-                mtp_layer_number=self.layer_number,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -1370,7 +1369,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         hidden_states: Tensor,
         decoder_input: Tensor,
-        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -1417,7 +1415,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
-                        input_ids=input_ids,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1434,7 +1431,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
-                        input_ids=input_ids,
                     )
 
         if not self.mhc_enabled:
@@ -1502,7 +1498,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = self._proj_and_transformer_layer(
             hidden_states=hidden_states,
             decoder_input=decoder_input,
-            input_ids=next_token_ids,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
@@ -1516,7 +1511,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         hidden_states: Tensor,
         decoder_input: Tensor,
-        input_ids: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
@@ -1553,7 +1547,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         def custom_forward(
             hidden_states,
             decoder_input,
-            input_ids,
             attention_mask,
             padding_mask,
             context,
@@ -1566,7 +1559,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             return self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
-                input_ids=input_ids,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 context=context,
@@ -1614,7 +1606,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
                     decoder_input,
-                    input_ids,
                     attention_mask,
                     padding_mask,
                     context,
@@ -1635,7 +1626,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     self.config.distribute_saved_activations,
                     hidden_states,
                     decoder_input,
-                    input_ids,
                     attention_mask,
                     padding_mask,
                     context,
@@ -1688,7 +1678,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             outputs = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
-                input_ids=input_ids,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 context=context,
@@ -1762,7 +1751,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
-                input_ids=input_ids,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 context=context,
@@ -1779,7 +1767,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
-                input_ids=input_ids,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 context=context,
@@ -1955,11 +1942,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
-
-        if self.config.mtp_detach_heads:
-            # Tag MTP params so the optimizer can clip their gradients separately.
-            for param in self.parameters():
-                param.grad_norm_group = 'mtp'
 
     def _build_layers(self, pg_collection):
         # Determine number of depths to build

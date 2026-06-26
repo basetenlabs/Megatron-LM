@@ -58,12 +58,7 @@ from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
-from .optimizer import (
-    MixedPrecisionOptimizer,
-    _zero_grad_group_helper,
-    copy_optimizer_param_metadata,
-    param_group_identifier_keys,
-)
+from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
@@ -418,7 +413,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
-                        copy_optimizer_param_metadata(shard_model_param, model_param)
+                        if hasattr(model_param, 'shared'):
+                            shard_model_param.shared = model_param.shared
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -449,7 +445,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        copy_optimizer_param_metadata(shard_main_param, model_param)
+                        if hasattr(model_param, 'shared'):
+                            shard_main_param.shared = model_param.shared
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -471,7 +468,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
-                    copy_optimizer_param_metadata(shard_model_param, model_param)
+                    if hasattr(model_param, 'shared'):
+                        shard_model_param.shared = model_param.shared
 
                 else:
                     raise TypeError(

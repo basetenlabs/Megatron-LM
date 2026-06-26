@@ -17,7 +17,6 @@ from packaging.version import Version as PkgVersion
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -1281,27 +1280,6 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        if args.megatron_fsdp_prefetch_recompute_forward_weights:
-            assert args.data_parallel_sharding_strategy == "optim_grads_params", (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
-                'with --data-parallel-sharding-strategy optim_grads_params.'
-            )
-            assert args.recompute_granularity == "full", (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
-                "with full activation recomputation."
-            )
-            assert not args.overlap_moe_expert_parallel_comm, (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
-                "with --overlap-moe-expert-parallel-comm."
-            )
-    else:
-        assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
-            "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
-        )
-        assert not args.megatron_fsdp_cache_param_bucket_views, (
-            "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
-        )
-
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -1592,44 +1570,6 @@ def validate_args(args, defaults={}):
             f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
-
-    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
-        args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
-            args.pad_packed_seq_alignment
-        )
-        if args.max_seqlen_per_dp_cp_rank is None:
-            raise ValueError(
-                '--max-seqlen-per-dp-cp-rank must be set when '
-                '--pad-packed-seq-alignment is enabled.'
-            )
-        if args.pad_packed_seq_alignment != 'max':
-            if args.pad_packed_seq_alignment <= 0:
-                raise ValueError(
-                    "--pad-packed-seq-alignment must be 'max' or a positive integer "
-                    "alignment."
-                )
-            if args.pad_packed_seq_alignment > args.max_seqlen_per_dp_cp_rank:
-                raise ValueError(
-                    '--pad-packed-seq-alignment must not exceed '
-                    f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
-                    f'got {args.pad_packed_seq_alignment}.'
-                )
-
-    if args.cuda_graph_impl != "none" and (
-        args.sequence_packing_scheduler is not None or args.dynamic_context_parallel
-    ):
-        if getattr(args, 'pad_packed_seq_alignment', None) is None:
-            raise ValueError('THD CUDA Graph requires --pad-packed-seq-alignment to be set.')
-        if (
-            args.pad_packed_seq_alignment != 'max'
-            and args.pad_packed_seq_alignment != args.max_seqlen_per_dp_cp_rank
-        ):
-            raise ValueError(
-                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
-                'or --pad-packed-seq-alignment equal to '
-                f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
-                f'got {args.pad_packed_seq_alignment}.'
-            )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -2219,51 +2159,8 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
-        _pat = args.hybrid_layer_pattern
-        _has_dsv4_csa = (
-            (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
-        )
-        _has_dsa = Symbols.DS_ATTENTION in _pat
-        if getattr(args, 'experimental_attention_variant', None) is None:
-            # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
-            # requires the full dsv4_hybrid contract (MLA, TP==1, no qk_clip,
-            # qk_head_dim/kv_lora_rank derivation). Set the variant so transformer_config runs
-            # that validation+derivation rather than silently skipping it. 'D' alone stays legacy
-            # DSv3 'dsa'. An explicit --experimental-attention-variant is always respected.
-            if _has_dsv4_csa:
-                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
-            elif _has_dsa:
-                kw_args['experimental_attention_variant'] = 'dsa'
-        # When the dsv4_hybrid variant is active (set above or explicitly) and the user did not
-        # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
-        # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
-        # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
-        _variant = kw_args.get('experimental_attention_variant',
-                               getattr(args, 'experimental_attention_variant', None))
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
-            _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
-            # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
-            # depth (a depth can contain multiple hybrid layers, e.g. "/MD-E"). This makes the
-            # array long enough for the deepseek attn index (num_layers + layer_number - 1) for
-            # any MTP attention position, not just depth-first. C->4, H->128, others->0.
-            _sections = _pat.split(Symbols.MTP_SEPARATOR)
-            _ratios = [_ratio_map.get(c, 0) for c in _sections[0].replace(Symbols.PIPE, '')]
-            for _mtp_sec in _sections[1:]:
-                _ratios += [_ratio_map.get(c, 0) for c in _mtp_sec.replace(Symbols.PIPE, '')]
-            kw_args['csa_compress_ratios'] = _ratios
-            args.csa_compress_ratios = _ratios
-        # Exact length check (the pattern is known here, so the precise per-layer count is too):
-        # one ratio per main layer + one per MTP layer of every MTP depth. This catches a
-        # mis-sized user-provided --csa-compress-ratios with a clear error. (transformer_config
-        # keeps a >= backstop because it does not have the pattern to recompute this exactly.)
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is not None:
-            _secs = _pat.split(Symbols.MTP_SEPARATOR)
-            _exact_len = sum(len(s.replace(Symbols.PIPE, '')) for s in _secs)
-            assert len(args.csa_compress_ratios) == _exact_len, (
-                f"csa_compress_ratios length ({len(args.csa_compress_ratios)}) must equal the "
-                f"number of layers in the hybrid pattern (main + every MTP-depth layer) "
-                f"= {_exact_len} for pattern '{_pat}'."
-            )
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -4805,8 +4702,7 @@ def _add_experimental_attention_variant_args(parser):
         'Accepts a string containing a Python list expression, e.g.: '
         '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
         'Each value is the compression ratio for the corresponding '
-        'transformer layer (valid values: 0, 4, 128; 0 = sliding-window-only, the "W" '
-        'hybrid layer symbol). '
+        'transformer layer (valid values: 0, 4, 128). '
         'The list length must equal num_layers.',
     )
     group.add_argument(
@@ -4816,10 +4712,6 @@ def _add_experimental_attention_variant_args(parser):
         'and fall back to unfused PyTorch implementations.',
         dest='apply_dsa_kernel_fusion',
     )
-    # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss},
-    # --csa-window-size, --csa-compress-rotary-base, --csa-dense-mode are
-    # auto-generated by ArgumentGroupFactory from TransformerConfig fields
-    # (none of them are in the exclude list at line 2500-2576).
     return parser
 
 
@@ -4987,27 +4879,6 @@ def _add_experimental_args(parser):
         "model gradients during FSDP. If 'auto', then the main gradient data-type will "
         "be used for the gradient communication / reduction data-type. When using NCCL "
         "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.",
-    )
-    group.add_argument(
-        '--megatron-fsdp-prefetch-recompute-forward-weights',
-        action='store_true',
-        default=False,
-        dest='megatron_fsdp_prefetch_recompute_forward_weights',
-        help=(
-            'If set, Megatron-FSDP prefetches rowwise weights needed by activation '
-            'recomputation during backward before prefetching backward transpose '
-            'weights.'
-        ),
-    )
-    group.add_argument(
-        '--megatron-fsdp-cache-param-bucket-views',
-        action='store_true',
-        default=False,
-        dest='megatron_fsdp_cache_param_bucket_views',
-        help=(
-            'If set, Megatron-FSDP caches parameter bucket views to reduce repeated '
-            'Python-side view setup when attaching module parameters to all-gather buckets.'
-        ),
     )
     group.add_argument(
         '--megatron-fsdp-enable-fine-grained-param-gather',

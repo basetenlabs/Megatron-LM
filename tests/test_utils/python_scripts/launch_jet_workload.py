@@ -652,11 +652,10 @@ def main(
                 )
                 sys.exit(int(not success))  # invert for exit 0
 
-            if not success or parse_failed_job(logs=mainrank_log):
-                logger.error("Release pipeline finished with status %s, retrying.", status.name)
+            if parse_failed_job(logs=mainrank_log):
                 send_slack_alert(
                     test_case=test_case,
-                    context=f"pipeline finished with status {status.name}, retrying",
+                    context="pipeline failed, retrying",
                     n_iteration=n_iteration,
                     n_attempts=n_attempts,
                 )
