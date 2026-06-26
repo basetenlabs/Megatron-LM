@@ -18,16 +18,14 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-    AbsorbedMLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
-    DSAttentionFused,
     DSAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.glm_dsa_fused import (
+    build_glm_dsa_fused_attention_spec,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -123,31 +121,10 @@ def get_dsa_module_spec_for_backend(
     )
 
     if config.apply_dsa_kernel_fusion:
-        # GLM-5.2 fused DSA: absorbed MLA (MQA-form core, V up-projection applied after
-        # core attention) + FlashMLA / cuDNN sparse attention via dsa_kernels, with
-        # frozen-indexer top-k and IndexShare. The combined kv up-projection is split into
-        # k/v inside AbsorbedMLASelfAttention at runtime (matrix absorption), so the spec and
-        # the HF weight mapping stay identical to the unfused path below.
-        core_attention = ModuleSpec(
-            module=DSAttentionFused,
-            submodules=DSAttentionSubmodules(indexer=indexer),
-        )
-        attention = ModuleSpec(
-            module=AbsorbedMLASelfAttention,
-            params={"attn_mask_type": AttnMaskType.causal},
-            submodules=AbsorbedMLASelfAttentionSubmodules(
-                linear_q_proj=backend.column_parallel_linear(),
-                linear_q_down_proj=backend.linear(),
-                linear_q_up_proj=backend.column_parallel_linear(),
-                linear_kv_down_proj=backend.linear(),
-                linear_kv_up_proj=backend.column_parallel_linear(),
-                core_attention=core_attention,
-                linear_proj=backend.row_parallel_linear(),
-                q_layernorm=qk_norm,
-                kv_layernorm=qk_norm,
-            ),
-            metainfo={"fuse_input_layernorm": False},
-        )
+        # GLM-5.2 fused DSA (absorbed MLA + fused frozen-indexer core) is built in the additive
+        # Baseten module to keep this upstream builder merge-clean; see
+        # glm_dsa_fused.build_glm_dsa_fused_attention_spec.
+        attention = build_glm_dsa_fused_attention_spec(backend, qk_norm, indexer)
     else:
         # Unfused reference path: standard MLA (combined kv up-proj) + multi-head DSAttention.
         core_attention = ModuleSpec(
