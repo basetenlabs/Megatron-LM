@@ -362,10 +362,14 @@ def _dsa_indexer_score_kernel(
     All offsets feeding pointer arithmetic are promoted to int64 — at 131k the
     element offsets (``offs * stride``) overflow int32.
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    # int64 BEFORE the multiply: pid*BLOCK must not be computed in int32 (overflows
+    # int32 once chunk/seq grows). Cast program_id and q_start to int64 up front so
+    # every derived offset and address is 64-bit.
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+    q_start = q_start.to(tl.int64)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
     offs_d = tl.arange(0, D).to(tl.int64)
 
     m_valid = offs_m < q_len
@@ -402,13 +406,17 @@ def _dsa_indexer_score_kernel(
     )
 
 
+import os as _os
+_DSV4_INDEXER_QBLOCK = int(_os.environ.get("DSV4_INDEXER_QBLOCK", "4096"))
+
+
 def _chunked_indexer_topk_bshd(
     q_bshd: Tensor,
     k_bsd: Tensor,
     w_bsh: Tensor,
     topk: int,
     ratio: int = 4,
-    query_block_size: int = 2048,
+    query_block_size: int = _DSV4_INDEXER_QBLOCK,
 ) -> Tuple[Tensor, Tensor]:
     """Frozen-indexer top-k without materializing the dense ``(b, sq, sk)`` scores.
 

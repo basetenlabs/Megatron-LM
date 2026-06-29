@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -563,6 +564,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
@@ -1903,10 +1905,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"(got {self.recompute_method}); only the uniform path runs "
                     "layers eagerly so they can self-checkpoint."
                 )
-            if self.fp8 is not None or self.fp4 is not None:
+            if (self.fp8 is not None or self.fp4 is not None) and \
+                    os.environ.get("DSV4_FP8_SPLIT_RECOMPUTE") != "1":
                 raise ValueError(
                     "recompute_split_attn_mlp is not supported with fp8/fp4 recipes; "
-                    "the staged recompute path uses tensor_parallel.checkpoint semantics only."
+                    "the staged recompute path uses tensor_parallel.checkpoint semantics only. "
+                    "Set DSV4_FP8_SPLIT_RECOMPUTE=1 to use the fp8-aware split path."
                 )
             if self.distribute_saved_activations:
                 raise ValueError(
@@ -1927,6 +1931,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn_norm_out",
                     "mhc",
                     "gdn",
                 }

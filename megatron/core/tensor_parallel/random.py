@@ -693,11 +693,25 @@ class _AttnMlpSplitCheckpointFunction(torch.autograd.Function):
         # Capture RNG before attention and before MLP so each stage's recompute
         # reproduces the exact dropout masks of this forward.
         ctx.rng_states_attn = _get_all_rng_states()
-        with torch.no_grad():
+        # fp8: capture autocast state so backward recompute reuses the same scaling
+        # (mirrors CheckpointWithoutOutputFunction). Save the attn->mlp boundary so
+        # attention is recomputed exactly ONCE in backward -> TE's per-module
+        # recompute_phase bookkeeping stays single-shot (the original double attn
+        # recompute is incompatible with fp8 amax replay).
+        ctx.fp8 = bool(HAVE_TE and FP8GlobalStateManager.is_fp8_enabled())
+        ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if ctx.fp8 else None
+        _fwd_ctx = (
+            activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+            if ctx.fp8 else contextlib.nullcontext()
+        )
+        with torch.no_grad(), _fwd_ctx:
             boundary = run_attention(layer_input)
             ctx.rng_states_mlp = _get_all_rng_states()
             output = run_mlp(boundary)
-        ctx.save_for_backward(layer_input)
+        if ctx.fp8:
+            ctx.save_for_backward(layer_input, boundary)
+        else:
+            ctx.save_for_backward(layer_input)
         _unset_checkpointing()
         return output
 
@@ -713,27 +727,47 @@ class _AttnMlpSplitCheckpointFunction(torch.autograd.Function):
                 "please use .backward() if possible"
             )
         _set_checkpointing()
-        (layer_input,) = ctx.saved_tensors
+        _fp8 = getattr(ctx, "fp8", False)
+        if _fp8:
+            layer_input, saved_boundary = ctx.saved_tensors
+        else:
+            (layer_input,) = ctx.saved_tensors
+            saved_boundary = None
         detached_input = detach_variable((layer_input,))[0]
 
+        def _rc_ctx():
+            return (
+                activation_recompute_forward(activation_recompute=True, recompute_phase=True)
+                if _fp8 else contextlib.nullcontext()
+            )
+        def _f8_ctx():
+            return fp8_autocast(enabled=True, fp8_recipe=ctx.fp8_recipe) if _fp8 else contextlib.nullcontext()
+
         with _fork_rng():
-            # 1) Regenerate the attention->MLP boundary value only (no graph).
-            _set_all_rng_states(*ctx.rng_states_attn)
-            with torch.no_grad():
-                boundary_value = ctx.run_attention(detached_input)
-            boundary_leaf = boundary_value.detach()
-            boundary_leaf.requires_grad_(True)
+            boundary_value = None
+            if _fp8:
+                # Boundary was saved in forward -> skip the extra no_grad attn pass.
+                boundary_leaf = saved_boundary.detach()
+                boundary_leaf.requires_grad_(True)
+            else:
+                # 1) Regenerate the attention->MLP boundary value only (no graph).
+                _set_all_rng_states(*ctx.rng_states_attn)
+                with torch.no_grad():
+                    boundary_value = ctx.run_attention(detached_input)
+                boundary_leaf = boundary_value.detach()
+                boundary_leaf.requires_grad_(True)
 
             # 2) Recompute MLP/MoE with grad, backprop into boundary, free its graph.
             _set_all_rng_states(*ctx.rng_states_mlp)
-            with torch.enable_grad():
+            with torch.enable_grad(), _rc_ctx(), _f8_ctx():
                 output = ctx.run_mlp(boundary_leaf)
             torch.autograd.backward(output, grad_output)
             grad_boundary = boundary_leaf.grad
+            del output, grad_output, boundary_leaf, boundary_value
 
             # 3) Recompute attention with grad and backprop into the layer input.
             _set_all_rng_states(*ctx.rng_states_attn)
-            with torch.enable_grad():
+            with torch.enable_grad(), _rc_ctx(), _f8_ctx():
                 boundary_for_attn = ctx.run_attention(detached_input)
             torch.autograd.backward(boundary_for_attn, grad_boundary)
 
