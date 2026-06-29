@@ -442,55 +442,24 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        def _a2a(out, inp):
-            if use_nccl_stream:
-                h = torch.distributed.all_to_all_single(
-                    out, inp, output_split_sizes=output_split_sizes,
-                    input_split_sizes=input_split_sizes, group=group, async_op=True,
-                )
-                h.wait()
-            else:
-                torch.distributed.all_to_all_single(
-                    out, inp, output_split_sizes=output_split_sizes,
-                    input_split_sizes=input_split_sizes, group=group,
-                )
-
-        import os as _os
-        if _os.environ.get("DSV4_NCCL_NOCHUNK") == "1":
-            _a2a(output, input)
-            return output
-        # int64-safe: a single all_to_all_single of >= 2**31 elements overflows the
-        # int32 per-pair count in c10d and deadlocks (DSv4 mHC dispatch at 131k = 2**31).
-        # Split along the feature (last) dim into sub-2**31 ops; token split_sizes are
-        # unchanged by feature slicing so the all2all-v structure stays valid.
-        _A2A_THRESHOLD = (1 << 31) - 1
-        _A2A_CHUNK = 1 << 29
-        # n MUST be identical on every rank: all_to_all_single is collective, and an
-        # all2all-v has per-rank-varying numel, so deriving n from LOCAL numel desyncs
-        # the chunk count across ranks -> mismatched collective -> NCCL kernel spins at
-        # 100% GPU waiting on an absent peer. All-reduce MAX the local numel first.
-        _local_max = max(input.numel(), output.numel())
-        _g = torch.tensor([_local_max], device=torch.cuda.current_device(), dtype=torch.long)
-        torch.distributed.all_reduce(_g, op=torch.distributed.ReduceOp.MAX, group=group)
-        _global_max = int(_g.item())
-        if input.dim() < 2 or _global_max <= _A2A_THRESHOLD:
-            _a2a(output, input)
-            return output
-        feature = input.shape[-1]
-        n = (_global_max + _A2A_CHUNK - 1) // _A2A_CHUNK
-        feat_chunk = max(1, (feature + n - 1) // n)
-        # Write each feature-slice straight into the PRE-ALLOCATED `output` (only one
-        # transient chunk live at a time) instead of appending to a list + torch.cat,
-        # which double-allocated the whole output tensor (cat result + all chunks +
-        # the unused `output`) and added ~2x the dispatch buffer at peak -> OOM at 131k.
-        # all_to_all_single needs contiguous in/out, so stage a contiguous chunk + copy_.
-        for f0 in range(0, feature, feat_chunk):
-            f1 = min(f0 + feat_chunk, feature)
-            in_c = input[..., f0:f1].contiguous()
-            out_c = input.new_empty([output.shape[0]] + list(in_c.shape[1:]))
-            _a2a(out_c, in_c)
-            output[..., f0:f1].copy_(out_c)
-            del in_c, out_c
+        if use_nccl_stream:
+            handle = torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+                async_op=True,
+            )
+            handle.wait()
+        else:
+            torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+            )
         return output
 
     @staticmethod
