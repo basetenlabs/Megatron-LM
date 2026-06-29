@@ -71,6 +71,7 @@ class DSv4HybridAttention(Attention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        compress_ratio: Optional[int] = None,
         name: str | None = None,
     ) -> None:
 
@@ -113,11 +114,14 @@ class DSv4HybridAttention(Attention):
 
         self.softmax_scale = None
 
-        if is_mtp_layer:
-            layer_idx = self.config.num_layers + layer_number - 1
-            compress_ratio = self.config.csa_compress_ratios[layer_idx]
-        else:
-            compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
+        # Per-layer compress ratio. When set explicitly (e.g. hybrid 'C'/'H' layer symbols
+        # pass compress_ratio=4/128 via the spec), use it directly; otherwise fall back to the
+        # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
+        _ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
+        if compress_ratio is None:
+            compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
+        # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
+        # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
         use_compressed_yarn = compress_ratio > 1
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
@@ -322,10 +326,12 @@ class DSv4HybridAttention(Attention):
                 if packed_seq_params.cu_seqlens_kv_padded is not None
                 else packed_seq_params.cu_seqlens_kv
             )
-            rope_seqlen = cu_seqlens_kv
+            rope_seqlen = packed_seq_params.max_seqlen_kv
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_kv = None
             rope_seqlen = seq_len
+            rope_max_seqlen_kv = None
         # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
         # concentration factor (mscale) is NOT part of the DSv4 model contract --
         # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
@@ -375,6 +381,7 @@ class DSv4HybridAttention(Attention):
                 mla_rotary_interleaved=True,
                 inverse=True,
                 mla_output_remove_interleaving=True,
+                max_seqlen=rope_max_seqlen_kv,
             )
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
@@ -416,8 +423,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        pp_layer_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
         name: str | None = None,
     ):
         if pg_collection is None:
@@ -431,8 +439,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
-            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            pp_layer_offset=pp_layer_offset,
+            compress_ratio=compress_ratio,
             name=name,
         )
 
@@ -563,8 +572,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_max_seqlen_q = rope_max_seqlen_kv = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -673,6 +685,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_q,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -690,6 +703,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_kv,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]

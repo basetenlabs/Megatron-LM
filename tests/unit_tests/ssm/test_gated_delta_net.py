@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import copy
 import os
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -166,86 +166,57 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
-    def test_selective_recompute_norm_out(self):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+    def test_selective_recompute_gdn(self):
+        """Whole-module 'gdn' recompute must match the non-recompute forward and gradients.
 
-        def build_gdn(config):
-            gdn_submodules = get_experimental_attention_variant_module_spec(
-                config=config
-            ).submodules
-            gdn = GatedDeltaNet(
-                config,
-                submodules=gdn_submodules,
-                layer_number=1,
-                bias=False,
-                conv_bias=False,
-                conv_init=1.0,
-                use_qk_l2norm=True,
-                A_init_range=(1, 16),
-                pg_collection=pg_collection,
-            )
-            return gdn.cuda().bfloat16()
-
-        def run(gdn, hidden_states):
-            output, _ = gdn(hidden_states, None)
-            output.float().sum().backward()
-            grads = {
-                name: param.grad.detach()
-                for name, param in gdn.named_parameters()
-                if param.grad is not None
-            }
-            input_grad = hidden_states.grad.detach().clone()
-            return output.detach(), grads, input_grad
+        The same module/input is run twice (recompute off, then on); the forward output and
+        all parameter / input gradients must agree within a tight tolerance (rtol/atol=1e-4).
+        The recompute path is run-to-run deterministic on these kernels (empirically bitwise),
+        so a tolerance well below the bf16 floor is expected to hold.
+        """
+        gdn = self.gdn
+        gdn.train()
 
         micro_batch_size = 2
         seq_length = 64
-        base_config = copy.deepcopy(self.transformer_config)
-        rec_config = copy.deepcopy(self.transformer_config)
-        rec_config.recompute_granularity = "selective"
-        rec_config.recompute_modules = ["gdn_norm_out"]
-
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        hidden_states = torch.randn(
-            (
-                seq_length // self.sp_size // self.cp_size,
-                micro_batch_size,
-                self.gdn.config.hidden_size,
-            ),
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
             device=torch.cuda.current_device(),
             dtype=torch.bfloat16,
-            requires_grad=True,
         )
 
-        # --- Baseline (no recompute) ---
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        base_gdn = build_gdn(base_config)
-        assert base_gdn.recompute_norm_out is False
-        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
-        hidden_states.grad = None
-        assert base_gdn.norm_out_checkpoint is None
-        del base_gdn
-        torch.cuda.empty_cache()
+        def run(recompute):
+            gdn.recompute_gdn = recompute
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
 
-        # --- Recompute ---
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        rec_gdn = build_gdn(rec_config)
-        assert rec_gdn.recompute_norm_out is True
-        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
-        assert rec_gdn.norm_out_checkpoint is not None
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(recompute=False)
+            out_rc, dinput_rc, pgrad_rc = run(recompute=True)
+        finally:
+            gdn.recompute_gdn = False
 
-        rank = torch.distributed.get_rank()
-        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
-        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
-        assert set(rec_grads.keys()) == set(base_grads.keys())
-        for name in base_grads:
-            assert torch.equal(
-                rec_grads[name], base_grads[name]
-            ), f"Grad not identical for {name} ({rank=})"
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-4,
+                atol=1e-4,
+                msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
 
     def test_jit_compiled_helpers(self):
         import torch._dynamo
@@ -287,7 +258,9 @@ class TestGatedDeltaNet:
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+                gdn._prepare_qkv_for_gated_delta_rule(
+                    qkv, gate, beta, alpha, batch, seq_len, gdn.cp_size
+                )
             )
 
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
