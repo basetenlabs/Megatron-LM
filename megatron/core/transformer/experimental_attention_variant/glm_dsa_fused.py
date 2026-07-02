@@ -7,10 +7,9 @@ stays *additive* so it never edits the actively-developed upstream DSA module, w
 minimizes rebase conflicts against NVIDIA dev. It only imports the shared DSA primitives
 from ``dsa`` / ``dsa_kernels``.
 
-The IndexShare knobs (``dsa_indexer_topk_freq`` / ``dsa_indexer_skip_topk_offset``) are read
-from the config with ``getattr`` defaults rather than declared as ``TransformerConfig``
-fields, so this module requires no edits to the upstream config either; the GLM bridge sets
-them as plain attributes on the provider.
+The IndexShare knobs (``dsa_indexer_topk_freq`` / ``dsa_indexer_skip_topk_offset``) are
+declared on ``TransformerConfig`` so values set by the GLM bridge survive provider-to-config
+conversion.
 """
 
 import math
@@ -108,12 +107,9 @@ class DSAttentionFused(MegatronModule):
 
         # Cross-layer top-k sharing (IndexShare): computing layers own an indexer and
         # produce fresh top-k; skip layers reuse the most recent computing layer's top-k.
-        # The freq/offset knobs are read via getattr with GLM-5 defaults (freq=1 disables
-        # sharing, offset=0) so this module needs no upstream TransformerConfig fields; the
-        # GLM bridge sets them as plain attrs. Validate here since the config no longer does.
         self.index_topk = config.dsa_indexer_topk
-        self.index_topk_freq = getattr(config, "dsa_indexer_topk_freq", 1)
-        self.index_skip_topk_offset = getattr(config, "dsa_indexer_skip_topk_offset", 0)
+        self.index_topk_freq = config.dsa_indexer_topk_freq
+        self.index_skip_topk_offset = config.dsa_indexer_skip_topk_offset
         if self.index_topk_freq < 1:
             raise ValueError(
                 f"dsa_indexer_topk_freq must be positive, got {self.index_topk_freq}."
