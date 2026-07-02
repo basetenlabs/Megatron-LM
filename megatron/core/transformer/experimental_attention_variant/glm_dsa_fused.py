@@ -13,11 +13,14 @@ fields, so this module requires no edits to the upstream config either; the GLM 
 them as plain attributes on the provider.
 """
 
+import json
+import os
 import math
 from typing import Optional
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
@@ -30,12 +33,135 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     dsa_sparse_attn,
     indexer_topk,
 )
+from megatron.core.transformer.experimental_attention_variant.prime_fp8_indexer import (
+    prime_fp8_indexer_topk,
+)
 from megatron.core.transformer.experimental_attention_variant.glm_absorbed_mla import (
     GlmAbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _parse_int_set_env(name: str) -> Optional[set[int]]:
+    value = os.getenv(name)
+    if not value:
+        return None
+    return {int(part.strip()) for part in value.split(",") if part.strip()}
+
+
+def _dump_dsa_topk_if_requested(
+    *,
+    layer_number: int,
+    skip_topk: bool,
+    source_layer: int,
+    topk_local: torch.Tensor,
+    indexer_scores: Optional[torch.Tensor],
+    seqlen_kv: int,
+    backend: str,
+) -> None:
+    dump_dir = os.getenv("TRAINERS_DSA_TOPK_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    layers = _parse_int_set_env("TRAINERS_DSA_TOPK_LAYERS")
+    if layers is not None and layer_number not in layers:
+        return
+
+    query_last_n = int(os.getenv("TRAINERS_DSA_TOPK_QUERY_LAST_N", "16"))
+    k = int(os.getenv("TRAINERS_DSA_TOPK_K", "256"))
+    query_start = max(0, topk_local.shape[1] - query_last_n)
+    query_positions = list(range(query_start, topk_local.shape[1]))
+    topk_slice = topk_local[:, query_start:, : min(k, topk_local.shape[-1])]
+    topk_score_slice = None
+    score_rows_slice = None
+    score_stats = None
+    if indexer_scores is not None:
+        score_query_slice = indexer_scores[:, query_start:, :]
+        if os.getenv("TRAINERS_DSA_SCORE_ROWS_DUMP", "0") == "1":
+            score_rows_slice = score_query_slice
+        gather_idx = topk_slice.to(torch.long).clamp(min=0, max=indexer_scores.shape[-1] - 1)
+        topk_score_slice = torch.gather(score_query_slice, dim=-1, index=gather_idx)
+        topk_score_slice = torch.where(
+            topk_slice >= 0,
+            topk_score_slice,
+            torch.full_like(topk_score_slice, float("nan")),
+        )
+        finite_mask = torch.isfinite(score_query_slice)
+        finite_count = finite_mask.sum(dim=-1).clamp(min=1)
+        finite_zero = torch.where(finite_mask, score_query_slice, torch.zeros_like(score_query_slice))
+        finite_mean = finite_zero.sum(dim=-1) / finite_count
+        finite_var = (
+            torch.where(
+                finite_mask,
+                (score_query_slice - finite_mean.unsqueeze(-1)) ** 2,
+                torch.zeros_like(score_query_slice),
+            ).sum(dim=-1)
+            / finite_count
+        )
+        score_stats = {
+            "min": torch.where(
+                finite_mask, score_query_slice, torch.full_like(score_query_slice, float("inf"))
+            )
+            .min(dim=-1)
+            .values.detach()
+            .cpu()
+            .float()
+            .tolist(),
+            "max": torch.where(
+                finite_mask, score_query_slice, torch.full_like(score_query_slice, float("-inf"))
+            )
+            .max(dim=-1)
+            .values.detach()
+            .cpu()
+            .float()
+            .tolist(),
+            "mean": finite_mean.detach().cpu().float().tolist(),
+            "std": torch.sqrt(finite_var).detach().cpu().float().tolist(),
+        }
+
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = int(os.getenv("RANK", "0"))
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    path = os.path.join(
+        dump_dir,
+        f"rank{rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}_cp{cp_rank}_ep{ep_rank}"
+        f"_layer{layer_number}_{backend}.json",
+    )
+    payload = {
+        "engine": "megatron",
+        "rank": rank,
+        "parallel_ranks": {
+            "pipeline": pp_rank,
+            "tensor": tp_rank,
+            "data": dp_rank,
+            "context": cp_rank,
+            "expert": ep_rank,
+        },
+        "backend": backend,
+        "layer_number": layer_number,
+        "skip_topk": skip_topk,
+        "source_layer": source_layer,
+        "seq_len": seqlen_kv,
+        "query_positions": query_positions,
+        "topk_k": int(topk_slice.shape[-1]),
+        "topk_shape": list(topk_local.shape),
+        "topk_checksum": int(topk_slice.detach().to(torch.int64).sum().item()),
+        "topk": topk_slice.detach().cpu().to(torch.int32).tolist(),
+    }
+    if topk_score_slice is not None:
+        payload["topk_scores"] = topk_score_slice.detach().cpu().float().tolist()
+        payload["score_stats"] = score_stats
+    if score_rows_slice is not None:
+        payload["score_rows"] = score_rows_slice.detach().cpu().float().tolist()
+        payload["score_shape"] = list(score_query_slice.shape)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -204,24 +330,49 @@ class DSAttentionFused(MegatronModule):
                     f"from source computing layer {self.source_layer}, but it did not run before "
                     "this layer in this pipeline stage. Cross-PP top-k sharing is not supported. "
                     f"Holder has layers {sorted(holder or {})}."
-                )
+            )
             topk_local = holder[self.source_layer]
+            indexer_scores = None
+            indexer_backend = "indexshare"
         else:
             # Computing layer: frozen-indexer inference top-k (no loss, no backward).
             assert self.indexer is not None
             q_idx, k_idx, w_idx = self.indexer.forward_before_topk(
                 x.detach(), qr.detach(), packed_seq_params
             )
-            topk_local, _ = indexer_topk(
-                q_idx,
-                k_idx,
-                w_idx,
-                min(self.index_topk, seqlen_kv),
-                ratio=1,  # no compression
-                indexer_softmax_scale=self.indexer.softmax_scale,
-            )
+            indexer_backend = os.getenv("TRAINERS_DSA_INDEXER_BACKEND", "cudnn")
+            if indexer_backend == "prime_fp8":
+                topk_local, _ = prime_fp8_indexer_topk(
+                    q_idx,
+                    k_idx,
+                    w_idx,
+                    min(self.index_topk, seqlen_kv),
+                    indexer_softmax_scale=self.indexer.softmax_scale,
+                )
+                indexer_scores = None
+            else:
+                indexer_backend = "cudnn"
+                topk_local, _, indexer_scores = indexer_topk(
+                    q_idx,
+                    k_idx,
+                    w_idx,
+                    min(self.index_topk, seqlen_kv),
+                    ratio=1,  # no compression
+                    indexer_softmax_scale=self.indexer.softmax_scale,
+                    return_scores=True,
+                )
             if holder is not None:
                 holder[self.layer_number] = topk_local
+
+        _dump_dsa_topk_if_requested(
+            layer_number=self.layer_number,
+            skip_topk=self.skip_topk,
+            source_layer=self.source_layer,
+            topk_local=topk_local,
+            indexer_scores=indexer_scores,
+            seqlen_kv=seqlen_kv,
+            backend=indexer_backend,
+        )
 
         flat_idxs, flat_tlen = build_flat_topk_idxs(
             topk_local, batch_size=b, seqlen_kv=seqlen_kv, compact=True

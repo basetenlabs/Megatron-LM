@@ -430,6 +430,7 @@ def indexer_topk(
     topk: int,
     ratio: int = 4,
     indexer_softmax_scale: float = 1.0,
+    return_scores: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -456,7 +457,11 @@ def indexer_topk(
     q_bshd, k_bsd, _w_bsh_raw, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
         q_indexer, k_indexer, weights, indexer_softmax_scale
     )
-    topk_indices, topk_length, _ = _indexer_topk_bshd(q_bshd, k_bsd, w_bsh_scaled, topk, ratio)
+    topk_indices, topk_length, scores = _indexer_topk_bshd(
+        q_bshd, k_bsd, w_bsh_scaled, topk, ratio
+    )
+    if return_scores:
+        return topk_indices, topk_length, scores
     return topk_indices, topk_length
 
 
