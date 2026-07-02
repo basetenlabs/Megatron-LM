@@ -98,7 +98,7 @@ dev = [
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend",
+    "nvidia-cudnn-frontend[cutedsl]>=1.25.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -193,8 +193,11 @@ override-dependencies = [
 
 [tool.uv.sources]
 
+# nv_dev branch: it provides `flash_mla_sparse_fwd`, the DSA sparse-attention
+# forward used by the fused GLM-5.2 path (dsa_kernels). The `main` rev (9edee0c)
+# imports but lacks that symbol, so the fused path fails at runtime.
 flash_mla = [
-    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" },
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
