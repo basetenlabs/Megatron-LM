@@ -1016,6 +1016,11 @@ class _DispatchManager(ABC):
         """Get the restored hidden states by instances."""
         pass
 
+    def _clear_forward_state(self, *attr_names: str) -> None:
+        """Drop per-forward hand-off references once the dispatcher has consumed them."""
+        for attr_name in attr_names:
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, None)
 
 class _HybridEPManager(_DispatchManager):
     """
@@ -1241,11 +1246,9 @@ class _HybridEPManager(_DispatchManager):
             self.num_permuted_tokens = None
         self._original_num_tokens = None
         self._padded_num_tokens = None
-        self.routing_map = None
-        self.token_probs = None
-        self.dispatched_probs = None
-        self.tokens_per_expert = None
-        self.pad_multiple = None
+        self._clear_forward_state(
+            "routing_map", "token_probs", "dispatched_probs", "tokens_per_expert", "pad_multiple"
+        )
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1425,15 +1428,16 @@ class _DeepepManager(_DispatchManager):
         # Manually release the metadata to avoid memory leak.
         self.dispatched_indices = None
         self.dispatched_probs = None
-        # These are forward-only hand-off references; autograd Functions own
-        # anything needed for backward after combine/restoration has consumed them.
-        self.reversed_mapping_for_combine = None
-        self.pad_offsets = None
-        self.dispatched_routing_map = None
-        self.hidden_shape_before_permute = None
-        self.token_indices = None
-        self.token_probs = None
-        self.tokens_per_expert = None
+        # Forward-only hand-off refs; autograd Functions own backward needs.
+        self._clear_forward_state(
+            "reversed_mapping_for_combine",
+            "pad_offsets",
+            "dispatched_routing_map",
+            "hidden_shape_before_permute",
+            "token_indices",
+            "token_probs",
+            "tokens_per_expert",
+        )
         return hidden_states
 
     def _pad_routing_map(
