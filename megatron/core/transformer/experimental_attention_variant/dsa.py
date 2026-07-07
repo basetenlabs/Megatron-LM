@@ -967,9 +967,9 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
-            # This flag is for the MLA-style interleaving in RoPE.
-            # Set it to False, as indexer does not apply interleaved RoPE.
-            mla_rotary_interleaved=False,
+            # Interleave convention comes from the checkpoint config (DeepSeek-V3.2:
+            # False, GLM-5.2: True) and must match the serving engine's indexer.
+            mla_rotary_interleaved=self.config.dsa_indexer_rope_interleave,
         )
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_pe, x_nope], dim=-1)
