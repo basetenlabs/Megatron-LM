@@ -331,6 +331,14 @@ class TransformerConfig(ModelParallelConfig):
     their indexer (set to ``first_k_dense_replace`` by the GLM bridge). Declared for the same
     conversion-survival reason as ``dsa_indexer_topk_freq``."""
 
+    dsa_indexer_rope_interleave: bool = False
+    """Whether the DSA indexer applies interleaved (GPT-J-style) RoPE. DeepSeek-V3.2
+    indexers do not (default); GLM-5.2 declares ``indexer_rope_interleave: true`` and
+    serving engines honor it (vLLM: ``is_neox_style = not indexer_rope_interleave``) —
+    a mismatch makes the trainer's top-k selection drift from inference. Set by the GLM
+    bridge from the checkpoint config; declared here for the same conversion-survival
+    reason as ``dsa_indexer_topk_freq``."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
