@@ -280,7 +280,7 @@ class DSAttentionFused(MegatronModule):
         # padded layout; capacity-padding rows can sit past max_seqlen_q, the max
         # over REAL datum lengths). The global padded row count upper-bounds any
         # within-sequence position; clamp defensively — overflow rows are padding.
-        rotary_len = max(int(max_seqlen_q), l_local * cp_group.size())
+        rotary_len = max(int(max_seqlen_q), l_local * self.pg_collection.cp.size())
         if indexer.config.rope_type == "rope":
             table = indexer.rotary_pos_emb(rotary_len, packed_seq=False)
             mscale = 1.0
