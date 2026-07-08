@@ -276,13 +276,19 @@ class DSAttentionFused(MegatronModule):
         x = x.detach()
         qr = qr.detach()
 
+        # Table must cover positions within PADDED sequences (cu_seqlens is the
+        # padded layout; capacity-padding rows can sit past max_seqlen_q, the max
+        # over REAL datum lengths). The global padded row count upper-bounds any
+        # within-sequence position; clamp defensively — overflow rows are padding.
+        rotary_len = max(int(max_seqlen_q), l_local * cp_group.size())
         if indexer.config.rope_type == "rope":
-            table = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=False)
+            table = indexer.rotary_pos_emb(rotary_len, packed_seq=False)
             mscale = 1.0
         else:
-            table, mscale = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=False)
+            table, mscale = indexer.rotary_pos_emb(rotary_len, packed_seq=False)
         position_ids = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
-        freqs = torch.index_select(table, 0, position_ids.long())  # [t, 1, 1, d]
+        position_ids = position_ids.long().clamp_(0, table.shape[0] - 1)
+        freqs = torch.index_select(table, 0, position_ids)  # [t, 1, 1, d]
 
         # THD shapes: x [t, 1, hidden], qr [t, q_lora] (packed squeeze) or [t, 1, q_lora].
         if x.dim() == 2:
