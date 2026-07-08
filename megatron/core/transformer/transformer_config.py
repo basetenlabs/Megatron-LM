@@ -1515,25 +1515,33 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
-        if self.experimental_attention_variant == "dsv4_hybrid" and (
+        # Variants with a contiguous-partition THD CP path: DSv4 hybrid (CSA) and
+        # GLM-5.2 fused DSA (frozen-indexer adapter in glm_dsa_fused.py).
+        _contiguous_cp_variants = ("dsv4_hybrid", "dsa")
+        if self.experimental_attention_variant in _contiguous_cp_variants and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            assert (
-                self.sequence_packing_scheduler is not None
-            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+            assert self.sequence_packing_scheduler is not None, (
+                f"{self.experimental_attention_variant} with CP requires a "
+                "sequence_packing_scheduler for THD inputs."
+            )
 
         if self.context_parallel_size > 1:
             if (
-                self.experimental_attention_variant == "dsv4_hybrid"
+                self.experimental_attention_variant in _contiguous_cp_variants
                 and self.cp_partition_mode != "contiguous"
             ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+                raise ValueError(
+                    f"{self.experimental_attention_variant} with CP requires "
+                    "cp_partition_mode='contiguous'."
+                )
             if (
-                self.experimental_attention_variant != "dsv4_hybrid"
+                self.experimental_attention_variant not in _contiguous_cp_variants
                 and self.cp_partition_mode != "zigzag"
             ):
                 raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                    "cp_partition_mode='contiguous' currently is only supported with "
+                    f"{_contiguous_cp_variants}."
                 )
 
         if self.experimental_attention_variant in ["gated_delta_net"]:

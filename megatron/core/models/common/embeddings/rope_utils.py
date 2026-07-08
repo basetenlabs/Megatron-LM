@@ -217,6 +217,7 @@ def _apply_rotary_pos_emb_thd(
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
+    cp_partition_mode: str = "zigzag",
 ) -> Tensor:
     """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
 
@@ -270,7 +271,22 @@ def _apply_rotary_pos_emb_thd(
     local_seq_len = local_seq_lens[seq_idx]
     global_seq_start = cu_seqlens_i64[seq_idx]
 
-    if cp_size > 1:
+    if cp_size > 1 and cp_partition_mode == "contiguous":
+        # Contiguous CP (DSv4 CSA / GLM fused DSA THD path) slices the whole
+        # packed row, not each sequence: this rank owns global packed rows
+        # [cp_rank * total_tokens, (cp_rank + 1) * total_tokens). Bucketize
+        # each global row into the GLOBAL cu_seqlens to recover its position
+        # within its sequence. Rows past the last real token (capacity
+        # padding) get position 0 — harmless, they are masked from loss.
+        global_rows = cp_rank * total_tokens + token_pos
+        seq_idx = torch.searchsorted(cu_seqlens_i64, global_rows, right=True) - 1
+        seq_idx = seq_idx.clamp(min=0, max=cu_seqlens_i64.shape[0] - 2)
+        seq_start = cu_seqlens_i64[seq_idx]
+        seq_end = cu_seqlens_i64[seq_idx + 1]
+        valid = (global_rows >= seq_start) & (global_rows < seq_end)
+        freq_pos = torch.where(valid, global_rows - seq_start, torch.zeros_like(global_rows))
+        global_seq_start = seq_start
+    elif cp_size > 1:
         cp_seg = local_seq_len // 2
         full_seqlen = local_seq_len * cp_size
         is_first_half = local_pos < cp_seg
@@ -399,6 +415,7 @@ def apply_rotary_pos_emb(
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
+            cp_partition_mode=getattr(config, "cp_partition_mode", "zigzag"),
         )
 
 
