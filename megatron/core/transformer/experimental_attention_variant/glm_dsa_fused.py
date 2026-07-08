@@ -239,8 +239,10 @@ class DSAttentionFused(MegatronModule):
             if holder is not None:
                 holder[self.layer_number] = topk_local
 
+        # PR#5087's build_flat_topk_idxs dropped the seqlen_kv arg (out-of-range
+        # masking now happens inside indexer_topk); SBHD semantics are unchanged.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            topk_local, batch_size=b, seqlen_kv=seqlen_kv, compact=True
+            topk_local, batch_size=b, compact=True
         )
         # dsa_sparse_attn (FlashMLA convention) attends with the full absorbed query/key dim
         # (kv_lora_rank + rope) but returns only the latent value subspace
