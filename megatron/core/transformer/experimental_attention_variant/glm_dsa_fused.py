@@ -17,13 +17,19 @@ from typing import Optional
 
 import torch
 
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAttentionSubmodules
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAttentionSubmodules,
+    rotate_activation,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     build_flat_topk_idxs,
     dsa_sparse_attn,
@@ -98,8 +104,16 @@ class DSAttentionFused(MegatronModule):
 
         if config.tensor_model_parallel_size != 1:
             raise ValueError("Fused DSA (FlashMLA sparse) currently requires TP=1.")
-        if config.context_parallel_size != 1:
-            raise ValueError("Fused DSA (FlashMLA sparse) currently requires CP=1.")
+        if config.context_parallel_size > 1:
+            # CP support: contiguous THD partitioning only (the trainer-side
+            # pack_thd_cp_microbatch path). See _forward_thd_cp below.
+            if getattr(config, "cp_partition_mode", "zigzag") != "contiguous":
+                raise ValueError(
+                    "Fused DSA with CP>1 requires cp_partition_mode='contiguous'."
+                )
+            if pg_collection is None or getattr(pg_collection, "cp", None) is None:
+                raise ValueError("Fused DSA with CP>1 requires a cp process group.")
+        self.pg_collection = pg_collection
 
         self.layer_number = layer_number
         if is_mtp_layer:
@@ -184,6 +198,12 @@ class DSAttentionFused(MegatronModule):
         ``position_ids`` are unused here: the outer absorbed-MLA applies the V up-projection
         after core attention, and the indexer derives RoPE positions internally.
         """
+        cp_group = (
+            getattr(self.pg_collection, "cp", None) if self.pg_collection is not None else None
+        )
+        if cp_group is not None and cp_group.size() > 1:
+            return self._forward_thd_cp(query, key, x, qr, packed_seq_params, cp_group)
+
         b = query.size(1)
         kv = key.squeeze(-2) if key.dim() == 4 else key  # [sq, b, k_channels]
         seqlen_kv = kv.size(0)
@@ -219,8 +239,10 @@ class DSAttentionFused(MegatronModule):
             if holder is not None:
                 holder[self.layer_number] = topk_local
 
+        # PR#5087's build_flat_topk_idxs dropped the seqlen_kv arg (out-of-range
+        # masking now happens inside indexer_topk); SBHD semantics are unchanged.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            topk_local, batch_size=b, seqlen_kv=seqlen_kv, compact=True
+            topk_local, batch_size=b, compact=True
         )
         # dsa_sparse_attn (FlashMLA convention) attends with the full absorbed query/key dim
         # (kv_lora_rank + rope) but returns only the latent value subspace
@@ -235,6 +257,176 @@ class DSAttentionFused(MegatronModule):
             topk_length=flat_tlen,
         )
         return output
+
+    # ------------------------------------------------------------------
+    # Context-parallel THD path (contiguous partitioning)
+    # ------------------------------------------------------------------
+
+    def _indexer_qkw_cp(self, x, qr, cu_seqlens, max_seqlen_q, global_start, l_local):
+        """CP-aware re-derivation of ``Indexer.forward_before_topk``.
+
+        Identical math to the CP=1 path except RoPE positions: each local row's
+        frequency row is its position *within its packed sequence*, recovered
+        from the GLOBAL ``cu_seqlens`` and this rank's contiguous row interval
+        (``Indexer._apply_rope`` would use local 0..l_local-1, wrong for
+        cp_rank > 0). The indexer is frozen (inputs detached), so no autograd
+        flows through any of this.
+        """
+        indexer = self.indexer
+        x = x.detach()
+        qr = qr.detach()
+
+        # Table must cover positions within PADDED sequences (cu_seqlens is the
+        # padded layout; capacity-padding rows can sit past max_seqlen_q, the max
+        # over REAL datum lengths). The global padded row count upper-bounds any
+        # within-sequence position; clamp defensively — overflow rows are padding.
+        rotary_len = max(int(max_seqlen_q), l_local * self.pg_collection.cp.size())
+        if indexer.config.rope_type == "rope":
+            table = indexer.rotary_pos_emb(rotary_len, packed_seq=False)
+            mscale = 1.0
+        else:
+            table, mscale = indexer.rotary_pos_emb(rotary_len, packed_seq=False)
+        position_ids = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
+        position_ids = position_ids.long().clamp_(0, table.shape[0] - 1)
+        freqs = torch.index_select(table, 0, position_ids)  # [t, 1, 1, d]
+
+        # THD shapes: x [t, 1, hidden], qr [t, q_lora] (packed squeeze) or [t, 1, q_lora].
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        if qr.dim() == 2:
+            qr = qr.unsqueeze(1)
+        seqlen, bsz = x.shape[0], x.shape[1]
+
+        q, _ = indexer.linear_wq_b(qr)
+        q = q.reshape(seqlen, bsz, indexer.index_n_heads, indexer.index_head_dim)
+        q = self._indexer_rope_cp(q, freqs, mscale)
+
+        k, _ = indexer.linear_wk(x)
+        k = indexer.k_norm(k)
+        k = k.reshape(seqlen, bsz, 1, indexer.index_head_dim)
+        k = self._indexer_rope_cp(k, freqs, mscale)
+        k = k.reshape(seqlen, bsz, indexer.index_head_dim)
+
+        q = rotate_activation(q)
+        k = rotate_activation(k)
+
+        weights, _ = indexer.linear_weights_proj(x)
+        weights = weights * (indexer.index_n_heads**-0.5) * indexer.softmax_scale
+
+        # Fold bsz=1: q [t, h, d], k [t, d], w [t, h].
+        return q.reshape(seqlen, indexer.index_n_heads, indexer.index_head_dim), k.reshape(
+            seqlen, indexer.index_head_dim
+        ), weights.reshape(seqlen, indexer.index_n_heads)
+
+    def _indexer_rope_cp(self, t, freqs, mscale):
+        """``Indexer._apply_rope`` with explicit per-row frequency rows.
+
+        Mirrors the split convention (pe FIRST, then nope) and flags
+        (``mla_rotary_interleaved=False``) exactly.
+        """
+        indexer = self.indexer
+        t_pe, t_nope = torch.split(
+            t,
+            [indexer.qk_pos_emb_head_dim, indexer.index_head_dim - indexer.qk_pos_emb_head_dim],
+            dim=-1,
+        )
+        t_pe = _apply_rotary_pos_emb_bshd(
+            t_pe,
+            freqs,
+            rotary_interleaved=self.config.rotary_interleaved,
+            mla_rotary_interleaved=False,
+            mscale=mscale,
+        )
+        return torch.cat([t_pe, t_nope], dim=-1)
+
+    def _forward_thd_cp(self, query, key, x, qr, packed_seq_params, cp_group):
+        """THD-packed contiguous context-parallel forward.
+
+        Each CP rank holds contiguous packed rows [r*l_local, (r+1)*l_local).
+        The compressed latent KV (~576 dims) is all-gathered over the CP group
+        (autograd: backward reduce-scatters dKV); the frozen indexer's K rows
+        are gathered without grad; every local query then runs top-k against
+        the full global KV with causal offsets, and FlashMLA/cuDNN sparse
+        attention consumes flat global indices. IndexShare holders store
+        (topk, layout) per computing layer, per-rank consistent.
+        """
+        psp = packed_seq_params
+        if psp is None or psp.qkv_format != "thd":
+            raise ValueError(
+                "GLM fused DSA with CP>1 requires THD packed inputs "
+                "(the trainer's pack_thd_cp_microbatch path)."
+            )
+        cu_seqlens = (
+            psp.cu_seqlens_q_padded if psp.cu_seqlens_q_padded is not None else psp.cu_seqlens_q
+        )
+        max_seqlen_q = int(psp.max_seqlen_q)
+        cp_rank = cp_group.rank()
+        l_local = query.shape[0]
+        global_start = cp_rank * l_local
+
+        # ---- KV: [t, 1, d] -> [t, d]; autograd all-gather over CP ----------
+        # (contiguous partitioning => rank-major concat IS sequence-major).
+        kv_local = key.reshape(l_local, key.shape[-1])
+        kv_global = gather_from_sequence_parallel_region(kv_local, group=cp_group)
+
+        holder = (
+            self._get_index_share_topk_holder(psp) if self.index_share else None
+        )
+        if self.skip_topk:
+            if holder is None or self.source_layer not in holder:
+                raise AssertionError(
+                    f"DSA IndexShare skip layer (layer_number={self.layer_number}) needs top-k "
+                    f"from source computing layer {self.source_layer}, but it did not run "
+                    "before this layer in this pipeline stage. Cross-PP top-k sharing is not "
+                    f"supported. Holder has layers {sorted(holder or {})}."
+                )
+            topk_local, layout = holder[self.source_layer]
+        else:
+            assert self.indexer is not None
+            q_idx, k_idx, w_idx = self._indexer_qkw_cp(
+                x, qr, cu_seqlens, max_seqlen_q, global_start, l_local
+            )
+            # Frozen indexer: plain (non-autograd) all-gather of K rows.
+            k_idx = k_idx.contiguous()
+            k_idx_global = k_idx.new_empty((k_idx.shape[0] * cp_group.size(),) + k_idx.shape[1:])
+            torch.distributed.all_gather_into_tensor(k_idx_global, k_idx, group=cp_group)
+            topk_local, layout = cp_utils.compute_cp_indexer_topk(
+                q_idx,
+                w_idx,
+                k_idx_global,
+                cu_seqlens,
+                cu_seqlens,  # ratio=1: compressed rows == token rows
+                global_start,
+                1,  # ratio: no compression
+                min(self.index_topk, max_seqlen_q),
+                self.indexer.softmax_scale,
+                max_seqlen_q=max_seqlen_q,
+                use_fused=True,
+            )
+            if topk_local is None:
+                raise RuntimeError("GLM fused DSA CP top-k returned no indices.")
+            if holder is not None:
+                holder[self.layer_number] = (topk_local, layout)
+
+        cu_q_topk, cu_k_topk, _q_causal_offsets = layout
+        flat_idxs, flat_tlen = build_flat_topk_idxs(
+            topk_local,
+            batch_size=1,
+            compact=True,
+            cu_seqlens_q=cu_q_topk,
+            cu_seqlens_kv=cu_k_topk,
+        )
+        output = dsa_sparse_attn(
+            query,
+            kv_global,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            topk_length=flat_tlen,
+            is_thd=True,
+        )
+        # Outer absorbed-MLA expects [t, 1, np * kv_lora_rank] under packing.
+        return output.unsqueeze(1)
 
 
 def build_glm_dsa_fused_attention_spec(backend, qk_norm, indexer):

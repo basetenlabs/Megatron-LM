@@ -623,6 +623,9 @@ class AbsorbedMLASelfAttention(Attention):
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
 
                 # Apply RoPE to q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                # max_seqlen: rotary_pos_emb spans one max-length sequence
+                # (rotary_seq_len rows), required by the THD path so it can
+                # tell per-sequence tables from exact-packed tables.
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
                     rotary_pos_emb,
@@ -631,6 +634,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rotary_seq_len,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -641,6 +645,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rotary_seq_len,
                 )
 
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
