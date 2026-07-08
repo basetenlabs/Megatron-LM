@@ -1748,9 +1748,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        # These fields are MCore-only and should not be forwarded to TE attention.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("cp_partition_mode")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1827,6 +1828,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
+        if (
+            packed_seq_kwargs.get("qkv_format") == "thd"
+            and packed_seq_kwargs.get("pad_between_seqs") is False
+        ):
+            # Megatron represents end padding as dummy THD sequences. TE DPA
+            # sizes THD outputs from cu_seqlens_q/kv, so pass padded
+            # boundaries as the effective attention boundaries while keeping
+            # the original PackedSeqParams metadata intact for downstream
+            # loss/routing paths.
+            if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
+            if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
@@ -1868,6 +1882,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
                 # Update Q K outside of TE Attention API
                 core_attn_out, batch_max_attention_logits = core_attn_out
+
+                # The max attention logit is only used as a statistic for qk-clip
+                # and logging, so it never needs gradients. Detach it from the
+                # autograd graph, otherwise accumulating it into
+                # current_max_attn_logits keeps every batch's attention forward
+                # graph alive and leaks memory (most visibly when only
+                # log_max_attention_logit is set and clip_qk() never resets it).
+                batch_max_attention_logits = batch_max_attention_logits.detach()
 
                 # Update QK_Clip balancing eta
                 if self.current_max_attn_logits is None:

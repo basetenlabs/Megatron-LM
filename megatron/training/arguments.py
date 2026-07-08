@@ -91,6 +91,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
     parser = _add_varlen_dataset_args(parser)
+    parser = _add_logits_distillation_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1186,6 +1187,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1890,6 +1892,21 @@ def validate_args(args, defaults={}):
             "torch",
             "torch_dist",
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+    if args.use_layer_wise_distributed_optimizer:
+        assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+            "Layer-wise (Muon) distributed optimizer does not support FP8/FP4 parameter gather "
+            "(fp8_param_gather / fp4_param_gather). Use fp8_param_gather=False (e.g. blockwise/"
+            "MXFP8 compute with parameters persisted in bf16)."
+        )
+        if not args.use_layer_wise_param_layout:
+            assert args.num_distributed_optimizer_instances == 1, (
+                "the decoupled compact LayerWise DDP layout (the default; pass "
+                "--use-layer-wise-param-layout for the padded layout) requires "
+                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
+                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
+                "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2647,6 +2664,19 @@ def _add_inference_args(parser):
         'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
     )
     group.add_argument(
+        '--inference-shards',
+        type=str,
+        default=None,
+        metavar='SPEC',
+        help='Partition the world into independent inference models, each with '
+        'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
+        'Shards are separated by "+" or ";"; per-shard keys are '
+        'tp,pp,ep,expt_tp,dp (each defaults to 1) and must partition the full '
+        'world. Tagging shards role=prefill|decode enables disaggregated '
+        'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
+        'is several independent decode instances.',
+    )
+    group.add_argument(
         '--inference-cuda-graph-all-prefills',
         action='store_true',
         default=False,
@@ -2674,6 +2704,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "moe_grad_scale_func",
         "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
@@ -2760,6 +2791,7 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "apply_dsa_kernel_fusion",
+        "mamba_training_ssm_states_dtype",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3529,6 +3561,18 @@ def _add_rl_args(parser):
         help='Skip BOS token at the beginning of the sequences. Default is False.',
     )
     group.add_argument(
+        '--rl-profile',
+        action='store_true',
+        default=False,
+        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).',
+    )
+    group.add_argument(
+        '--rl-profile-dir',
+        type=str,
+        default=None,
+        help='Directory to write RL profiling data. Defaults to {save}/profiles.',
+    )
+    group.add_argument(
         '--rl-inference-parsers',
         nargs='*',
         default=[],
@@ -3793,6 +3837,9 @@ def _add_learning_rate_args(parser):
         help='Minimum value for learning rate for the input and output layer. The scheduler'
         'clip values below this threshold',
     )
+    group.add_argument(
+        '--freeze-all-layers', action='store_true', help='Freeze all layers of the model.'
+    )
 
     return parser
 
@@ -3913,6 +3960,13 @@ def _add_mixed_precision_args(parser):
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
         help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+    )
+    group.add_argument(
+        '--mamba-training-ssm-states-dtype',
+        type=str,
+        choices=['fp32', 'bf16'],
+        default=None,
+        help='Dtype of the materialized inter-chunk SSM states in Mamba training',
     )
 
     return parser
@@ -4165,17 +4219,16 @@ def _add_distributed_args(parser):
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
     group.add_argument(
-        '--no-use-layer-wise-param-layout',
-        action='store_false',
+        '--use-layer-wise-param-layout',
+        action='store_true',
         dest='use_layer_wise_param_layout',
-        help='Opt out of the precomputed LayerWise param layout. When set, '
-        'falls back to the legacy LayerWise ping-pong path: all params '
-        '(including non-Muon embeddings, biases, layernorm) live in a single '
-        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-        'The default (precomputed layout) routes non-Muon params through a '
-        'separate DistributedOptimizer with byte-level sharding, which is faster '
-        'and uses less padding but produces different bf16 reduction ordering '
-        'and so will not match legacy-path loss curves bit-for-bit.',
+        default=False,
+        help='Opt INTO the padded shard-aligned LayerWise param layout. The default is the compact '
+        'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
+        'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
+        'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
+        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
+        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 
@@ -5149,6 +5202,47 @@ def _add_varlen_dataset_args(parser):
         'min_seq_len=seq_length//2, max_seq_len=seq_length, '
         'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
+    return parser
+
+
+def _add_logits_distillation_args(parser):
+    group = parser.add_argument_group(title='Logits Distillation')
+
+    group.add_argument('--logits-save-top-k', type=int, default=None,
+                       help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-load-dir', type=str, default=None,
+                       help='Directory to load logits.')
+    group.add_argument('--logits-load-decode-threads', type=int, default=4,
+                       help='Number of decode threads for cached-logits zstd '
+                            'decompression and torch.load processing.')
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
+                       help='PyTorch DataLoader prefetch factor for decoded '
+                            'cached-logits iterations. (Non-MSC only)')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of sequential tar consumption.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
+                       help='KD loss alpha for loading logits. Total loss is calculated as '
+                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings and '
+                            'training falls back to LM-only loss instead of crashing.')
     return parser
 
 

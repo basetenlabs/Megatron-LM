@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from megatron.lite.runtime import create_runtime
@@ -16,11 +19,50 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _pipeline_callbacks,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
 
 pytestmark = pytest.mark.mlite
+
+
+def test_runtime_returns_loss_separately_from_microbatch_metrics():
+    model = nn.Linear(1, 1, bias=False)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={"forward_step": lambda module, batch: {"value": module(batch["x"])}},
+    )
+    batches = iter([{"x": torch.ones(1, 1), "micro": i} for i in range(2)])
+    result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        batches,
+        lambda out, batch: (out["value"].sum(), {"micro": batch["micro"]}),
+        num_microbatches=2,
+    )
+
+    assert result.metrics == {"micro": [0, 1]}
+    assert result.model_output.loss is not None
+
+
+def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
+    context = LossContext(source_batch="source")
+    seen = []
+    forward, loss = _pipeline_callbacks(
+        lambda _model, batch: seen.append((batch, get_loss_context()))
+        or {"loss": torch.tensor(1.0)},
+        lambda out, batch, ctx: (out["loss"], {"batch": batch, "source": ctx.source_batch}),
+    )
+
+    output = forward(None, ("wrapped", context))
+    with use_loss_context(context):
+        forward(None, "presplit")
+    _, metrics = loss(output, "presplit", context)
+
+    assert seen == [("wrapped", context), ("presplit", context)]
+    assert metrics == {"batch": "presplit", "source": "source"}
 
 
 def test_runtime_config_defaults_to_mlite_backend():
@@ -181,6 +223,151 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     runtime.to(handle, "cuda", model=False, optimizer=True, grad=False)
 
     assert optimizer.calls == ["offload", "load"]
+
+
+class _FakeStorage:
+    def __init__(self, size: int):
+        self._size = size
+        self.resize_calls: list[int] = []
+
+    def size(self):
+        return self._size
+
+    def resize_(self, size: int):
+        self.resize_calls.append(size)
+        self._size = size
+        return self
+
+
+class _FakeBufferData:
+    def __init__(self, size: int):
+        self._storage = _FakeStorage(size)
+        self.cpu_called = False
+        self.pinned = False
+        self.copied_from = None
+        self.copy_non_blocking = None
+        self.zero_calls = 0
+
+    @property
+    def data(self):
+        return self
+
+    def cpu(self):
+        self.cpu_called = True
+        return self
+
+    def pin_memory(self):
+        self.pinned = True
+        return self
+
+    def storage(self):
+        return self._storage
+
+    def copy_(self, other, *, non_blocking: bool):
+        self.copied_from = other
+        self.copy_non_blocking = non_blocking
+        return self
+
+    def zero_(self):
+        self.zero_calls += 1
+        return self
+
+
+class _FakeBuffer:
+    def __init__(self):
+        self.param_data = _FakeBufferData(3)
+        self.grad_data = _FakeBufferData(5)
+
+
+class _FakeModule:
+    def parameters(self):
+        return []
+
+
+class _FakeMegatronDDP:
+    def __init__(self):
+        self.buffer = _FakeBuffer()
+        self.buffers = [self.buffer]
+        self.expert_parallel_buffers = []
+        self.module = _FakeModule()
+        self.to_calls: list[str] = []
+
+    def to(self, device):
+        self.to_calls.append(device)
+        raise AssertionError("DDP model chunks must use the buffer offload path")
+
+
+class _FakeMegatronDDPSubclass(_FakeMegatronDDP):
+    pass
+
+
+class _FakeNativeModel:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def to(self, device):
+        self.calls.append(device)
+        return self
+
+
+def _install_fake_megatron_ddp(monkeypatch) -> None:
+    core = types.ModuleType("megatron.core")
+    distributed = types.ModuleType("megatron.core.distributed")
+    distributed.DistributedDataParallel = _FakeMegatronDDP
+    core.distributed = distributed
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.distributed", distributed)
+
+
+def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
+    from megatron.lite.runtime.megatron_utils import _is_megatron_ddp
+
+    _install_fake_megatron_ddp(monkeypatch)
+
+    assert _is_megatron_ddp(_FakeMegatronDDP()) is True
+    assert _is_megatron_ddp(_FakeMegatronDDPSubclass()) is True
+    assert _is_megatron_ddp(_FakeNativeModel()) is False
+
+
+@pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
+def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
+    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+
+    _install_fake_megatron_ddp(monkeypatch)
+    model = model_cls()
+    buffer = model.buffer
+
+    offload_model_to_cpu([model])
+
+    assert model.to_calls == []
+    assert buffer.param_data.cpu_called is True
+    assert buffer.param_data.pinned is True
+    assert buffer.param_data_size == 3
+    assert buffer.grad_data_size == 5
+    assert buffer.param_data.storage().size() == 0
+    assert buffer.grad_data.storage().size() == 0
+
+    load_model_to_gpu([model])
+
+    assert model.to_calls == []
+    assert buffer.param_data.storage().size() == 3
+    assert buffer.grad_data.storage().size() == 5
+    assert buffer.param_data.copied_from is buffer.param_data.cpu_data
+    assert buffer.param_data.copy_non_blocking is True
+    assert buffer.grad_data.zero_calls == 1
+
+
+def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
+    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+
+    monkeypatch.setitem(sys.modules, "megatron.core", None)
+    monkeypatch.setitem(sys.modules, "megatron.core.distributed", None)
+    model = _FakeNativeModel()
+
+    offload_model_to_cpu([model])
+    load_model_to_gpu([model])
+
+    assert model.calls == ["cpu", "cuda"]
 
 
 def test_model_handle_dp_defaults():

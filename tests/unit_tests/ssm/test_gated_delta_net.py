@@ -17,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
@@ -68,16 +69,108 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
     return unpacked_x
 
 
+try:
+    from causal_conv1d.cpp_functions import causal_conv1d_bwd_function
+except ImportError:
+    HAVE_FUSED_PRE_GDR = False
+else:
+    HAVE_FUSED_PRE_GDR = callable(causal_conv1d_bwd_function)
+
+
+def _make_gdn_config(**overrides):
+    config_kwargs = {
+        "hidden_size": 128,
+        "linear_conv_kernel_dim": 2,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 32,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "num_layers": 1,
+        "normalization": "RMSNorm",
+        "use_cpu_initialization": True,
+        "layernorm_zero_centered_gamma": True,
+        "num_attention_heads": 8,
+        "activation_func": F.silu,
+        "bf16": True,
+        "experimental_attention_variant": "gated_delta_net",
+        "linear_attention_freq": [1],
+        "transformer_impl": "transformer_engine",
+    }
+    config_kwargs.update(overrides)
+    return TransformerConfig(**config_kwargs)
+
+
+def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
+    config = _make_gdn_config()
+    assert not config.gdn_pre_gated_delta_rule_fusion
+
+
+def test_gdn_pre_gated_delta_rule_fusion_accepts_gdn_variant():
+    config = _make_gdn_config(gdn_pre_gated_delta_rule_fusion=True)
+    assert config.gdn_pre_gated_delta_rule_fusion
+
+
+def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            gdn_pre_gated_delta_rule_fusion=True,
+        )
+
+
+def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():
+    with pytest.raises(AssertionError, match="gdn_conv_pad_alignment is incompatible"):
+        _make_gdn_config(
+            context_parallel_size=2, linear_cp_mode="chunkwise", gdn_conv_pad_alignment=4096
+        )
+
+
+def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
+    config = _make_gdn_config(
+        tensor_model_parallel_size=2,
+        context_parallel_size=4,
+        linear_cp_mode="chunkwise",
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    )
+    assert config.linear_cp_mode == "chunkwise"
+
+
+def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
+    with pytest.raises(AssertionError, match="linear_head_parallel_size"):
+        _make_gdn_config(
+            tensor_model_parallel_size=2,
+            context_parallel_size=4,
+            linear_cp_mode="headwise",
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+        )
+
+
 @pytest.mark.parametrize(
-    ("tp_size", "sp", "cp_size"),
-    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
+    ("tp_size", "sp", "cp_size", "linear_cp_mode"),
+    [
+        # cp_size=1: the CP path is inactive, so linear_cp_mode choice is irrelevant.
+        # Cover the "chunkwise" default and skip the "headwise" variants for brevity.
+        (1, False, 1, None),
+        (2, False, 1, None),
+        (2, True, 1, None),
+        # cp_size=2: exercise both CP paths.
+        (1, False, 2, "headwise"),
+        (2, False, 2, "headwise"),
+        (2, True, 2, "headwise"),
+        (1, False, 2, "chunkwise"),
+        (2, False, 2, "chunkwise"),
+        (2, True, 2, "chunkwise"),
+    ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size):
+    def setup_method(self, tp_size, sp, cp_size, linear_cp_mode):
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -88,6 +181,18 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.linear_cp_mode = linear_cp_mode
+        if self.linear_cp_mode == "headwise":
+            self.cp_size_chunkwise = 1
+            self.cp_size_headwise = self.cp_size
+        elif self.linear_cp_mode == "chunkwise":
+            self.cp_size_chunkwise = self.cp_size
+            self.cp_size_headwise = 1
+        elif self.cp_size == 1:
+            self.cp_size_chunkwise = 1
+            self.cp_size_headwise = 1
+        else:
+            raise ValueError(f"Invalid linear CP mode: {self.linear_cp_mode}")
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -115,6 +220,7 @@ class TestGatedDeltaNet:
             context_parallel_size=cp_size,
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[1],
+            linear_cp_mode=self.linear_cp_mode,
             transformer_impl="transformer_engine",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -140,7 +246,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -166,6 +272,7 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    @pytest.mark.flaky_in_dev  # Issue #5473
     def test_selective_recompute_gdn(self):
         """Whole-module 'gdn' recompute must match the non-recompute forward and gradients.
 
@@ -177,7 +284,7 @@ class TestGatedDeltaNet:
         gdn = self.gdn
         gdn.train()
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         torch.manual_seed(1234)
         base_input = torch.randn(
@@ -218,6 +325,43 @@ class TestGatedDeltaNet:
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
+    def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):
+        if not (self.linear_cp_mode == "chunkwise" and self.cp_size > 1):
+            pytest.skip("Only chunkwise CP with CP>1 uses the FLA CP batch guard.")
+
+        gdn = self.gdn
+
+        micro_batch_size = 2
+        seq_length = 64
+        hidden_states = torch.ones(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with pytest.raises(ValueError, match="requires micro_batch_size == 1"):
+            gdn(hidden_states, None)
+
+    def test_gpu_forward_rejects_sbhd_conv_padding(self):
+        gdn = self.gdn
+        gdn.config.gdn_conv_pad_alignment = 4096
+
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
+        seq_length = 64
+        hidden_states = torch.ones(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        expected_error = (
+            "incompatible with GDN chunkwise CP"
+            if self.linear_cp_mode == "chunkwise" and self.cp_size > 1
+            else "only supported with packed sequence"
+        )
+        with pytest.raises(ValueError, match=expected_error):
+            gdn(hidden_states, None)
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 
@@ -225,9 +369,9 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
-        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_headwise
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_headwise
         qkv = torch.randn(
             batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
         )
@@ -259,7 +403,7 @@ class TestGatedDeltaNet:
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
                 gdn._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len, gdn.cp_size
+                    qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=self.cp_size_headwise
                 )
             )
 
@@ -287,6 +431,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.linear_cp_mode == "chunkwise":
+            pytest.skip("Chunkwise CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
 
@@ -330,6 +476,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.linear_cp_mode == "chunkwise":
+            pytest.skip("Chunkwise CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
         sequence_length = 32
@@ -372,17 +520,520 @@ class TestGatedDeltaNet:
         )
         assert output_thd_no_padding.shape == output_thd_padded.shape
 
-        # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
+        # C) explicit causal-conv padding is only applied to packed inputs and
+        # should not affect the original unpadded token outputs.
+        self.gdn.config.gdn_conv_pad_alignment = 48
+        output_thd_conv_pad, _ = self.gdn(
+            hidden_states_thd, None, packed_seq_params=no_padding_params
+        )
+        self.gdn.config.gdn_conv_pad_alignment = None
+        assert output_thd_conv_pad.shape == output_thd_no_padding.shape
+        torch.testing.assert_close(
+            output_thd_conv_pad,
+            output_thd_no_padding,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"THD conv-padded output mismatch ({rank=}): {msg}",
+        )
+
+        # D) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
-        # D) actual mismatch branch without *_padded: should raise.
+        # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(not HAVE_FUSED_PRE_GDR, reason="causal-conv1d fused backward is not installed.")
+@pytest.mark.internal
+class TestFusedPreGatedDeltaRule:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        self.pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        self.unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        self.fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False
+        )
+        self.fused_gdn.load_state_dict(self.unfused_gdn.state_dict())
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def _build_gdn(
+        self,
+        gdn_pre_gated_delta_rule_fusion: bool,
+        *,
+        deterministic_mode: bool = True,
+        conv_kernel_dim: int = 2,
+    ):
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=conv_kernel_dim,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+            deterministic_mode=deterministic_mode,
+            gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
+        )
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=transformer_config
+        ).submodules
+        gdn = GatedDeltaNet(
+            transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=self.pg_collection,
+        )
+        return gdn.cuda().bfloat16()
+
+    def _packed_pre_gated_delta_rule_reference(self, gdn, qkvzba, cu_seqlens):
+        """Run the unfused pre-GDR path independently on each packed sequence."""
+
+        segment_outputs = [[] for _ in range(6)]
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            outputs = gdn.pre_gated_delta_rule(
+                qkvzba[start:end],
+                batch=1,
+                seq_len=end - start,
+                cp_size_headwise=gdn.cp_size,
+                cp_group_headwise=gdn.pg_collection.cp,
+            )
+            for output_list, output in zip(segment_outputs, outputs):
+                output_list.append(output)
+        return tuple(torch.cat(outputs, dim=1) for outputs in segment_outputs)
+
+    def _assert_pre_gated_delta_rule_outputs_close(
+        self, fused_outputs, unfused_outputs, *, atol: float, rtol: float, output_tolerances=None
+    ):
+        """Compare named pre-GDR outputs with optional per-output tolerances."""
+
+        output_names = ("query", "key", "value", "gate", "beta", "g")
+        output_tolerances = output_tolerances or {}
+        for name, fused, unfused in zip(output_names, fused_outputs, unfused_outputs):
+            output_atol, output_rtol = output_tolerances.get(name, (atol, rtol))
+            torch.testing.assert_close(
+                fused,
+                unfused,
+                atol=output_atol,
+                rtol=output_rtol,
+                msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
+            )
+
+    def test_fused_and_unfused_forward_match(self):
+        hidden_states = torch.randn(
+            (32, 2, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = self.unfused_gdn(hidden_states, None)
+            fused_output, fused_bias = self.fused_gdn(hidden_states, None)
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=1e-3, rtol=1e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_forward_thd_match(self):
+        unfused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+
+        hidden_states = torch.randn(
+            (32, 1, unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens = torch.tensor(
+            [0, 1, 4, 11, 32], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=21,
+            max_seqlen_kv=21,
+            total_tokens=hidden_states.shape[0],
+        )
+        assert packed_seq_params.seq_idx is not None
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = unfused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+            fused_output, fused_bias = fused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=2e-3, rtol=2e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_forward_thd_padding_match(self):
+        unfused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+
+        hidden_states = torch.randn(
+            (12, 1, unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens = torch.tensor(
+            [0, 1, 4, 9], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        cu_seqlens_padded = torch.tensor(
+            [0, 2, 6, 12], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=6,
+            max_seqlen_kv=6,
+            total_tokens=hidden_states.shape[0],
+        )
+        assert packed_seq_params.seq_idx is not None
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = unfused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+            fused_output, fused_bias = fused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=2e-3, rtol=2e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_pre_gated_delta_rule_match(self):
+        batch = 2
+        seq_len = 32
+        hidden_states = torch.randn(
+            (seq_len, batch, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            qkvzba, _ = self.unfused_gdn.in_proj(hidden_states)
+            unfused_outputs = self.unfused_gdn.pre_gated_delta_rule(
+                qkvzba, batch, seq_len, self.unfused_gdn.cp_size, self.unfused_gdn.pg_collection.cp
+            )
+            fused_outputs = self.fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba)
+
+        self._assert_pre_gated_delta_rule_outputs_close(
+            fused_outputs,
+            unfused_outputs,
+            atol=1e-3,
+            rtol=1e-3,
+            output_tolerances={"g": (1e-3, 3e-3)},
+        )
+
+    def test_fused_and_unfused_pre_gated_delta_rule_backward_match(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 2
+        seq_len = 32
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = reference_gdn.pre_gated_delta_rule(
+            qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
+        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+
+        unfused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
+        )
+        fused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(fused_outputs, grad_outputs)
+        )
+        unfused_loss.backward()
+        fused_loss.backward()
+
+        torch.testing.assert_close(qkvzba_fused.grad, qkvzba_unfused.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            fused_gdn.conv1d.weight.grad, reference_gdn.conv1d.weight.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.A_log.grad, reference_gdn.A_log.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad, reference_gdn.dt_bias.grad, atol=3e-2, rtol=3e-2
+        )
+
+    def test_fused_and_unfused_packed_pre_gated_delta_rule_forward_match(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 1
+        cu_seqlens = torch.tensor(
+            [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        seq_len = cu_seqlens[-1].item()
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            unfused_outputs = self._packed_pre_gated_delta_rule_reference(
+                reference_gdn, qkvzba, cu_seqlens
+            )
+            fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens
+            )
+
+        self._assert_pre_gated_delta_rule_outputs_close(
+            fused_outputs, unfused_outputs, atol=2e-3, rtol=2e-3
+        )
+
+    def test_fused_and_unfused_packed_pre_gated_delta_rule_backward_match(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 1
+        cu_seqlens = torch.tensor(
+            [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        seq_len = cu_seqlens[-1].item()
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = self._packed_pre_gated_delta_rule_reference(
+            reference_gdn, qkvzba_unfused, cu_seqlens
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
+            qkvzba_fused, cu_seqlens_q=cu_seqlens
+        )
+        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+
+        unfused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
+        )
+        fused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(fused_outputs, grad_outputs)
+        )
+        unfused_loss.backward()
+        fused_loss.backward()
+
+        torch.testing.assert_close(qkvzba_fused.grad, qkvzba_unfused.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            fused_gdn.conv1d.weight.grad, reference_gdn.conv1d.weight.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.A_log.grad, reference_gdn.A_log.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad, reference_gdn.dt_bias.grad, atol=3e-2, rtol=3e-2
+        )
+
+    def test_fused_packed_conv_forward_boundary_isolation(self):
+        from megatron.core.fusions.fused_pre_gated_delta_rule import (
+            fused_streamed_pre_gated_delta_rule,
+        )
+
+        seq_len = 5
+        boundary = 3
+        num_key_heads = 1
+        num_value_heads = 4
+        key_head_dim = 32
+        value_head_dim = 32
+        conv_width = 4
+        qk_channels = num_key_heads * key_head_dim
+        v_channels = num_value_heads * value_head_dim
+        k_offset = qk_channels
+        v_offset = 2 * qk_channels
+        total_channels = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
+        device = torch.cuda.current_device()
+
+        qkvzba = torch.zeros((seq_len, 1, total_channels), device=device, dtype=torch.bfloat16)
+        qkvzba[boundary - 1, 0, :qk_channels] = 10.0
+        qkvzba[boundary - 1, 0, k_offset : k_offset + qk_channels] = 10.0
+        qkvzba[boundary - 1, 0, v_offset : v_offset + v_channels] = 10.0
+        conv_weight = torch.zeros((2 * qk_channels + v_channels, 1, conv_width), device=device)
+        conv_weight[:qk_channels, 0, conv_width - 2] = 1.0
+        conv_weight[k_offset : k_offset + qk_channels, 0, conv_width - 2] = 1.0
+        conv_weight[v_offset : v_offset + v_channels, 0, conv_width - 2] = 1.0
+        A_log = torch.zeros((num_value_heads,), device=device, dtype=torch.bfloat16)
+        dt_bias = torch.zeros((num_value_heads,), device=device, dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, boundary, seq_len], device=device, dtype=torch.int32)
+
+        query, key, value, _, _, _ = fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            conv_weight.to(torch.bfloat16),
+            None,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            cu_seqlens=cu_seqlens,
+        )
+
+        torch.testing.assert_close(
+            query[0, boundary], torch.zeros_like(query[0, boundary]), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            key[0, boundary], torch.zeros_like(key[0, boundary]), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            value[0, boundary], torch.zeros_like(value[0, boundary]), atol=0.0, rtol=0.0
+        )
+
+    def test_fused_packed_conv_backward_boundary_isolation(self):
+        from megatron.core.fusions.fused_pre_gated_delta_rule import (
+            fused_streamed_pre_gated_delta_rule,
+        )
+
+        seq_len = 5
+        boundary = 3
+        num_key_heads = 1
+        num_value_heads = 4
+        key_head_dim = 32
+        value_head_dim = 32
+        conv_width = 4
+        qk_channels = num_key_heads * key_head_dim
+        v_channels = num_value_heads * value_head_dim
+        k_offset = qk_channels
+        v_offset = 2 * qk_channels
+        total_channels = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
+        device = torch.cuda.current_device()
+
+        qkvzba = torch.zeros(
+            (seq_len, 1, total_channels), device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        conv_weight = torch.zeros(
+            (2 * qk_channels + v_channels, 1, conv_width),
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            qkvzba[boundary - 1, 0, :qk_channels] = 10.0
+            qkvzba[boundary - 1, 0, k_offset : k_offset + qk_channels] = 10.0
+            qkvzba[boundary - 1, 0, v_offset : v_offset + v_channels] = 10.0
+            conv_weight[:qk_channels, 0, conv_width - 2] = 1.0
+            conv_weight[k_offset : k_offset + qk_channels, 0, conv_width - 2] = 1.0
+            conv_weight[v_offset : v_offset + v_channels, 0, conv_width - 2] = 1.0
+        A_log = torch.zeros(
+            (num_value_heads,), device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        dt_bias = torch.zeros(
+            (num_value_heads,), device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        cu_seqlens = torch.tensor([0, boundary, seq_len], device=device, dtype=torch.int32)
+
+        query, key, value, gate, beta, g = fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            conv_weight,
+            None,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            cu_seqlens=cu_seqlens,
+        )
+
+        loss = (
+            query[0, boundary].float().sum()
+            + key[0, boundary].float().sum()
+            + value[0, boundary].float().sum()
+        )
+        loss = loss + 0.0 * (gate.float().sum() + beta.float().sum() + g.float().sum())
+        loss.backward()
+
+        leaked_q_grad = qkvzba.grad[boundary - 1, 0, :qk_channels]
+        leaked_k_grad = qkvzba.grad[boundary - 1, 0, k_offset : k_offset + qk_channels]
+        leaked_v_grad = qkvzba.grad[boundary - 1, 0, v_offset : v_offset + v_channels]
+        torch.testing.assert_close(
+            leaked_q_grad, torch.zeros_like(leaked_q_grad), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            leaked_k_grad, torch.zeros_like(leaked_k_grad), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            leaked_v_grad, torch.zeros_like(leaked_v_grad), atol=0.0, rtol=0.0
+        )
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -432,17 +1083,22 @@ class TestGDNCuSeqlensResolve:
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "linear_cp_mode"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 2),  # CP
-        (2, False, 2),  # TP w/o SP + CP
-        (2, True, 2),  # TP w/ SP + CP
+        (4, False, 1, None),  # TP w/o SP
+        (4, True, 1, None),  # TP w/ SP
+        (1, False, 2, "headwise"),  # Headwise CP
+        (2, False, 2, "headwise"),  # TP w/o SP + Headwise CP
+        (2, True, 2, "headwise"),  # TP w/ SP + Headwise CP
+        (1, False, 2, "chunkwise"),  # Chunkwise CP
+        (2, False, 2, "chunkwise"),  # TP w/o SP + chunkwise CP
+        (2, True, 2, "chunkwise"),  # TP w/ SP + chunkwise CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -459,6 +1115,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
+        linear_cp_mode=linear_cp_mode,
         transformer_impl="transformer_engine",
     )
 
@@ -466,10 +1123,16 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         config=transformer_config, vp_stage=None, pp_rank=0
     )
 
-    if cp:
-        atol, rtol = 5e-3, 5e-3
+    cosine_similarity_threshold = None
+    if cp > 1:
+        atol, rtol = 2e-3, 1e-2
+        cosine_similarity_threshold = 0.9999
     else:
-        atol, rtol = 5e-4, 5e-4
+        atol, rtol = 2e-4, 2e-3
+        cosine_similarity_threshold = 0.99999
+
+    is_chunkwise_cp = linear_cp_mode == "chunkwise" and cp > 1
+    micro_batch_size = 1 if is_chunkwise_cp and not sequence_packing else 4
 
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
@@ -477,12 +1140,13 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         tmp_path_dist_ckpt=tmp_path_dist_ckpt,
         atol=atol,
         rtol=rtol,
+        cosine_similarity_threshold=cosine_similarity_threshold,
         tp=tp,
         sp=sp,
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=4,
+        micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
     )
 

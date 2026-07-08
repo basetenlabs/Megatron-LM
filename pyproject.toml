@@ -94,7 +94,7 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "flash-linear-attention~=0.4.0",
+    "flash-linear-attention>=0.4.2,<0.5",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
@@ -169,12 +169,13 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
+    "flash_mla",
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
@@ -199,6 +200,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" },
 ]
+nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
@@ -247,6 +249,10 @@ omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
+    # These fused paths are mostly Triton DSL kernels and PyTorch
+    # autograd-engine callbacks. The CUDA code is exercised by unit tests,
+    # but coverage.py cannot reliably trace those execution contexts.
+    "*/megatron/core/fusions/*",
 ]
 parallel = true
 sigterm = false

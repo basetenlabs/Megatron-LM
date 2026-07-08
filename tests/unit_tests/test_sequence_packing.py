@@ -8,13 +8,16 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import (
+    DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -167,6 +170,178 @@ class MockVariableLengthSequencePackingDataIterator:
             )
 
         return batch
+
+
+class _MockCPGroup:
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+def test_dsv4_thd_cp_slice_uses_static_partition_total():
+    from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
+
+    batch = {
+        "tokens": torch.arange(12, dtype=torch.int64),
+        "position_ids": torch.arange(12, dtype=torch.int64),
+        "labels": torch.arange(100, 112, dtype=torch.int64),
+        "loss_mask": torch.ones(12, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 12], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 12], dtype=torch.int32),
+        "max_seqlen": torch.tensor([12], dtype=torch.int32),
+    }
+
+    get_cp_slice_for_thd(
+        batch,
+        _MockCPGroup(size=4, rank=2),
+        cp_partition_mode="contiguous",
+        partition_total_tokens=16,
+    )
+
+    assert torch.equal(batch["tokens"], torch.arange(8, 12, dtype=torch.int64))
+    assert torch.equal(batch["position_ids"], torch.arange(8, 12, dtype=torch.int64))
+    assert torch.equal(batch["labels"], torch.arange(108, 112, dtype=torch.int64))
+    assert torch.equal(batch["loss_mask"], torch.ones(4, dtype=torch.float32))
+    assert torch.equal(batch["cu_seqlens"], torch.tensor([0, 12], dtype=torch.int32))
+    assert torch.equal(batch["cu_seqlens_padded"], torch.tensor([0, 12], dtype=torch.int32))
+
+
+@pytest.mark.parametrize(
+    ("alignment", "cuda_graph_impl", "local_cp_size", "total_tokens", "local_target"),
+    [(4, "none", 2, 10, 8), (8, "transformer_engine", 2, 10, 8)],
+)
+def test_dsv4_thd_dynamic_cp_pads_before_slicing(
+    monkeypatch, alignment, cuda_graph_impl, local_cp_size, total_tokens, local_target
+):
+    """DSv4 padding must not change rank-local row origins after CP slicing."""
+    cp_rank = local_cp_size - 1
+    dynamic_cp_group = _MockCPGroup(size=local_cp_size, rank=cp_rank)
+    pg_collection = SimpleNamespace(
+        tp=_MockCPGroup(size=1, rank=0),
+        pp=_MockCPGroup(size=1, rank=0),
+        cp=_MockCPGroup(size=4, rank=cp_rank),
+    )
+    config = SimpleNamespace(
+        cp_partition_mode="contiguous",
+        pad_packed_seq_alignment=alignment,
+        max_seqlen_per_dp_cp_rank=8,
+        thd_max_packed_sequences=None,
+        cuda_graph_impl=cuda_graph_impl,
+        pad_packed_seq_by_appending_dummy_seq=True,
+    )
+    tokens = torch.arange(1, total_tokens + 1, dtype=torch.int64)
+    batch = {
+        "tokens": tokens.clone(),
+        "position_ids": torch.arange(total_tokens, dtype=torch.int64),
+        "labels": tokens + 100,
+        "loss_mask": torch.ones(total_tokens, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, total_tokens], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, total_tokens], dtype=torch.int32),
+        "max_seqlen": torch.tensor([total_tokens], dtype=torch.int32),
+        "local_cp_size": torch.tensor([local_cp_size], dtype=torch.int32),
+    }
+    pad_input_lengths = []
+    real_pad_sequence_for_thd = data_schedule.pad_sequence_for_thd
+
+    def record_padding(
+        tokens, labels, loss_mask, position_ids, packed_seq_params, *, padding_mask, **_
+    ):
+        pad_input_lengths.append(tokens.shape[-1])
+        assert tokens.shape[-1] == local_target
+        assert padding_mask.shape[-1] == local_target
+        result = real_pad_sequence_for_thd(
+            tokens,
+            labels,
+            loss_mask,
+            position_ids,
+            packed_seq_params,
+            padding_mask=padding_mask,
+            **_,
+        )
+        assert result[0].shape[-1] == local_target
+        assert result[-1].shape[-1] == local_target
+        return result
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_world_size",
+        lambda group=None: group.size() if group is not None else 1,
+    )
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda group=None: group.rank() if group is not None else 0
+    )
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_: None)
+    monkeypatch.setattr(data_schedule, "pad_sequence_for_thd", record_padding)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dynamic_data_context_parallel_groups",
+        lambda group_size: dynamic_cp_group,
+    )
+
+    result = get_batch_on_this_rank_for_sequence_packing(
+        data_iterator=iter([batch]), dynamic_cp=True, pg_collection=pg_collection, config=config
+    )
+
+    local_tokens, _, _, _, _, packed_seq_params, padding_mask = result
+    global_start = cp_rank * local_target
+    expected = torch.zeros(local_target, dtype=torch.int64)
+    copied = max(0, min(total_tokens - global_start, local_target))
+    if copied:
+        expected[:copied] = torch.arange(
+            global_start + 1, global_start + copied + 1, dtype=torch.int64
+        )
+    assert torch.equal(local_tokens.squeeze(0), expected)
+    assert padding_mask.shape == (1, local_target)
+    assert torch.equal(
+        padding_mask.squeeze(0),
+        torch.arange(global_start, global_start + local_target) >= total_tokens,
+    )
+    assert packed_seq_params.local_cp_size == local_cp_size
+    assert packed_seq_params.cp_partition_mode == "contiguous"
+    assert pad_input_lengths == [local_target]
+
+
+def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[6144, 2048], [6144, 2048]]
+    assert sample_ids == [[0, 1], [0, 1]]
+    assert exec_times[0] == exec_times[1]
+
+
+def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[50, 50] for _ in range(14)]
+    assert sample_ids == [[0, 1] for _ in range(14)]
+    assert exec_times == [exec_times[0] for _ in range(14)]
+
+
+def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping_by_default():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=2,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+    )
+
+    sample_id_groups = scheduler.get_groups_and_subsamples([(0, 6144), (1, 2048)])
+
+    assert sample_id_groups == [[[0, 1], [0, 1]]]
 
 
 def _gather_tensor_from_tp_group(tensor):
@@ -586,13 +761,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             if is_pp_first and (vpp is None or vpp <= 1):
                 dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                 cp_size = parallel_state.get_context_parallel_world_size()
-                cp_group = parallel_state.get_context_parallel_group()
 
                 # Count each sequence exactly once using int64 for bitwise comparison.
                 # THD (dp_balanced): CP siblings hold identical packed data,
                 #   so reduce across DP only (not CP) on both sides.
-                # DCP: data is redistributed uniquely across dp_cp ranks,
-                #   so per-microbatch CP all_reduce + scale, then dp_cp all_reduce.
+                # DCP: wrap_data_iterator returns packed samples before
+                #   get_batch_on_this_rank_for_sequence_packing applies CP
+                #   slicing, so local CP siblings still hold identical packed
+                #   tokens here. Scale each rank by max_cp / local_cp, then
+                #   reduce across DPxCP. A local-CP all-reduce here would
+                #   overcount the pre-slice tokens.
                 # Both sides multiply by max_cp so DCP (with varying local_cp)
                 # can be normalized to the same integer scale without division.
                 max_cp = cp_size
@@ -611,21 +789,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # After wrap.
                 token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
                 if is_dynamic_cp:
-                    # DCP: per-microbatch CP all_reduce + scale to max_cp,
-                    # then dp_cp all_reduce to aggregate unique contributions.
                     for batch in batch_all:
                         mb_sum = batch['tokens'].long().sum().clone()
                         local_cp = batch['local_cp_size']
                         if isinstance(local_cp, torch.Tensor):
                             local_cp = local_cp.item()
-                        mb_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
-                            group_size=local_cp
-                        )
-                        torch.distributed.all_reduce(
-                            mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
-                        )
-                        # all_reduce result = mb_sum * local_cp.
-                        # Scale to mb_sum * max_cp.
                         mb_sum *= max_cp // local_cp
                         token_sum_after += mb_sum
                     torch.distributed.all_reduce(

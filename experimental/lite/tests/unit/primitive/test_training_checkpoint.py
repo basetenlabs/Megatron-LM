@@ -4,14 +4,18 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.distributed.tensor import Replicate, Shard
+
+pytest.importorskip("megatron.core.dist_checkpointing")
 
 from megatron.core.dist_checkpointing.strategies.torch import (
     _replace_state_dict_keys_with_sharded_keys,
 )
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
+    _dist_opt_checkpoint_metadata,
     _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
@@ -22,6 +26,22 @@ from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
+
+
+@pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
+def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
+    opts = [
+        SimpleNamespace(
+            data_parallel_group_gloo=group,
+            sharded_state_dict=lambda: None,
+            gbuf_ranges={},
+            buffers=[],
+            optimizer=object(),
+        )
+        for group in groups
+    ]
+    metadata = _dist_opt_checkpoint_metadata(SimpleNamespace(chained_optimizers=opts))
+    assert metadata["distrib_optim_fully_reshardable_mem_efficient"] is expected
 
 
 def _assert_state_equal(actual, expected) -> None:
@@ -100,7 +120,7 @@ DISTOPT_METADATA = {
 }
 
 
-def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) -> None:
+def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = FakeDistOpt()
     ps = ParallelState(pp_rank=1, tp_rank=2, dp_cp_rank=3)
@@ -128,7 +148,7 @@ def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) 
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
 
 
-def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
+def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
     ps = ParallelState(
         pp_size=2,
         pp_rank=1,
@@ -160,7 +180,7 @@ def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
     assert expert_replica == (0, 0, 0)
 
 
-def test_distopt_replica_id_groups_sharded_axes_by_placement() -> None:
+def test_dist_opt_replica_id_groups_sharded_axes_by_placement() -> None:
     placements = [Replicate(), Replicate(), Replicate(), Shard(0)]
     rank_offsets0, replica_id0 = _rank_offsets_and_replica_id(
         placements, ParallelState(tp_size=2, tp_rank=0), expert=False
@@ -183,7 +203,7 @@ def test_distopt_replica_id_groups_sharded_axes_by_placement() -> None:
     assert expert_replica_id == (0, 0, 0)
 
 
-def test_distopt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
+def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     rank_offsets, replica_id = _rank_offsets_and_replica_id(
         [Replicate(), Replicate(), Replicate(), Shard(0)],
         ParallelState(pp_size=2, pp_rank=1, tp_size=2, tp_rank=1),
@@ -202,7 +222,7 @@ def test_distopt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     assert replica_id == (0, 0, 0)
 
 
-def test_distopt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:
+def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:
     ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
     model = torch.nn.Linear(4, 2)
     attach_model_sharded_state_dict([model], ps)
@@ -215,7 +235,7 @@ def test_distopt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter()
     assert set(filtered_sd) == {"model_pp1.weight", "model_pp1.bias"}
 
 
-def test_distopt_model_state_keys_are_pp_and_vpp_aware() -> None:
+def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
     ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
     single_chunk = torch.nn.Linear(4, 2)
     attach_model_sharded_state_dict([single_chunk], ps)
@@ -240,7 +260,7 @@ def test_distopt_model_state_keys_are_pp_and_vpp_aware() -> None:
     assert _single_or_all_model_state(vpp_sd) is vpp_sd
 
 
-def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
     optimizer = FakeDistOpt()
@@ -271,7 +291,7 @@ def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> 
     assert optimizer.loaded_state == {"loaded": True}
 
 
-def test_distopt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
+def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
     class FakeTorchOptimizer:
         def __init__(self, steps):
             self.state = {

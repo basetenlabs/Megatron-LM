@@ -22,11 +22,12 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
+from megatron.lite.primitive.deterministic import set_deterministic
+from megatron.lite.runtime import create_runtime
+
 from examples.bench.bench import BenchCliConfig, build_runtime_config, build_session_config
 from examples.bench.results import compare_correctness_artifacts, load_result_artifact
 from examples.bench.session import _make_data_iter
-from megatron.lite.primitive.deterministic import set_deterministic
-from megatron.lite.runtime import create_runtime
 
 
 def _distributed_rank() -> int:
@@ -234,6 +235,8 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
 
 
 def _update_hash_with_tensor(h: Any, name: str, tensor: torch.Tensor) -> None:
+    if hasattr(tensor, "to_local"):
+        tensor = tensor.to_local()
     t = tensor.detach().contiguous().cpu()
     h.update(name.encode("utf-8"))
     h.update(b"\0")
@@ -285,7 +288,7 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     count = 0
     details = []
     include_details = os.environ.get("MLITE_CORRECTNESS_WEIGHT_DETAILS") == "1"
-    for name, tensor in sorted(rt.export_weights(handle, cpu=True), key=lambda item: item[0]):
+    for name, tensor in sorted(rt.export_weights(handle), key=lambda item: item[0]):
         _update_hash_with_tensor(h, str(name), tensor)
         if include_details:
             detail = _hash_tensor(tensor)
@@ -299,48 +302,16 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     return result
 
 
-def _batch_without_labels(batch: Any) -> dict[str, Any]:
-    if not isinstance(batch, dict):
-        return {
-            "input_ids": batch["input_ids"],
-            "position_ids": getattr(batch, "position_ids", None),
-            "packed_seq_params": getattr(batch, "packed_seq_params", None),
-        }
-    return {k: v for k, v in batch.items() if k != "labels"}
-
-
 def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
-    sample = _batch_without_labels(batch)
-    if "forward_step" in handle._extras:
-        try:
-            out = handle._model(**sample)
-        except (KeyError, TypeError):
-            out = handle._extras["forward_step"](handle._model, sample)
-        if isinstance(out, dict):
-            logits = out.get("logits")
-            if logits is not None:
-                return logits
-            return out.get("vocab_parallel_logits")
-        return out if isinstance(out, torch.Tensor) else None
-
-    model_list = handle._extras.get("model_list")
-    if model_list:
-        out = model_list[0](
-            input_ids=sample.get("input_ids"),
-            position_ids=sample.get("position_ids"),
-            attention_mask=sample.get("attention_mask"),
-            packed_seq_params=sample.get("packed_seq_params"),
-        )
-        if isinstance(out, tuple):
-            out = out[0]
-        if isinstance(out, dict):
-            logits = out.get("logits")
-            if logits is not None:
-                return logits
-            return out.get("vocab_parallel_logits")
-        return out if isinstance(out, torch.Tensor) else None
-
-    return None
+    result = rt.forward_backward(
+        handle,
+        iter([batch]),
+        loss_fn=None,
+        num_microbatches=1,
+        forward_only=True,
+    )
+    output = result.model_output
+    return output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None)
 
 
 def run_backend(
@@ -377,7 +348,8 @@ def run_backend(
                     handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
                 )
                 _sync(session_cfg.device)
-                logits = _hash_tensor(result.model_output.vocab_parallel_logits)
+                output = result.model_output
+                logits = _hash_tensor(output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None))
                 grads = _grad_fingerprint(handle)
 
                 if session_cfg.no_optimizer:
@@ -386,11 +358,14 @@ def run_backend(
                     update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
                     rt.lr_scheduler_step(handle)
                 _sync(session_cfg.device)
+                loss = result.metrics.get("loss")
+                if loss is None:
+                    loss = result.model_output.loss
 
             steps.append(
                 {
                     "step": step,
-                    "loss": _scalar(result.metrics.get("loss", 0.0)),
+                    "loss": _scalar(0.0 if loss is None else loss),
                     "logits": logits,
                     "grad_fingerprint": grads,
                     "grad_norm": _scalar(grad_norm),

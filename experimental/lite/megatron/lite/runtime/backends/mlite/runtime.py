@@ -12,17 +12,20 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
+from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
-    impl_cfg_kwargs = {**rt_cfg.impl_cfg, "parallel": rt_cfg.parallel}
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
+    # Only forward impl_cfg keys this model's ImplConfig declares: the connector
+    # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
+    impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
+    impl_cfg_kwargs["parallel"] = rt_cfg.parallel
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -64,13 +67,13 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: Any, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
         raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
-    if not isinstance(batch, dict) or "input_ids" not in batch:
-        raise TypeError("Megatron Lite pipeline runtime requires dict batches with input_ids.")
+    if not isinstance(batch, PackedBatch):
+        raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
 
-    input_ids = batch["input_ids"]
+    input_ids = batch.input_ids
     if input_ids.dim() == 1:
         batch_size = 1
         local_seq_len = int(input_ids.size(0))
@@ -84,16 +87,33 @@ def _infer_pipeline_tensor_shape(batch: Any, model_cfg: Any, ps) -> tuple[int, i
         raise ValueError("Pipeline tensor shape requires non-empty sequence.")
 
     tp_size = int(getattr(ps, "tp_size", 1) or 1)
-    if tp_size > 1:
+    cp_size = int(getattr(ps, "cp_size", 1) or 1)
+    # The model scatters THD activations into Megatron sequence-parallel + context-parallel form
+    # before the first layer, so PP-communicated hidden states carry padded_S / (CP * TP) per rank.
+    # The raw input_ids length is UNPADDED and not CP-divided; sizing the P2P buffer from it makes the
+    # receiver wait for CP*TP-too-many elements -> NCCL recv hang. Replicate thd.pack_nested_thd padding
+    # (each sequence padded to align = tp * (2*cp if cp>1 else 1)) then divide by CP*TP.
+    seq_lens = getattr(batch, "seq_lens", None)
+    if seq_lens is not None and cp_size * tp_size > 1:
+        sl = seq_lens if isinstance(seq_lens, torch.Tensor) else torch.as_tensor(seq_lens)
+        sl = sl.to(torch.int64).reshape(-1)
+        align = tp_size * (2 * cp_size if cp_size > 1 else 1)
+        padded = sl + (align - sl % align) % align
+        total_padded = int(padded.sum().item())
+        local_seq_len = total_padded // (cp_size * tp_size)
+    elif tp_size > 1:
         if local_seq_len % tp_size != 0:
             raise ValueError(
                 f"Pipeline tensor sequence length {local_seq_len} is not divisible by TP={tp_size}."
             )
-        # Megatron Lite Qwen3.5 scatters embeddings into Megatron sequence-parallel form
-        # before the first layer, so PP activations carry S / (CP * TP).
         local_seq_len //= tp_size
 
-    return (local_seq_len, batch_size, int(model_cfg.hidden_size))
+    # Models with multi-head hyper-connections (e.g. DeepSeek V4) carry hc_mult
+    # parallel residual streams across pipeline stages. The inter-stage tensor folds
+    # hc_mult into the hidden dim ([B, S, hc_mult * H]); size the P2P buffer to match.
+    # hc_mult defaults to 1, so this is a no-op for every other model.
+    hc_mult = int(getattr(model_cfg, "hc_mult", 1) or 1)
+    return (local_seq_len, batch_size, int(model_cfg.hidden_size) * hc_mult)
 
 
 def _last_loss_output(outputs: list[dict]) -> dict:
@@ -111,6 +131,27 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     raise TypeError(
         f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}."
     )
+
+
+def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
+    def wrapped_forward_step(model, item):
+        batch, loss_context = split_loss_context(item)
+        if loss_context is None:
+            return forward_step(model, batch)
+        with use_loss_context(loss_context):
+            return forward_step(model, batch)
+
+    if loss_fn is None:
+        return wrapped_forward_step, None
+
+    def wrapped_loss_fn(output, item, loss_context=None):
+        batch, item_loss_context = split_loss_context(item)
+        loss_context = loss_context or item_loss_context or get_loss_context()
+        if loss_context is None:
+            return loss_fn(output, batch)
+        return loss_fn(output, batch, loss_context)
+
+    return wrapped_forward_step, wrapped_loss_fn
 
 
 class MegatronLiteRuntime(RuntimeBase):
@@ -195,8 +236,8 @@ class MegatronLiteRuntime(RuntimeBase):
             if callable(reload_model_params):
                 reload_model_params()
 
-        # ── forward_step default ──
-        forward_fn = bundle.forward_step or (lambda m, b: m(**b))
+        if bundle.forward_step is None:
+            raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -209,7 +250,7 @@ class MegatronLiteRuntime(RuntimeBase):
             _extras={
                 "model_chunks": bundle.chunks,
                 "model_cfg": model_cfg,
-                "forward_step": forward_fn,
+                "forward_step": bundle.forward_step,
                 "protocol": proto,
                 "finalize_grads": bundle.finalize_grads,
                 "world_size": dist.get_world_size(),
@@ -389,22 +430,27 @@ class MegatronLiteRuntime(RuntimeBase):
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
+            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
-            first_batch = next(data_iter)
-            data_iter = chain([first_batch], data_iter)
+            first_item = next(data_iter)
+            first_batch, _loss_context = split_loss_context(first_item)
+            data_iter = chain([first_item], data_iter)
             tensor_shape = _infer_pipeline_tensor_shape(
                 first_batch, handle._extras.get("model_cfg"), ps
             )
+            model_chunks = handle._extras.get("model_chunks", [handle._model])
+            pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
+            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             outputs = forward_backward_pipelining(
-                forward_step,
-                handle._extras.get("model_chunks", [handle._model]),
+                pipeline_forward_step,
+                pipeline_chunks,
                 data_iter,
                 SimpleNamespace(num_microbatches=num_microbatches),
                 ps,
                 tensor_shape=tensor_shape,
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
+                loss_fn=pipeline_loss_fn,
                 forward_only=forward_only,
             )
             out = _last_loss_output(outputs)
@@ -413,12 +459,14 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss_float = float(loss_obj.detach().item())
             elif loss_obj is not None:
                 loss_float = float(loss_obj)
-            else:
-                loss_float = 0.0
-            loss_t = torch.tensor([loss_float], device="cuda")
+            loss_payload = torch.tensor(
+                [loss_obj is not None, loss_float if loss_obj is not None else 0.0],
+                device="cuda",
+                dtype=torch.float32,
+            )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
-            out = {"loss": loss_t.squeeze(0)}
+                dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+            out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
             out = run_microbatch_loop(
                 handle._model,
@@ -429,6 +477,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist_opt=not forward_only,
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=loss_fn,
+                forward_only=forward_only,
             )
 
         if not forward_only:
@@ -437,22 +486,13 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        loss_val = (
-            loss_tensor.item()
-            if isinstance(loss_tensor, torch.Tensor)
-            else float(loss_tensor or 0.0)
-        )
-        metrics: dict = {"loss": loss_val}
-        for m in out.get("_loss_fn_metrics", []) if out else []:
-            for k, v in m.items():
-                if k not in metrics:
-                    metrics[k] = v
+        metric_rows = out.get("_loss_fn_metrics", []) if out else []
         if ps.pp_size > 1:
-            for item in outputs:
-                for k, v in item.get("metrics", {}).items():
-                    if k not in metrics:
-                        metrics[k] = v
-            metrics["_micro_outputs"] = outputs
+            metric_rows += [item["metrics"] for item in outputs if item.get("metrics")]
+        metrics: dict = {}
+        for row in metric_rows:
+            for key, value in row.items():
+                metrics.setdefault(key, []).append(value)
 
         return ForwardResult(
             model_output=ModelOutputs(
