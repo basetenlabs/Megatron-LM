@@ -673,14 +673,46 @@ class AbsorbedMLASelfAttention(Attention):
         _, v_up_weight = self._get_kv_up_weights()
         return v_up_weight
 
+    def _effective_kv_up_proj_weight(self) -> torch.Tensor:
+        """``linear_kv_up_proj`` weight with any LoRA adapter folded in.
+
+        The absorbed path consumes ``linear_kv_up_proj`` as a raw weight (K folded
+        into the query, V applied after core attention) instead of calling its
+        ``forward``, so a PEFT LoRA adapter must be folded into the effective
+        weight here or it would never be applied. Duck-typed on the
+        ``AdapterWrapper`` layout (``to_wrap`` base + ``adapter``) to avoid a
+        ``megatron.core`` -> ``megatron.bridge`` dependency. Returns
+        ``W + scale * (B @ A)``; gradients flow to A/B through the absorption
+        einsums. Fused DSA runs TP=1, so the adapter factors are unsharded; TP>1
+        LoRA on the absorbed kv up-projection is unsupported.
+        """
+        module = self.linear_kv_up_proj
+        if not (hasattr(module, "to_wrap") and hasattr(module, "adapter")):
+            return module.weight
+        weight = module.to_wrap.weight
+        if not getattr(module, "_adapter_enabled", True):
+            return weight
+        if self.config.tensor_model_parallel_size != 1:
+            raise NotImplementedError(
+                "LoRA on the absorbed kv up-projection is only supported with TP=1."
+            )
+        adapter = module.adapter
+        lora_a = adapter.linear_in.weight  # [lora_dim, kv_lora_rank]
+        lora_b = adapter.linear_out.weight  # [num_heads * (qk_head_dim + v_head_dim), lora_dim]
+        scale = getattr(adapter, "scale", None)
+        if scale is None:
+            scale = adapter.alpha / adapter.dim
+        return weight + scale * (lora_b @ lora_a)
+
     def _get_kv_up_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return K and V up-projection weights from the combined per-head MLA layout."""
         expected_rows = self.num_attention_heads_per_partition * (
             self.config.qk_head_dim + self.config.v_head_dim
         )
-        assert self.linear_kv_up_proj.weight.size(0) == expected_rows
-        assert self.linear_kv_up_proj.weight.size(1) == self.config.kv_lora_rank
-        kv_up_weight = self.linear_kv_up_proj.weight.view(
+        weight = self._effective_kv_up_proj_weight()
+        assert weight.size(0) == expected_rows
+        assert weight.size(1) == self.config.kv_lora_rank
+        kv_up_weight = weight.view(
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
             self.config.kv_lora_rank,
