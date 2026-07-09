@@ -7,7 +7,6 @@ from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -17,6 +16,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttentionSubmodules,
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
+)
+from megatron.core.transformer.experimental_attention_variant.glm_absorbed_mla import (
+    GlmAbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -111,7 +113,7 @@ def get_dsa_module_spec_for_backend(
     )
 
     attention = ModuleSpec(
-        module=AbsorbedMLASelfAttention,
+        module=GlmAbsorbedMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
         submodules=AbsorbedMLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),

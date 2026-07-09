@@ -673,14 +673,24 @@ class AbsorbedMLASelfAttention(Attention):
         _, v_up_weight = self._get_kv_up_weights()
         return v_up_weight
 
+    def _kv_up_proj_weight(self) -> torch.Tensor:
+        """Raw combined KV up-projection weight consumed by the absorbed path.
+
+        The absorbed path uses this weight directly instead of calling
+        ``linear_kv_up_proj.forward``. Subclasses can override this to return an
+        effective weight, for example with a LoRA adapter folded in.
+        """
+        return self.linear_kv_up_proj.weight
+
     def _get_kv_up_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return K and V up-projection weights from the combined per-head MLA layout."""
         expected_rows = self.num_attention_heads_per_partition * (
             self.config.qk_head_dim + self.config.v_head_dim
         )
-        assert self.linear_kv_up_proj.weight.size(0) == expected_rows
-        assert self.linear_kv_up_proj.weight.size(1) == self.config.kv_lora_rank
-        kv_up_weight = self.linear_kv_up_proj.weight.view(
+        weight = self._kv_up_proj_weight()
+        assert weight.size(0) == expected_rows
+        assert weight.size(1) == self.config.kv_lora_rank
+        kv_up_weight = weight.view(
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
             self.config.kv_lora_rank,
