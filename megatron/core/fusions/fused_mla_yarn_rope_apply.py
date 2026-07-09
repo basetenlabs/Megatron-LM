@@ -94,7 +94,7 @@ def rotary_fwd_q_kernel(
         seq_num: number of sequences for thd format, not used for sbhd format
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_q is None:
@@ -172,7 +172,7 @@ def rotary_bwd_q_kernel(
 
         batch_size, seq_num, and cu_seqlens_q are the same as in the forward pass
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_q is None:
@@ -421,7 +421,7 @@ def rotary_fwd_kv_kernel(
             or [total_seq_len, head_num, emb_dim + k_dim]
         O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
@@ -525,7 +525,7 @@ def rotary_bwd_kv_kernel(
             or [total_seq_len, head_num, k_dim + v_dim]
         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
