@@ -84,4 +84,9 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
 
     nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    # Compare release components only: deployments that cannot take the
+    # PyPI >=0.6.0 wheel's torch requirement pin nvidia-resiliency-ext to a
+    # known-good git commit, whose setuptools-scm version reads 0.6.0.devN.
+    # PEP 440 orders 0.6.0.devN < 0.6.0, which would spuriously fail this
+    # feature gate even though the pinned build carries the 0.6.0 API.
+    return PkgVersion(PkgVersion(nvrx_version).base_version) >= PkgVersion(version)
