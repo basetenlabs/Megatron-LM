@@ -612,8 +612,6 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            # q_chunk's row 0 is at this absolute causal position, not position 0.
-            # Align cuDNN's causal diagonal with the compacted query chunk.
             q_causal_offsets = torch.full(
                 (b,),
                 bottom_right_key_start + row_start,
@@ -778,8 +776,6 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
-    # Each K segment is the document prefix through its Q segment, so q[0]'s
-    # document-local causal position is len(K_segment) - len(Q_segment).
     segment_q_causal_offsets = (segment_k_lengths - segment_q_lengths).to(
         dtype=torch.int32, device=device
     )
