@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -564,6 +565,120 @@ def _compute_indexer_scores_chunk_with_global_rows(
     return scores_chunk
 
 
+_DSA_INDEXER_FP8_FORWARD_ENV = "DSA_INDEXER_FP8_FORWARD"
+
+
+def _dsa_indexer_fp8_forward_enabled() -> bool:
+    """Whether to score the DSA indexer forward in FP8 via DeepGEMM.
+
+    Off by default; set ``DSA_INDEXER_FP8_FORWARD=1`` to make the trainer's
+    indexer top-k selection match FP8 inference (the DeepGEMM
+    ``sm100_fp8_mqa_logits`` kernel used by vLLM) in the scorer, instead of the
+    BF16 cuDNN scorer.
+    """
+    return os.environ.get(_DSA_INDEXER_FP8_FORWARD_ENV) == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def _deep_gemm_mqa_logits():
+    """Return DeepGEMM's fp8 MQA-logits entrypoint (optional dependency)."""
+    import deep_gemm
+
+    fn = getattr(deep_gemm, "fp8_fp4_mqa_logits", None) or getattr(
+        deep_gemm, "fp8_mqa_logits", None
+    )
+    if fn is None:
+        raise RuntimeError(
+            "deep_gemm exposes neither fp8_fp4_mqa_logits nor fp8_mqa_logits; "
+            "cannot run the FP8 indexer forward."
+        )
+    return fn
+
+
+def _ue8m0_quant(x: Tensor, group_size: int = 128) -> Tuple[Tensor, Tensor]:
+    """Per-``group_size`` E4M3 quantization with UE8M0 (power-of-two) scales.
+
+    Matches the grouped indexer quantization used by the FP8 inference kernel so
+    trainer and inference quantize identically. Returns ``(fp8, scale)`` with one
+    FP32 scale per group along the last dimension.
+    """
+    lead = list(x.shape[:-1])
+    d = x.shape[-1]
+    groups = x.float().reshape(*lead, d // group_size, group_size)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    raw = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / fp8_max
+    scale = torch.exp2(torch.ceil(torch.log2(raw)))
+    fp8 = (groups / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return fp8.reshape(*lead, d), scale.reshape(*lead, d // group_size)
+
+
+def _deepgemm_indexer_forward_scores(
+    index_q: Tensor,
+    index_k: Tensor,
+    weights: Tensor,
+    *,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> dict:
+    """FP8 head-summed indexer logits via DeepGEMM ``fp8_mqa_logits``.
+
+    Drop-in for the dense / bottom-right-causal cases of
+    ``CudnnDsaInterface.indexer_forward_wrapper``. Quantizes ``index_q`` and
+    ``index_k`` to grouped E4M3, folds the per-(row, head) Q scale into the head
+    weights (the FP8 scorer applies it after the positively-homogeneous ReLU, so
+    folding is exact), builds per-row ``[ks, ke)`` key ranges, and returns the
+    same ``{"scores": [b, rows, sk]}`` head-summed logits as the cuDNN kernel.
+
+    Head-dim equals one quantization group (``group_size == D``). Uniform score
+    factors (softmax scale, ``1/sqrt(n_head)``) are omitted: they do not change
+    the top-k ranking.
+    """
+    b, rows, n_head, head_dim = index_q.shape
+    if b != 1:
+        raise RuntimeError("FP8 indexer forward supports b == 1")
+    sk = index_k.size(1)
+    q = index_q[0]
+    k = index_k[0, :, 0, :] if index_k.dim() == 4 else index_k[0]
+    w = weights[0].float()
+    q_fp8, q_scale = _ue8m0_quant(q, head_dim)
+    k_fp8, k_scale = _ue8m0_quant(k, head_dim)
+    q_scale = q_scale.reshape(rows, n_head)
+    k_scale = k_scale.reshape(sk).float().contiguous()
+    w_folded = (w * q_scale).contiguous().float()
+    q_fp8 = q_fp8.contiguous()
+    k_fp8 = k_fp8.contiguous()
+    device = q.device
+    ks = torch.zeros(rows, dtype=torch.int32, device=device)
+    if q_causal_offsets is not None:
+        offset = int(q_causal_offsets.reshape(-1)[0].item())
+        ke = (
+            torch.arange(rows, device=device, dtype=torch.int32) + (offset + 1)
+        ).clamp_(max=sk)
+    else:
+        ke = torch.full((rows,), sk, dtype=torch.int32, device=device)
+    logits = _deep_gemm_mqa_logits()(
+        (q_fp8, None), (k_fp8, k_scale), w_folded, ks, ke, clean_logits=True
+    )
+    return {"scores": logits.view(b, rows, sk)}
+
+
+def _indexer_forward_scores(index_q: Tensor, index_k: Tensor, weights: Tensor, **kwargs):
+    """Route indexer forward scoring to the FP8 DeepGEMM kernel when enabled and
+    the layout is dense or bottom-right-causal, else the cuDNN BF16 kernel.
+
+    THD multi-segment packed-CP calls (which pass ``cu_seqlens_q``/
+    ``cu_seqlens_k``) are not yet handled by the FP8 path and fall back to cuDNN.
+    """
+    if (
+        _dsa_indexer_fp8_forward_enabled()
+        and kwargs.get("cu_seqlens_q") is None
+        and kwargs.get("cu_seqlens_k") is None
+    ):
+        return _deepgemm_indexer_forward_scores(
+            index_q, index_k, weights, q_causal_offsets=kwargs.get("q_causal_offsets")
+        )
+    return _cudnn_dsa.indexer_forward_wrapper(index_q, index_k, weights, **kwargs)
+
+
 def _indexer_topk_from_score_chunks(
     q_bshd: Tensor,
     k_bshd: Tensor,
@@ -618,7 +733,7 @@ def _indexer_topk_from_score_chunks(
                 dtype=torch.int32,
                 device=q_chunk.device,
             )
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_scores(
                 q_chunk,
                 score_k_bshd,
                 w_chunk,
@@ -627,7 +742,7 @@ def _indexer_topk_from_score_chunks(
                 q_causal_offsets=q_causal_offsets,
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_scores(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         else:
@@ -779,7 +894,7 @@ def _indexer_topk_multi_packed_cp_thd(
     segment_q_causal_offsets = (segment_k_lengths - segment_q_lengths).to(
         dtype=torch.int32, device=device
     )
-    scores = _cudnn_dsa.indexer_forward_wrapper(
+    scores = _indexer_forward_scores(
         q_bshd[0],
         segmented_k,
         w_bsh[0],
@@ -1192,7 +1307,7 @@ def _indexer_topk_bshd(
                 q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
             )
         else:
-            scores = _cudnn_dsa.indexer_forward_wrapper(
+            scores = _indexer_forward_scores(
                 q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
             )[
                 "scores"
