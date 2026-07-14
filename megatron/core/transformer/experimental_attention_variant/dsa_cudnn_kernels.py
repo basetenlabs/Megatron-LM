@@ -612,8 +612,19 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
+            q_causal_offsets = torch.full(
+                (b,),
+                bottom_right_key_start + row_start,
+                dtype=torch.int32,
+                device=q_chunk.device,
+            )
             scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
+                q_chunk,
+                score_k_bshd,
+                w_chunk,
+                ratio=indexer_ratio,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                q_causal_offsets=q_causal_offsets,
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
             scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
@@ -765,6 +776,9 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
+    segment_q_causal_offsets = (segment_k_lengths - segment_q_lengths).to(
+        dtype=torch.int32, device=device
+    )
     scores = _cudnn_dsa.indexer_forward_wrapper(
         q_bshd[0],
         segmented_k,
@@ -775,6 +789,7 @@ def _indexer_topk_multi_packed_cp_thd(
         cu_seqlens_k=segment_cu_k,
         max_seqlen_q=max_segment_q,
         max_seqlen_k=max_segment_k,
+        q_causal_offsets=segment_q_causal_offsets,
     )["scores"]
 
     segment_topk = min(topk_k, max_segment_k)
