@@ -460,10 +460,36 @@ def _remove_indexer_topk_tie_break(
     return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
 
 
+def _indexer_top_k_one_chunk(
+    scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
+) -> dict:
+    """Run top-k for one row chunk, avoiding cuDNN's unsupported odd-K specialization."""
+    if topk_k % 2 == 0:
+        return _cudnn_dsa.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
+        )
+
+    # cuDNN Frontend 1.26.0 selects a vector-width-2 output path for some odd K values
+    # and asserts during JIT compilation. Its public contract permits any K <= 2048, so
+    # keep cuDNN indexer scoring and use PyTorch only for the unsupported selection step.
+    seq_lens = seq_lens.to(device=scores_flat.device).clamp(min=0, max=scores_flat.size(1))
+    key_positions = torch.arange(scores_flat.size(1), device=scores_flat.device)
+    scores_flat.masked_fill_(key_positions.unsqueeze(0) >= seq_lens.unsqueeze(1), float("-inf"))
+    topk_scores, topk_indices = torch.topk(scores_flat, topk_k, dim=-1, sorted=False)
+
+    valid = topk_indices < seq_lens.unsqueeze(1)
+    topk_indices = topk_indices.to(torch.int32).masked_fill_(~valid, -1)
+    if return_topk_scores:
+        topk_scores.masked_fill_(~valid, float("-inf"))
+    else:
+        topk_scores = None
+    return {"indices": topk_indices, "values": topk_scores}
+
+
 def _indexer_top_k_wrapper_chunked(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
-    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+    """Run indexer top-k in row chunks to bound selection scratch allocation."""
     n_rows, sk = scores_flat.shape
     scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
     scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
@@ -472,26 +498,23 @@ def _indexer_top_k_wrapper_chunked(
     )
 
     if chunk_rows >= n_rows:
-        return _cudnn_dsa.indexer_top_k_wrapper(
-            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
-        )
+        return _indexer_top_k_one_chunk(scores_flat, seq_lens, topk_k, return_topk_scores)
 
     indices_chunks = []
     values_chunks = [] if return_topk_scores else None
     for row_start in range(0, n_rows, chunk_rows):
         row_end = min(row_start + chunk_rows, n_rows)
-        tk_result = _cudnn_dsa.indexer_top_k_wrapper(
+        tk_result = _indexer_top_k_one_chunk(
             scores_flat[row_start:row_end].contiguous(),
             seq_lens[row_start:row_end].contiguous(),
-            top_k=topk_k,
-            next_n=1,
-            return_val=return_topk_scores,
+            topk_k,
+            return_topk_scores,
         )
         indices_chunks.append(tk_result["indices"])
         if return_topk_scores:
             values = tk_result["values"]
             if values is None:
-                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
+                raise RuntimeError("Indexer top-k selection did not return values.")
             values_chunks.append(values)
 
     return {
