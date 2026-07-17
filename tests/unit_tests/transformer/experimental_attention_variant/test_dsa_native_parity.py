@@ -234,6 +234,94 @@ def _reference_absorbed_output_and_sparse_loss(case, topk_indices: torch.Tensor)
     return output, loss
 
 
+@pytest.mark.parametrize("return_topk_scores", [False, True])
+def test_cudnn_indexer_topk_odd_k_uses_torch_fallback_for_cp_regression_shape(
+    monkeypatch, return_topk_scores
+):
+    class FailingDSA:
+        @staticmethod
+        def indexer_top_k_wrapper(*_args, **_kwargs):
+            raise AssertionError("cuDNN top-k must not be called for odd K")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FailingDSA)
+    scores = torch.arange(705, dtype=torch.float32).view(1, 705).expand(235, 705).clone()
+    seq_lens = torch.full((235,), 705, dtype=torch.int32)
+
+    result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
+        scores, seq_lens, topk_k=705, return_topk_scores=return_topk_scores
+    )
+
+    expected_indices = torch.arange(705, dtype=torch.int32).view(1, 705).expand(235, 705)
+    torch.testing.assert_close(result["indices"].sort(dim=-1).values, expected_indices)
+    if return_topk_scores:
+        assert result["values"] is not None
+        selected_scores = torch.gather(scores, dim=1, index=result["indices"].long())
+        torch.testing.assert_close(result["values"], selected_scores)
+    else:
+        assert result["values"] is None
+
+
+def test_cudnn_indexer_topk_odd_k_torch_fallback_respects_seq_lens(monkeypatch):
+    class FailingDSA:
+        @staticmethod
+        def indexer_top_k_wrapper(*_args, **_kwargs):
+            raise AssertionError("cuDNN top-k must not be called for odd K")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FailingDSA)
+    scores = torch.tensor(
+        [
+            [1.0, 3.0, 2.0, 100.0, 99.0, 98.0, 97.0],
+            [1.0, 9.0, 3.0, 8.0, 2.0, 7.0, 6.0],
+        ]
+    )
+    seq_lens = torch.tensor([3, 7], dtype=torch.int32)
+
+    result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
+        scores, seq_lens, topk_k=5, return_topk_scores=True
+    )
+
+    assert result["values"] is not None
+    assert (result["indices"][0] == -1).sum().item() == 2
+    assert set(result["indices"][0][result["indices"][0] >= 0].tolist()) == {0, 1, 2}
+    assert torch.isneginf(result["values"][0][result["indices"][0] == -1]).all()
+    assert set(result["indices"][1].tolist()) == {1, 2, 3, 5, 6}
+
+
+def test_cudnn_indexer_topk_even_k_still_uses_cudnn(monkeypatch):
+    seen = {}
+
+    class FakeDSA:
+        @staticmethod
+        def indexer_top_k_wrapper(scores, seq_lens, top_k, next_n, return_val):
+            seen.update(
+                scores=scores,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                return_val=return_val,
+            )
+            return {
+                "indices": torch.zeros((scores.size(0), top_k), dtype=torch.int32),
+                "values": None,
+            }
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    scores = torch.randn(3, 8)
+    seq_lens = torch.full((3,), 8, dtype=torch.int32)
+
+    result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
+        scores, seq_lens, topk_k=4, return_topk_scores=False
+    )
+
+    assert seen["scores"] is scores
+    assert seen["seq_lens"] is seq_lens
+    assert seen["top_k"] == 4
+    assert seen["next_n"] == 1
+    assert seen["return_val"] is False
+    assert result["indices"].shape == (3, 4)
+    assert result["values"] is None
+
+
 def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
     class FakeDSA:
         @staticmethod
