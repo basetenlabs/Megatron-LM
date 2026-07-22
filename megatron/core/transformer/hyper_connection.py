@@ -126,14 +126,11 @@ class BroadcastTensorFused(torch.autograd.Function):
         grads = [g for g in (grad1, grad2, grad3) if g is not None]
         if len(grads) == 0:
             return None, None
-        # In-place accumulation into the first grad rather than fused_add_3_fn /
-        # out-of-place add: the latter allocates a fresh residual-grad tensor per
-        # layer, ~n_streams * activation-sized, held through the mHC backward.
-        # The incoming grads are owned by this backward, so in-place is safe.
-        out = grads[0]
-        for g in grads[1:]:
-            out = out.add_(g)
-        return out, None
+        if len(grads) == 1:
+            return grads[0], None
+        if len(grads) == 2:
+            return grads[0] + grads[1], None
+        return ctx.fused_add_3_fn(grad1, grad2, grad3), None
 
 
 @torch.compile
