@@ -3075,7 +3075,10 @@ def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tup
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
 
-@torch.compile
+# [baseten] eager, not torch.compile: on this stack cuTile is unavailable so the
+# mHC falls back to these torch fns; under DSv4 dynamic shapes dynamo recompiles
+# past its limit and the compiled mHC kernels emit NaN on step 2+ (validated:
+# disabling compilation here makes the DSv4-Flash 131k run train cleanly).
 def _torch_h_post_bda_bwd(
     grad_output: Tensor,
     h_res: Tensor,
@@ -3107,7 +3110,8 @@ def _torch_h_post_bda_bwd(
     )
 
 
-@torch.compile
+# [baseten] eager, not torch.compile (see _torch_h_post_bda_bwd note above): the
+# compiled fallback emits NaN on DSv4 step 2+ under recompile churn.
 def _torch_proj_rms_compute_h(
     x: Tensor,
     weight: Tensor,
