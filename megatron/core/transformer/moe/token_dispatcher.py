@@ -94,6 +94,16 @@ class MoETokenDispatcher:
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
 
+    def _clear_forward_state(self, *attr_names: str) -> None:
+        """Drop references to per-forward tensors so they are not pinned into
+        the backward pass. Each named attribute, if present and not already
+        None, is set to None. At long sequence these stashed metadata/token
+        tensors (~hundreds of MB/layer) would otherwise stay alive across all
+        layers' backward and inflate the peak."""
+        for name in attr_names:
+            if getattr(self, name, None) is not None:
+                setattr(self, name, None)
+
     def get_cudagraph_attr(self, attr_name: str):
         """Resolve a cudagraph attribute path, including nested attributes."""
         attr = self
@@ -909,6 +919,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+        # Release per-forward metadata/token tensors stashed on self during
+        # dispatch so they are not held alive through every layer's backward
+        # (~hundreds of MB/layer at 131k). Recomputed on the next forward.
+        self._clear_forward_state(
+            "hidden_shape",
+            "hidden_shape_before_permute",
+            "reversed_local_input_permutation_mapping",
+            "routing_map",
+            "probs",
+            "tokens_per_expert",
+            "input_splits",
+            "output_splits",
+            "output_splits_tp",
+            "num_out_tokens",
+            "num_global_tokens_per_local_expert",
+            "num_global_tokens_per_local_expert_cpu",
+            "capacity",
+        )
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

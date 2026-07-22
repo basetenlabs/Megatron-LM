@@ -2262,6 +2262,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+        # Drop the offload interface so it doesn't pin the mlp-norm boundary
+        # activation across the backward recompute (mirrors the base
+        # TransformerLayer, which nulls mlp_norm_manager after group_offload).
+        self.mlp_norm_manager = None
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
