@@ -13,6 +13,7 @@ can be more efficient for certain attention variants.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -57,6 +58,19 @@ if HAVE_TE:
     from megatron.core.post_training.modelopt.layers import Linear
 else:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
+
+
+def _glm52_sync_after_oproj(layer_number: int, device: torch.device) -> None:
+    """Apply a scoped post-o_proj barrier for the long-context race experiment."""
+    selected_layers = {
+        int(value)
+        for value in os.environ.get(
+            "GLM52_DSA_SYNC_AFTER_OPROJ_LAYERS", ""
+        ).split(",")
+        if value.strip()
+    }
+    if layer_number in selected_layers:
+        torch.cuda.synchronize(device)
 
 
 def _restore_packed_thd_batch_dim(
@@ -905,6 +919,7 @@ class AbsorbedMLASelfAttention(Attention):
         # Output. [sq, b, h]
         # =================
         output, bias = self.linear_proj(core_attn_out)
+        _glm52_sync_after_oproj(self.layer_number, output.device)
 
         return output, bias
 

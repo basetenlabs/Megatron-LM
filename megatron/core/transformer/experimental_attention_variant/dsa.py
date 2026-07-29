@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -32,6 +33,19 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+def _glm52_sync_after_sparse(layer_number: int, device: torch.device) -> None:
+    """Apply a scoped device barrier for the long-context race experiment."""
+    selected_layers = {
+        int(value)
+        for value in os.environ.get(
+            "GLM52_DSA_SYNC_AFTER_SPARSE_LAYERS", ""
+        ).split(",")
+        if value.strip()
+    }
+    if layer_number in selected_layers:
+        torch.cuda.synchronize(device)
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -126,6 +140,7 @@ def _run_sparse_attention(
     varlen_starts: Optional[torch.Tensor],
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
+    layer_number: int,
     topk_length: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
@@ -170,6 +185,7 @@ def _run_sparse_attention(
                 key_positions=key_positions,
             )
         assert output is not None
+        _glm52_sync_after_sparse(layer_number, query.device)
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
@@ -2234,6 +2250,7 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            layer_number=self.layer_number,
         )
 
         if use_indexer_loss:
