@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import functools
+import inspect
+import os
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -460,10 +462,99 @@ def _remove_indexer_topk_tie_break(
     return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
 
 
+def _use_deterministic_indexer_topk() -> bool:
+    """Whether GLM-5.2 should use FlashInfer's stable radix selector.
+
+    cuDNN's default CUDA selector is fast, but repeated forwards can choose
+    different members at the top-k cutoff once the key count exceeds DSA's
+    2,048-token budget. Keep this correctness treatment explicitly opt-in
+    until its training-throughput cost is characterized.
+    """
+    return os.environ.get("GLM52_DSA_DETERMINISTIC_TOPK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _flashinfer_topk_supports_tie_break() -> bool:
+    """Return whether the installed FlashInfer exposes explicit tie-breaking."""
+    import flashinfer
+
+    return "tie_break" in inspect.signature(flashinfer.top_k_ragged_transform).parameters
+
+
+def _canonicalize_indexer_topk_order(
+    selected: Tensor, selected_scores: Optional[Tensor]
+) -> tuple[Tensor, Optional[Tensor]]:
+    """Sort valid logical key IDs while keeping invalid entries in the suffix.
+
+    Sparse attention is invariant to the selected-set order in exact
+    arithmetic, but its floating-point reduction is not. The vLLM correctness
+    path uses the same logical-ID order for prefill and decode; use that
+    contract here too so score-rank movement cannot change attention
+    arithmetic when membership is unchanged.
+    """
+    invalid_key = torch.iinfo(selected.dtype).max
+    sort_keys = torch.where(selected >= 0, selected, invalid_key)
+    sorted_keys, order = torch.sort(sort_keys, dim=-1)
+    selected = sorted_keys.masked_fill(sorted_keys == invalid_key, -1)
+    if selected_scores is not None:
+        selected_scores = torch.gather(selected_scores, dim=-1, index=order.long())
+        selected_scores = selected_scores.masked_fill(selected < 0, float("-inf"))
+    return selected, selected_scores
+
+
+def _run_deterministic_indexer_topk(
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+) -> dict:
+    """Select stable DSA membership directly from the existing fp32 scores."""
+    import flashinfer
+
+    lengths = (
+        seq_lens.to(device=scores_flat.device, dtype=torch.int32)
+        .clamp(min=0, max=scores_flat.size(1))
+        .contiguous()
+    )
+    offsets = torch.zeros_like(lengths)
+    kwargs = {"deterministic": True}
+    if _flashinfer_topk_supports_tie_break():
+        # Match vLLM's deterministic DSA contract on newer FlashInfer builds:
+        # prefer the smaller logical key index for an exact score tie.
+        kwargs["tie_break"] = 1
+    selected = flashinfer.top_k_ragged_transform(
+        scores_flat, offsets, lengths, topk_k, **kwargs
+    ).to(dtype=torch.int32)
+
+    valid = (selected >= 0) & (selected < lengths.unsqueeze(1))
+    gather_indices = selected.clamp(min=0, max=max(0, scores_flat.size(1) - 1)).long()
+    selected_scores = (
+        torch.gather(scores_flat, dim=1, index=gather_indices)
+        if return_topk_scores
+        else None
+    )
+    selected = selected.masked_fill(~valid, -1)
+    if selected_scores is not None:
+        selected_scores = selected_scores.masked_fill(~valid, float("-inf"))
+    selected, selected_scores = _canonicalize_indexer_topk_order(
+        selected, selected_scores
+    )
+    return {"indices": selected, "values": selected_scores}
+
+
 def _indexer_top_k_one_chunk(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
     """Run top-k for one row chunk, avoiding cuDNN's unsupported odd-K specialization."""
+    if _use_deterministic_indexer_topk():
+        return _run_deterministic_indexer_topk(
+            scores_flat, seq_lens, topk_k, return_topk_scores
+        )
+
     if topk_k % 2 == 0:
         return _cudnn_dsa.indexer_top_k_wrapper(
             scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores

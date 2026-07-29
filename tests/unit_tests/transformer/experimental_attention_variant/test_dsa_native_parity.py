@@ -322,6 +322,85 @@ def test_cudnn_indexer_topk_even_k_still_uses_cudnn(monkeypatch):
     assert result["values"] is None
 
 
+@pytest.mark.parametrize("return_topk_scores", [False, True])
+def test_deterministic_indexer_topk_bypasses_cudnn(monkeypatch, return_topk_scores):
+    seen = {}
+
+    class FailingDSA:
+        @staticmethod
+        def indexer_top_k_wrapper(*_args, **_kwargs):
+            raise AssertionError("cuDNN top-k must not run in deterministic mode")
+
+    def fake_deterministic(scores, seq_lens, topk_k, return_scores):
+        seen.update(
+            scores=scores,
+            seq_lens=seq_lens,
+            topk_k=topk_k,
+            return_scores=return_scores,
+        )
+        return {
+            "indices": torch.tensor([[1, 0], [2, -1]], dtype=torch.int32),
+            "values": (
+                torch.tensor([[3.0, 1.0], [6.0, float("-inf")]])
+                if return_scores
+                else None
+            ),
+        }
+
+    monkeypatch.setenv("GLM52_DSA_DETERMINISTIC_TOPK", "true")
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FailingDSA)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_run_deterministic_indexer_topk", fake_deterministic
+    )
+    scores = torch.tensor([[1.0, 3.0, 2.0], [4.0, 5.0, 6.0]])
+    seq_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+    result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
+        scores, seq_lens, topk_k=2, return_topk_scores=return_topk_scores
+    )
+
+    assert seen["scores"] is scores
+    assert seen["seq_lens"] is seq_lens
+    assert seen["topk_k"] == 2
+    assert seen["return_scores"] is return_topk_scores
+    torch.testing.assert_close(
+        result["indices"], torch.tensor([[1, 0], [2, -1]], dtype=torch.int32)
+    )
+    if return_topk_scores:
+        torch.testing.assert_close(
+            result["values"], torch.tensor([[3.0, 1.0], [6.0, float("-inf")]])
+        )
+    else:
+        assert result["values"] is None
+
+
+def test_canonicalize_indexer_topk_order_keeps_scores_aligned():
+    indices = torch.tensor(
+        [[7, -1, 2, 5, -1], [4, 1, 3, 0, 2]], dtype=torch.int32
+    )
+    scores = torch.tensor(
+        [[7.0, float("-inf"), 2.0, 5.0, float("-inf")], [4.0, 1.0, 3.0, 0.0, 2.0]]
+    )
+
+    actual_indices, actual_scores = (
+        dsa_cudnn_kernels._canonicalize_indexer_topk_order(indices, scores)
+    )
+
+    torch.testing.assert_close(
+        actual_indices,
+        torch.tensor([[2, 5, 7, -1, -1], [0, 1, 2, 3, 4]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        actual_scores,
+        torch.tensor(
+            [
+                [2.0, 5.0, 7.0, float("-inf"), float("-inf")],
+                [0.0, 1.0, 2.0, 3.0, 4.0],
+            ]
+        ),
+    )
+
+
 def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
     class FakeDSA:
         @staticmethod
