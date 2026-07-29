@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 import torch
@@ -42,6 +44,66 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+_GLM52_LAYER_TAIL_CAPTURE_COUNTS: dict[tuple[int, str], int] = {}
+_GLM52_LAYER_TAIL_CAPTURE_PENDING: dict[int, dict[str, Tensor]] = {}
+
+
+def _glm52_capture_layer_tail(
+    layer_number: int,
+    stage: str,
+    hidden_states: Tensor,
+    config: TransformerConfig,
+) -> None:
+    """Capture one rank-local token at each layer boundary for bisection.
+
+    This diagnostic is inert unless
+    ``GLM52_MEGATRON_LAYER_TAIL_CAPTURE_DIR`` is set. GPU clones are retained
+    until the final layer so the hot path does not synchronize to the host at
+    every boundary. Placing the hook in the layer covers activation-recompute
+    forwards as well as the ordinary transformer-block loop.
+    """
+    capture_dir_raw = os.environ.get("GLM52_MEGATRON_LAYER_TAIL_CAPTURE_DIR")
+    if not capture_dir_raw or hidden_states.ndim < 2:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    rank = torch.distributed.get_rank()
+    capture_rank_raw = os.environ.get("GLM52_MEGATRON_LAYER_TAIL_CAPTURE_RANK", "0")
+    if capture_rank_raw.lower() != "all" and rank != int(capture_rank_raw):
+        return
+    exact_local_tokens = int(
+        os.environ.get("GLM52_MEGATRON_LAYER_TAIL_CAPTURE_EXACT_LOCAL_TOKENS", "0")
+    )
+    if exact_local_tokens > 0 and hidden_states.size(0) != exact_local_tokens:
+        return
+
+    counter_key = (layer_number, stage)
+    call_index = _GLM52_LAYER_TAIL_CAPTURE_COUNTS.get(counter_key, 0)
+    _GLM52_LAYER_TAIL_CAPTURE_COUNTS[counter_key] = call_index + 1
+    max_calls = int(os.environ.get("GLM52_MEGATRON_LAYER_TAIL_CAPTURE_MAX_CALLS", "8"))
+    if call_index >= max_calls:
+        return
+
+    row_index = int(os.environ.get("GLM52_MEGATRON_LAYER_TAIL_CAPTURE_ROW", "-1"))
+    boundary = f"layer{layer_number}.{stage}"
+    _GLM52_LAYER_TAIL_CAPTURE_PENDING.setdefault(call_index, {})[boundary] = (
+        hidden_states[row_index].detach().clone()
+    )
+    if layer_number != config.num_layers or stage != "post_mlp":
+        return
+
+    pending = _GLM52_LAYER_TAIL_CAPTURE_PENDING.pop(call_index)
+    payload = {
+        "call_index": call_index,
+        "rank": rank,
+        "local_tokens": hidden_states.size(0),
+        "row_index": row_index,
+        "boundaries": {name: tensor.cpu() for name, tensor in sorted(pending.items())},
+    }
+    capture_dir = Path(capture_dir_raw)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, capture_dir / f"rank{rank}-call{call_index}.pt")
 
 
 def _get_offloading_interface():
@@ -737,12 +799,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        input_hidden_states = kwargs.get(
+            "hidden_states", args[0] if args else None
+        )
+        if isinstance(input_hidden_states, Tensor):
+            _glm52_capture_layer_tail(
+                self.layer_number, "input", input_hidden_states, self.config
+            )
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        _glm52_capture_layer_tail(
+            self.layer_number, "post_attention", hidden_states, self.config
+        )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        if isinstance(output, Tensor):
+            _glm52_capture_layer_tail(
+                self.layer_number, "post_mlp", output, self.config
+            )
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):

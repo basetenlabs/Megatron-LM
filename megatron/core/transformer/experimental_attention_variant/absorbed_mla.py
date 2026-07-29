@@ -15,6 +15,7 @@ can be more efficient for certain attention variants.
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn, Optional, Union
 
 import torch
@@ -60,6 +61,9 @@ else:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
 
 
+_GLM52_ATTN_STAGE_CAPTURE_COUNTS: dict[int, int] = {}
+
+
 def _glm52_sync_after_oproj(layer_number: int, device: torch.device) -> None:
     """Apply a scoped post-o_proj barrier for the long-context race experiment."""
     selected_layers = {
@@ -71,6 +75,71 @@ def _glm52_sync_after_oproj(layer_number: int, device: torch.device) -> None:
     }
     if layer_number in selected_layers:
         torch.cuda.synchronize(device)
+
+
+def _glm52_capture_attention_stages(
+    *,
+    layer_number: int,
+    hidden_states: torch.Tensor,
+    q_absorbed: torch.Tensor,
+    q_compressed: torch.Tensor,
+    kv_compressed: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Capture a targeted absorbed-MLA boundary without affecting normal runs."""
+    capture_dir_raw = os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_DIR")
+    if not capture_dir_raw:
+        return
+    selected_layers = {
+        int(value)
+        for value in os.environ.get(
+            "GLM52_MEGATRON_ATTN_STAGE_CAPTURE_LAYERS", ""
+        ).split(",")
+        if value.strip()
+    }
+    if selected_layers and layer_number not in selected_layers:
+        return
+    exact_local_tokens = int(
+        os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_EXACT_LOCAL_TOKENS", "0")
+    )
+    if exact_local_tokens > 0 and hidden_states.size(0) != exact_local_tokens:
+        return
+
+    call_index = _GLM52_ATTN_STAGE_CAPTURE_COUNTS.get(layer_number, 0)
+    _GLM52_ATTN_STAGE_CAPTURE_COUNTS[layer_number] = call_index + 1
+    max_calls = int(os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_MAX_CALLS", "8"))
+    if call_index >= max_calls:
+        return
+
+    row_index = int(os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_ROW", "-1"))
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else 0
+    )
+    payload = {
+        "call_index": call_index,
+        "rank": rank,
+        "layer_number": layer_number,
+        "local_tokens": hidden_states.size(0),
+        "row_index": row_index,
+        # Full local KV is small enough to prove whether any key/value source
+        # row changed on any CP rank. Query and output probes only need the
+        # selected local row that maps to the scored global tail token.
+        "kv_compressed": kv_compressed.detach().clone().cpu(),
+        "hidden_tail": hidden_states[row_index].detach().clone().cpu(),
+        "q_absorbed_tail": q_absorbed[row_index].detach().clone().cpu(),
+        "q_compressed_tail": q_compressed[row_index].detach().clone().cpu(),
+        "core_attn_tail": core_attn_out[row_index].detach().clone().cpu(),
+        "output_tail": output[row_index].detach().clone().cpu(),
+    }
+    capture_dir = Path(capture_dir_raw)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        payload,
+        capture_dir / f"rank{rank}-layer{layer_number}-call{call_index}.pt",
+    )
 
 
 def _restore_packed_thd_batch_dim(
@@ -920,6 +989,15 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         output, bias = self.linear_proj(core_attn_out)
         _glm52_sync_after_oproj(self.layer_number, output.device)
+        _glm52_capture_attention_stages(
+            layer_number=self.layer_number,
+            hidden_states=hidden_states,
+            q_absorbed=q_absorbed,
+            q_compressed=q_compressed,
+            kv_compressed=kv_compressed,
+            core_attn_out=core_attn_out,
+            output=output,
+        )
 
         return output, bias
 

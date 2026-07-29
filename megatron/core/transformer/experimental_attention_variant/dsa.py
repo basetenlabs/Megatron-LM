@@ -4,6 +4,7 @@ import copy
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import torch
@@ -34,6 +35,10 @@ try:
 except ImportError:
     hadamard_transform = None
 
+_GLM52_DSA_TOPK_CAPTURE_COUNTS: dict[int, int] = {}
+_GLM52_DSA_TOPK_CAPTURE_PENDING: dict[int, dict[int, dict[str, object]]] = {}
+_GLM52_SPARSE_RAW_CAPTURE_COUNTS: dict[int, int] = {}
+
 
 def _glm52_sync_after_sparse(layer_number: int, device: torch.device) -> None:
     """Apply a scoped device barrier for the long-context race experiment."""
@@ -46,6 +51,121 @@ def _glm52_sync_after_sparse(layer_number: int, device: torch.device) -> None:
     }
     if layer_number in selected_layers:
         torch.cuda.synchronize(device)
+
+
+def _glm52_capture_dsa_topk(
+    *,
+    config,
+    layer_number: int,
+    source_layer: int,
+    computes_topk: bool,
+    topk_indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+) -> None:
+    """Capture one query's DSA membership per layer for repeat bisection."""
+    capture_dir_raw = os.environ.get("GLM52_MEGATRON_DSA_TOPK_CAPTURE_DIR")
+    if not capture_dir_raw or topk_indices.ndim != 3:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    rank = torch.distributed.get_rank()
+    capture_rank_raw = os.environ.get("GLM52_MEGATRON_DSA_TOPK_CAPTURE_RANK", "0")
+    if capture_rank_raw.lower() != "all" and rank != int(capture_rank_raw):
+        return
+    exact_local_tokens = int(
+        os.environ.get("GLM52_MEGATRON_DSA_TOPK_CAPTURE_EXACT_LOCAL_TOKENS", "0")
+    )
+    if exact_local_tokens > 0 and topk_indices.size(1) != exact_local_tokens:
+        return
+
+    call_index = _GLM52_DSA_TOPK_CAPTURE_COUNTS.get(layer_number, 0)
+    _GLM52_DSA_TOPK_CAPTURE_COUNTS[layer_number] = call_index + 1
+    max_calls = int(os.environ.get("GLM52_MEGATRON_DSA_TOPK_CAPTURE_MAX_CALLS", "8"))
+    if call_index >= max_calls:
+        return
+
+    row_index = int(os.environ.get("GLM52_MEGATRON_DSA_TOPK_CAPTURE_ROW", "-1"))
+    entry: dict[str, object] = {
+        "source_layer": source_layer,
+        "computes_topk": computes_topk,
+        "indices": topk_indices[:, row_index, :].detach().clone(),
+    }
+    if topk_length is not None:
+        entry["length"] = topk_length[:, row_index].detach().clone()
+    _GLM52_DSA_TOPK_CAPTURE_PENDING.setdefault(call_index, {})[layer_number] = entry
+    if layer_number != config.num_layers:
+        return
+
+    pending = _GLM52_DSA_TOPK_CAPTURE_PENDING.pop(call_index)
+    payload = {
+        "call_index": call_index,
+        "rank": rank,
+        "local_tokens": topk_indices.size(1),
+        "row_index": row_index,
+        "layers": {
+            number: {
+                name: value.cpu() if isinstance(value, torch.Tensor) else value
+                for name, value in entry.items()
+            }
+            for number, entry in sorted(pending.items())
+        },
+    }
+    capture_dir = Path(capture_dir_raw)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, capture_dir / f"rank{rank}-call{call_index}.pt")
+
+
+def _glm52_capture_sparse_raw(
+    *,
+    layer_number: int,
+    query: torch.Tensor,
+    raw_output: torch.Tensor,
+) -> None:
+    """Capture the pre-V-up sparse output for a targeted repeatability probe."""
+    capture_dir_raw = os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_DIR")
+    if not capture_dir_raw:
+        return
+    selected_layers = {
+        int(value)
+        for value in os.environ.get(
+            "GLM52_MEGATRON_ATTN_STAGE_CAPTURE_LAYERS", ""
+        ).split(",")
+        if value.strip()
+    }
+    if selected_layers and layer_number not in selected_layers:
+        return
+    exact_local_tokens = int(
+        os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_EXACT_LOCAL_TOKENS", "0")
+    )
+    if exact_local_tokens > 0 and query.size(0) != exact_local_tokens:
+        return
+
+    call_index = _GLM52_SPARSE_RAW_CAPTURE_COUNTS.get(layer_number, 0)
+    _GLM52_SPARSE_RAW_CAPTURE_COUNTS[layer_number] = call_index + 1
+    max_calls = int(os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_MAX_CALLS", "8"))
+    if call_index >= max_calls:
+        return
+
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else 0
+    )
+    row_index = int(os.environ.get("GLM52_MEGATRON_ATTN_STAGE_CAPTURE_ROW", "-1"))
+    payload = {
+        "call_index": call_index,
+        "rank": rank,
+        "layer_number": layer_number,
+        "local_tokens": query.size(0),
+        "row_index": row_index,
+        "raw_sparse_tail": raw_output[row_index].detach().clone().cpu(),
+    }
+    capture_dir = Path(capture_dir_raw)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        payload,
+        capture_dir / f"sparse-raw-rank{rank}-layer{layer_number}-call{call_index}.pt",
+    )
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -186,6 +306,11 @@ def _run_sparse_attention(
             )
         assert output is not None
         _glm52_sync_after_sparse(layer_number, query.device)
+        _glm52_capture_sparse_raw(
+            layer_number=layer_number,
+            query=query,
+            raw_output=output,
+        )
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
@@ -2232,6 +2357,16 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+
+        assert topk_indices is not None
+        _glm52_capture_dsa_topk(
+            config=self.config,
+            layer_number=self.layer_number,
+            source_layer=self.source_layer,
+            computes_topk=computes_topk,
+            topk_indices=topk_indices,
+            topk_length=topk_length,
+        )
 
         # ===================================
         # Run sparse attention kernel
