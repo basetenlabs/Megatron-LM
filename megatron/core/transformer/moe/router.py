@@ -277,6 +277,16 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if getattr(self, 'local_tokens_per_expert', None) is not None:
+            if self.local_tokens_per_expert.dtype != torch.float32:
+                # The token-count sensor must also stay float32. A bf16/fp16 module cast
+                # (e.g. Float16Module) silently converts this buffer, making the
+                # `+=` accumulation in _apply_expert_bias lossy: increments below the
+                # ulp vanish as counts grow, corrupting the counts that drive the
+                # aux-loss-free expert-bias update.
+                self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.to(
+                    torch.float32
+                )
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
