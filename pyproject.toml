@@ -97,7 +97,9 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
-    "flash-linear-attention~=0.4.0",
+    # ~=0.4.0 excluded all of 0.5.x, which Kimi-K3's KDA path needs; MCore's own
+    # fla surface is signature-compatible across 0.4.2 and 0.5.2.
+    "flash-linear-attention>=0.4.0,<0.6",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
