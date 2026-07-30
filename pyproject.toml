@@ -97,7 +97,11 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
-    "flash-linear-attention==0.5.1",
+    # Upstream moved to ==0.5.1; Kimi-K3 needs >=0.5.2, because chunk_kda only
+    # started reading A_log/dt_bias from **kwargs in 0.5.2 and silently discards
+    # them before that -- training a different KDA forget gate with nothing
+    # raised. Keep upstream's 0.5.x line, floored where K3 becomes correct.
+    "flash-linear-attention>=0.5.2,<0.6",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
