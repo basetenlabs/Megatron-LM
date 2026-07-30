@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import functools
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
@@ -53,6 +54,8 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+logger = logging.getLogger(__name__)
 
 
 def switch_load_balancing_loss_func(
@@ -1190,6 +1193,40 @@ def get_updated_expert_bias(
 
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+
+        # Count-sanity gate: token counts are sums of routing-map booleans, so they must
+        # be finite and non-negative. Garbage counts (e.g. from a shape-buggy sensor or a
+        # corrupted collective) would silently corrupt the bias update: a NaN offset makes
+        # torch.sign return nan (older torch) or 0 (torch >= 2.x), i.e. a poisoned bias or
+        # a silently zeroed tick. A skipped +-update_rate tick is harmless, so on violation
+        # log loudly once and return the bias unchanged.
+        bad_counts = (~torch.isfinite(tokens_per_expert)) | (tokens_per_expert < 0)
+        if bad_counts.any():
+            group_rank = (
+                torch.distributed.get_rank(group=tp_dp_cp_group)
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if group_rank == 0:
+                n_nonfinite = (~torch.isfinite(tokens_per_expert)).sum().item()
+                n_negative = (
+                    (tokens_per_expert < 0) & torch.isfinite(tokens_per_expert)
+                ).sum().item()
+                bad_idx = bad_counts.nonzero()[:8].tolist()
+                bad_vals = tokens_per_expert[bad_counts][:8].tolist()
+                logger.warning(
+                    "get_updated_expert_bias: SKIPPING expert-bias update — "
+                    "tokens_per_expert failed the count-sanity gate "
+                    "(shape=%s, non-finite=%d, negative=%d, first bad entries: idx=%s vals=%s). "
+                    "The expert bias is left unchanged for this step.",
+                    tuple(tokens_per_expert.shape),
+                    n_nonfinite,
+                    n_negative,
+                    bad_idx,
+                    bad_vals,
+                )
+            return expert_bias
+
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
