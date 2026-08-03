@@ -125,6 +125,10 @@ class CudnnDsaInterface(Protocol):
 
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
+# LPS-1003 tripwire (see _dsa_score_contract_check): per-device count of
+# top-k input contract violations, accumulated async on the hot path and
+# read out at a rank-symmetric sync point via raise_if_dsa_scores_corrupted.
+_dsa_corruption_counters: dict = {}
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
@@ -460,10 +464,83 @@ def _remove_indexer_topk_tie_break(
     return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
 
 
+def _dsa_score_contract_check(scores_flat: Tensor, seq_lens: Tensor) -> None:
+    """Accumulate violations of the top-k input contract (LPS-1003 tripwire).
+
+    The contract: every position inside a row's visible-key window
+    ``[0, seq_lens[r])`` holds a finite score written by the indexer forward;
+    every position outside it holds the ``-inf`` the glue prefilled. Nothing
+    in a healthy run produces a non-finite value inside the window — the one
+    mechanism that ever did in production (the ``ExternalStream(0)`` launch
+    ordering race, LPS-1003) erased freshly-written scores back to the
+    prefill and surfaced as silent loss spikes that took weeks to attribute.
+
+    The count ``sum(clamped seq_lens) - count(isfinite)`` is zero iff the
+    contract holds; any imbalance (non-finite in-window, or finite values in
+    the padding) accumulates into a device-side counter. No host sync here —
+    the counter is read at a rank-symmetric sync point by
+    ``raise_if_dsa_scores_corrupted``. Raising there rather than here keeps
+    every rank failing together with the same error; a single-rank raise
+    mid-forward strands the other ranks in their next collective until the
+    NCCL watchdog (measured: 45s-10min of hang, then an unrelated-looking
+    ALLREDUCE-timeout crash).
+    """
+    counter = _dsa_corruption_counters.get(scores_flat.device)
+    if counter is None:
+        counter = torch.zeros(1, dtype=torch.int64, device=scores_flat.device)
+        _dsa_corruption_counters[scores_flat.device] = counter
+    sk = scores_flat.size(-1)
+    windows = seq_lens.to(device=scores_flat.device, dtype=torch.int64).clamp(min=0, max=sk)
+    counter += (windows.sum() - torch.count_nonzero(torch.isfinite(scores_flat))).abs()
+
+
+def reset_dsa_corruption_counters() -> None:
+    """Zero pending counts (op start), so an op that died mid-flight cannot
+    misattribute its counts to the next op."""
+    for counter in _dsa_corruption_counters.values():
+        counter.zero_()
+
+
+def raise_if_dsa_scores_corrupted(op_name: str = "forward_backward") -> None:
+    """Raise on every rank if any top-k call violated the score contract.
+
+    Call at a point where the stream is already host-synced (e.g. after loss
+    readback) and which every rank reaches symmetrically: the verdict is
+    all-reduced so all ranks raise together instead of the survivors hanging
+    in their next collective. Cost when clean: one scalar D2H per device plus
+    one 8-byte all-reduce.
+    """
+    local = 0
+    for counter in _dsa_corruption_counters.values():
+        local += int(counter.item())
+        counter.zero_()
+    total = local
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        flag = torch.tensor(
+            [local],
+            dtype=torch.int64,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        torch.distributed.all_reduce(flag)
+        total = int(flag.item())
+    if total == 0:
+        return
+    where = f"{local} on this rank" if local else "all on other ranks"
+    raise RuntimeError(
+        f"DSA top-k input corrupted during {op_name}: {total} score-contract "
+        f"violations across ranks ({where}). Non-finite values inside a "
+        "visible-key window (or finite values overwriting the -inf padding) "
+        "mean the indexer score buffer was corrupted upstream (LPS-1003 "
+        "class: launch-stream ordering, allocator reuse, or a new producer "
+        "bug). This is NOT a data or user error — investigate, do not retry."
+    )
+
+
 def _indexer_top_k_one_chunk(
     scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
 ) -> dict:
     """Run top-k for one row chunk, avoiding cuDNN's unsupported odd-K specialization."""
+    _dsa_score_contract_check(scores_flat, seq_lens)
     if topk_k % 2 == 0:
         return _cudnn_dsa.indexer_top_k_wrapper(
             scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
