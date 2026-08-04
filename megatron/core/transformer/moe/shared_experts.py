@@ -239,6 +239,10 @@ class SharedExpertMLP(MLP):
         """
         if wait_current_stream:
             self.wait_current_stream()
+        # [RSFIX] input comes from the main stream but is consumed on self.stream
+        # below. record_stream so the allocator does not recycle it mid-flight.
+        if input is not None and input.is_cuda:
+            input.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
@@ -371,6 +375,11 @@ class SharedExpertMLP(MLP):
                 output = self.cached_output
             self.cached_output = None
         torch.cuda.current_stream().wait_stream(self.stream)
+        # [RSFIX] output is produced on self.stream but consumed on the main stream
+        # (the combine shared-expert add). record_stream so the caching allocator
+        # does not recycle it while the main stream still needs it (accum-poison race).
+        if output is not None and output.is_cuda:
+            output.record_stream(torch.cuda.current_stream())
         return output
 
     def backward_dw(self):
