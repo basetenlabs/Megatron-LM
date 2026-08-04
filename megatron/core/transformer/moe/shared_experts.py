@@ -234,6 +234,9 @@ class SharedExpertMLP(MLP):
         """
         if wait_current_stream:
             self.wait_current_stream()
+        # [RSFIX] input main->side: record_stream so the allocator can't recycle it mid-flight
+        if input is not None and input.is_cuda:
+            input.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
@@ -360,6 +363,9 @@ class SharedExpertMLP(MLP):
                 output = self.cached_output
             self.cached_output = None
         torch.cuda.current_stream().wait_stream(self.stream)
+        # [RSFIX] output side->main: record_stream so the allocator can't recycle it mid-flight
+        if output is not None and output.is_cuda:
+            output.record_stream(torch.cuda.current_stream())
         return output
 
     def backward_dw(self):
