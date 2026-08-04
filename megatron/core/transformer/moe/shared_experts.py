@@ -375,6 +375,9 @@ class SharedExpertMLP(MLP):
                 output = self.cached_output
             self.cached_output = None
         torch.cuda.current_stream().wait_stream(self.stream)
+        # [RSFIX-OUT] output side->main: record_stream so the allocator can't recycle it
+        if output is not None and output.is_cuda:
+            output.record_stream(torch.cuda.current_stream())
         return output
 
     def backward_dw(self):
