@@ -85,6 +85,34 @@ def overlap_state_check(required_state: "SharedExpertState", next_state: "Shared
     return decorator
 
 
+class _BackwardMainStreamSync(torch.autograd.Function):
+    """Reverse-direction twin of _BackwardStreamWait.
+
+    Applied on the MAIN stream where the shared-expert branch input enters
+    the overlapped region. Its backward therefore runs on the main stream
+    AFTER the whole side-stream backward chain, where it (a) fences the main
+    stream on the side stream (the tail fence the forward path has in
+    get_output but backward lacked) and (b) record_streams the incoming
+    grad — allocated by side-stream backward ops — for main-stream use, so
+    the caching allocator cannot recycle it across op boundaries
+    (accum-poison race, backward variant).
+    """
+
+    @staticmethod
+    def forward(ctx, input, stream):
+        """forward (identity)"""
+        ctx.stream = stream
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """backward: main waits for side; pin grad for main-stream use"""
+        torch.cuda.current_stream().wait_stream(ctx.stream)
+        if grad_output is not None and grad_output.is_cuda:
+            grad_output.record_stream(torch.cuda.current_stream())
+        return grad_output, None
+
+
 class _BackwardStreamWait(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, stream):
@@ -96,6 +124,10 @@ class _BackwardStreamWait(torch.autograd.Function):
     def backward(ctx, grad_output):
         """backward with stream wait"""
         ctx.stream.wait_stream(torch.cuda.current_stream())
+        # [RSFIX-BWD] grad_output was allocated on the main stream but is
+        # consumed by side-stream backward ops; pin it for the side stream.
+        if grad_output is not None and grad_output.is_cuda:
+            grad_output.record_stream(ctx.stream)
         return grad_output, None
 
 
@@ -243,6 +275,10 @@ class SharedExpertMLP(MLP):
         """
         if wait_current_stream:
             self.wait_current_stream()
+        # [RSFIX-BWD] identity on forward; on backward this node runs on the
+        # main stream after the side-stream chain: tail-fence + grad pin.
+        if input is not None and input.is_cuda and torch.is_grad_enabled():
+            input = _BackwardMainStreamSync.apply(input, self.stream)
         # [RSFIX] input comes from the main stream but is consumed on self.stream
         # below. record_stream so the allocator does not recycle it mid-flight.
         if input is not None and input.is_cuda:
