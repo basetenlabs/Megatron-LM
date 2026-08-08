@@ -2251,6 +2251,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
+        # Released TE mis-detects tail-only padding as "no padding", which
+        # under context parallelism silently corrupts chunk-boundary rows.
+        # Pass the answer explicitly instead of relying on TE's auto-detect.
+        # Details: basetenlabs/Megatron-LM#25.
+        if qkv_format == "thd" and self.config.context_parallel_size > 1:
+            cu_q = packed_seq_kwargs.get("cu_seqlens_q")
+            cu_q_padded = packed_seq_kwargs.get("cu_seqlens_q_padded")
+            cu_kv = packed_seq_kwargs.get("cu_seqlens_kv")
+            cu_kv_padded = packed_seq_kwargs.get("cu_seqlens_kv_padded")
+            if (
+                cu_q_padded is not None and cu_q is not None and not torch.equal(cu_q_padded, cu_q)
+            ) or (
+                cu_kv_padded is not None
+                and cu_kv is not None
+                and not torch.equal(cu_kv_padded, cu_kv)
+            ):
+                packed_seq_kwargs["pad_between_seqs"] = True
+
         attention_bias_kwargs = {}
         if attention_bias is not None:
             assert is_te_min_version("1.2.0"), (
