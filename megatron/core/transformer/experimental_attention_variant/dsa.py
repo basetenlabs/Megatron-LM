@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -32,6 +34,70 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+# ----------------------------------------------------------------------------
+# BT_DSA_CP_LAYOUT_CACHE (env-gated, default OFF)
+#
+# Under packed THD + allgather CP, every layer's forward rebuilds the packed CP
+# layout (query positions + gathered-KV reorder) via
+# `dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder`, which
+# internally issues 17 × 5 boolean-mask indexes (each an aten::nonzero + D2H
+# sync) — 85 host syncs per layer-microbatch, 26,520 per 78-layer × 2-mb step
+# including the full-recompute replay (see
+# experiment_artefacts/glm/lps_1062_perf/dispatcher_opt/). The result is a pure
+# function of the microbatch's (cu_seqlens_q, cu_seqlens_kv, cp_size, cp_rank,
+# sizes) — identical across layers and across the recompute replay — so cache
+# it on the packed_seq_params carrier, the same per-microbatch lifetime pattern
+# the DSA top-k sharing holder uses. Cached tensors are the identical objects
+# from the first computation, so reuse is bitwise exact. Downstream consumers
+# are read-only (index_select / mask construction).
+# ----------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+_CP_LAYOUT_CACHE_ATTR = "_dsa_cp_layout_cache"
+_CP_LAYOUT_GATE_LOGGED = [False]
+
+
+def _cp_layout_cache_enabled() -> bool:
+    """Lazy env-gate read (per-call; negligible at ~3 calls/layer).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_DSA_CP_LAYOUT_CACHE", "0") == "1"
+    if not _CP_LAYOUT_GATE_LOGGED[0]:
+        _CP_LAYOUT_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning("BT_DSA_CP_LAYOUT_CACHE=1: DSA packed-CP layout cache ACTIVE")
+        else:
+            logger.warning(
+                "BT_DSA_CP_LAYOUT_CACHE present but DISABLED (env unset or != '1'); "
+                "rebuilding the packed CP layout per layer"
+            )
+    return enabled
+
+
+def _cached_cp_layout(packed_seq_params, key, cu_seqlens_q, cu_seqlens_kv, builder):
+    """Return the cached packed-CP layout for this microbatch, building on miss.
+
+    The cache lives on the packed_seq_params carrier (one per microbatch, alive
+    through its forward and recompute replay). Entries hold references to the
+    input cu_seqlens tensors and hit only on object identity, so a stale entry
+    can never be returned for different inputs.
+    """
+    cache = getattr(packed_seq_params, _CP_LAYOUT_CACHE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(packed_seq_params, _CP_LAYOUT_CACHE_ATTR, cache)
+    entry = cache.get(key)
+    if entry is not None and entry[0] is cu_seqlens_q and entry[1] is cu_seqlens_kv:
+        return entry[2]
+    result = builder()
+    cache[key] = (cu_seqlens_q, cu_seqlens_kv, result)
+    return result
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -1733,13 +1799,30 @@ class DSAttention(MegatronModule):
                     row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
-                )
+                if _cp_layout_cache_enabled():
+                    packed_query_positions_full = _cached_cp_layout(
+                        packed_seq_params,
+                        ("local_pos", cp_size, cp_rank, packed_query_output_size),
+                        cu_seqlens_q,
+                        None,
+                        lambda: dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        ),
+                    )
+                else:
+                    packed_query_positions_full = (
+                        dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                    )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
                     packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
@@ -1758,20 +1841,48 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                if _cp_layout_cache_enabled():
+                    packed_query_positions, kv_reorder_idx = _cached_cp_layout(
+                        packed_seq_params,
+                        (
+                            "qk_pos_reorder",
+                            cp_size,
+                            cp_rank,
+                            packed_query_output_size,
+                            packed_global_output_size,
+                            query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output,
+                        ),
+                        cu_seqlens_q,
+                        cu_seqlens_kv,
+                        lambda: dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        ),
                     )
-                )
+                else:
+                    packed_query_positions, kv_reorder_idx = (
+                        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                    )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
@@ -1811,6 +1922,24 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
+                    if _cp_layout_cache_enabled():
+                        _, idx = _cached_cp_layout(
+                            packed_seq_params,
+                            ("kv_reorder", cp_size, cp_rank, local_len),
+                            cu_seqlens_q,
+                            cu_seqlens_kv,
+                            lambda: dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                            ),
+                        )
+                        return idx
                     _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_kv=cu_seqlens_kv,
