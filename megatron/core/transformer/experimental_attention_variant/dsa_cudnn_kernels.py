@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import functools
+import logging
+import os
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -23,7 +25,482 @@ if TYPE_CHECKING:
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer.transformer_config import TransformerConfig
 
+logger = logging.getLogger(__name__)
+
 _flash_mla_sparse_fwd = None
+
+# ----------------------------------------------------------------------------
+# BT_DSA_BWD_ASYNC_NONEMPTY (env-gated, default OFF)
+#
+# `_run_sparse_attention_backward` compacts away query rows with no valid top-k
+# entries via `torch.nonzero(topk_length > 0)` — a synchronizing call that drains
+# the compute stream once per layer-microbatch in backward (measured 156 calls /
+# 19.2s CPU per 524K-token step on GLM-5.2 CP16; see
+# experiment_artefacts/glm/lps_1062_perf/dispatcher_opt/). When the gate is on,
+# the forward pass instead kicks an asynchronous 1-byte D2H of
+# `(topk_length > 0).all()` on a side stream (the same pattern the MoE alltoall
+# dispatcher uses for its split bookkeeping) and stashes (event, pinned_buf) on
+# the autograd ctx. Backward then waits on an event that completed during
+# forward (~µs) and, when every row is non-empty, substitutes
+# `torch.arange(N)` — bitwise identical to `nonzero(topk_length > 0).flatten()`
+# in that case (row-major int64 indices) — keeping every other op of the
+# compaction dataflow unchanged. When any row is empty it falls back to the
+# original syncing `nonzero` (status-quo cost, no regression).
+#
+# Stream-safety notes (review: dispatcher_opt/REVIEW_FIXA.md):
+# * Ordering: `.all()` is enqueued on the current (compute) stream FIRST, then
+#   the side stream wait_stream()s the compute stream (a snapshot of
+#   already-enqueued work), so the 1-byte copy is ordered after the flag.
+# * The per-call pinned buffer and the device flag tensor are both referenced
+#   from ctx until backward reads them, so neither can be recycled while the
+#   D2H is in flight (no ring buffer — replay interleaving makes slot reuse
+#   racy). `record_stream` on the device flag is belt-and-braces for the same.
+# * Recompute timing: under full recompute the first (no-grad) forward's ctx is
+#   discarded; the replay's ctx is the one backward reads. NOTE: grad mode
+#   CANNOT discriminate the two from inside the kick — PyTorch runs every
+#   autograd Function.forward under no-grad, so `torch.is_grad_enabled()` is
+#   False inside `FusedSparseAttentionFunc.forward` in BOTH passes (gating on
+#   it here made the patch inert — v1 bug). The probe therefore also fires in
+#   the discarded first pass: harmless (its ctx/event/pinned buf are dropped
+#   and GC'd; nothing ever waits on the event) and cheap (2 tiny kernels + a
+#   1-byte copy). In the replay, the backward's `event.synchronize()` runs tens
+#   of ms later, after the replayed layer forward has finished on the compute
+#   stream — the event waits only on the side-stream copy, long complete =>
+#   µs-scale, and it never touches the compute stream (no hidden drain, no
+#   circular wait; also correct under CUDA_DEVICE_MAX_CONNECTIONS=1, which the
+#   trainer leaves unset).
+# * CUDA-graph capture falls back to the original path (side-stream work
+#   during capture is illegal).
+# * Loudness: the first successful kick logs "armed" once; with the gate on,
+#   every backward read is counted and a per-window log line reports
+#   fallbacks AND probe-misses — a present-but-inert patch (no probes reaching
+#   ctx) shows up as probes_missing=156/156 instead of failing silently.
+# ----------------------------------------------------------------------------
+
+
+def _async_nonempty_enabled() -> bool:
+    """Lazy env-gate read (per-call; ~100ns, negligible at 156 calls/step).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_DSA_BWD_ASYNC_NONEMPTY", "0") == "1"
+    if not _GATE_STATE_LOGGED["async_nonempty"]:
+        _GATE_STATE_LOGGED["async_nonempty"] = True
+        if enabled:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY=1: DSA-bwd async-nonempty probe patch ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY present but DISABLED (env unset or != '1'); "
+                "using the original syncing nonzero path"
+            )
+    return enabled
+
+
+_GATE_STATE_LOGGED = {"async_nonempty": False, "async_nonempty_armed": False}
+
+
+_NONEMPTY_DTOH_STREAM = None
+
+
+def _get_nonempty_dtoh_stream() -> "torch.cuda.Stream":
+    """One lazily-created module-level side stream (mirrors the dispatcher's)."""
+    global _NONEMPTY_DTOH_STREAM
+    if _NONEMPTY_DTOH_STREAM is None:
+        _NONEMPTY_DTOH_STREAM = torch.cuda.Stream()
+    return _NONEMPTY_DTOH_STREAM
+
+
+# Probe telemetry (REVIEW_FIXA 2b + loudness requirement): the fast path is
+# expected to fire ~100% on bench AND customer data; any fallback is status-quo
+# cost, and routine fallbacks void the win claim — so they are counted and
+# logged. probes_missing counts gated backward reads whose ctx carries no probe
+# (present-but-inert detection: a healthy patched boot shows 0). All lines at
+# WARNING so they reach trainer_srun.log. 156 flag reads ≈ one 78-layer ×
+# 2-microbatch step (GLM-5.2 CP16 bench shape).
+_NONEMPTY_PROBE_STATS = {"reads": 0, "fallbacks": 0, "probes_missing": 0, "logged_windows": 0}
+_NONEMPTY_PROBE_WINDOW = 156
+_NONEMPTY_PROBE_MAX_LOGGED_WINDOWS = 100
+
+
+def _note_nonempty_probe_read(all_rows_nonempty: bool) -> None:
+    stats = _NONEMPTY_PROBE_STATS
+    stats["reads"] += 1
+    if not all_rows_nonempty:
+        stats["fallbacks"] += 1
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY: fallback to syncing nonzero (empty top-k rows) "
+            "— occurrence %d at flag-read %d",
+            stats["fallbacks"],
+            stats["reads"],
+        )
+    if (
+        stats["reads"] % _NONEMPTY_PROBE_WINDOW == 0
+        and stats["logged_windows"] < _NONEMPTY_PROBE_MAX_LOGGED_WINDOWS
+    ):
+        stats["logged_windows"] += 1
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY: window %d (≈step %d): reads=%d fallbacks=%d "
+            "probes_missing=%d",
+            stats["logged_windows"],
+            stats["logged_windows"],
+            stats["reads"],
+            stats["fallbacks"],
+            stats["probes_missing"],
+        )
+
+
+def _note_nonempty_probe_missing() -> None:
+    stats = _NONEMPTY_PROBE_STATS
+    stats["reads"] += 1
+    stats["probes_missing"] += 1
+    if stats["probes_missing"] == 1:
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY: gate is ON but a backward read found no probe "
+            "on ctx — the patch is present-but-inert (check that the kick fired in "
+            "forward; see the 'armed' line at first use)"
+        )
+    if (
+        stats["reads"] % _NONEMPTY_PROBE_WINDOW == 0
+        and stats["logged_windows"] < _NONEMPTY_PROBE_MAX_LOGGED_WINDOWS
+    ):
+        stats["logged_windows"] += 1
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY: window %d (≈step %d): reads=%d fallbacks=%d "
+            "probes_missing=%d",
+            stats["logged_windows"],
+            stats["logged_windows"],
+            stats["reads"],
+            stats["fallbacks"],
+            stats["probes_missing"],
+        )
+
+
+def _maybe_kick_nonempty_probe(topk_length_flat: Tensor):
+    """Kick the async all-rows-nonempty probe; return (event, pinned_buf, flag_gpu).
+
+    Returns None when the probe cannot run (gate off, CPU tensor, or CUDA-graph
+    capture) — callers then take the original syncing path. NOTE: no
+    `torch.is_grad_enabled()` gate here — PyTorch runs every autograd
+    Function.forward under no-grad, so that check is always False inside
+    `FusedSparseAttentionFunc.forward` and would disable the probe in BOTH the
+    discarded first pass and the recompute replay (v1 inertness bug). The
+    discarded-pass kick is harmless (its ctx is dropped; nothing waits on the
+    event) and cheap.
+    """
+    if not _async_nonempty_enabled():
+        return None
+    if not isinstance(topk_length_flat, Tensor) or not topk_length_flat.is_cuda:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    # Ordering (binding): flag on the compute stream, THEN side-stream wait.
+    flag_gpu = (topk_length_flat > 0).all()
+    stream = _get_nonempty_dtoh_stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        pinned_buf = torch.empty((), dtype=torch.bool, pin_memory=True)
+        pinned_buf.copy_(flag_gpu, non_blocking=True)
+        event = stream.record_event()
+    # Keep the device flag's memory from being recycled while the side-stream
+    # copy is in flight (the ctx reference to flag_gpu is the primary guard).
+    flag_gpu.record_stream(stream)
+    if not _GATE_STATE_LOGGED["async_nonempty_armed"]:
+        _GATE_STATE_LOGGED["async_nonempty_armed"] = True
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY: armed — first async nonempty probe kicked"
+        )
+    return (event, pinned_buf, flag_gpu)
+
+
+def _read_nonempty_probe(ctx) -> bool:
+    """Read a stashed probe in backward; False means 'take the original path'."""
+    gate_on = _async_nonempty_enabled()
+    probe = getattr(ctx, "dsa_nonempty_probe", None)
+    if probe is None:
+        if gate_on:
+            # Loud inertness: with the gate on every backward should find a probe.
+            _note_nonempty_probe_missing()
+        return False
+    event, pinned_buf, _flag_gpu = probe
+    event.synchronize()
+    all_rows_nonempty = bool(pinned_buf.item())
+    if gate_on:
+        _note_nonempty_probe_read(all_rows_nonempty)
+    return all_rows_nonempty
+
+
+# ----------------------------------------------------------------------------
+# BT_DSA_BWD_ASYNC_NONEMPTY_V3 (env-gated, default OFF) — first-pass-anchored
+# nonempty probe (the post-FIX-C follow-on; PATCH_NOTES.md FIX-A-v3 sketch).
+#
+# v2 kicked the probe in the recompute replay (FusedSparseAttentionFunc.forward
+# runs in both passes). It measured ~0 because the MoE dispatcher's replay
+# d2h_event.synchronize() fired upstream of A's read point in every
+# layer-backward and throttled the autograd thread to GPU-lockstep — both the
+# probe event and the original nonzero were cheap at that point. With FIX C
+# (BT_MOE_DISPATCH_REPLAY_CACHE) removing the replay syncs, a replay-anchored
+# probe would instead wait on replay-fwd GPU progress (the throttle is gone,
+# the wait relocates): so v3 anchors the probe in the NO-GRAD FIRST PASS
+# (seconds before the backward, GPU queue shallow) — the event is long
+# complete whenever the backward reads it, in every regime.
+#
+# Mechanism: at the dsa.py level (a plain function, where
+# torch.is_grad_enabled() truthfully discriminates the passes — False in the
+# checkpoint first pass, True in the replay), the first pass kicks the same
+# async 1-byte D2H of (topk_length > 0).all() and stashes
+# (event, pinned_buf, flag_gpu) on the packed_seq_params carrier keyed by
+# layer_number (the per-microbatch carrier pattern of the DSA top-k holder and
+# BT_DSA_CP_LAYOUT_CACHE; entries are popped on replay fetch, so they die with
+# their microbatch). The replay fetches its layer's probe and passes it down
+# through run_fused_absorbed_sparse_attention into
+# FusedSparseAttentionFunc.apply as an opaque wrapper (autograd treats it as a
+# non-tensor input — one extra None in the backward return arity), so the
+# backward's ctx references the FIRST-PASS probe.
+#
+# SAFETY (load-bearing): the flag describes the first pass's topk_length while
+# the backward consumes the replay's. Row emptiness is STRUCTURAL — a row is
+# empty iff it is a THD padding row (zero causally-valid KV candidates), fixed
+# by cu_seqlens/mask bounds, which are integer metadata, bitwise-identical
+# across the replay. Score-level replay nondeterminism (ULP) cannot flip a
+# row's emptiness because emptiness is candidate-set membership, not score
+# order. The residual risk is a genuine kernel bug; the on-box verify mode
+# (below) asserts the cross-pass identity on every replay before any timed
+# run, and the loss canary covers the rest.
+#
+# BT_DSA_BWD_ASYNC_NONEMPTY_V3_VERIFY=1 (requires the v3 gate): on every replay
+# that consumes a stashed probe, recompute the flag from the replay's fresh
+# topk_length_flat and assert equality with the first-pass value (raises on
+# mismatch). Soak-only: it syncs on every layer-pass.
+#
+# Eval passes also kick (grad disabled, no checkpoint): harmless — the probes
+# complete and are never read, and the carrier dies with the eval microbatch.
+# Non-recompute training finds empty stashes and falls back per layer-pass
+# (loud via the miss counter — this gate targets full-recompute configs).
+# ----------------------------------------------------------------------------
+
+_V3_GATE_LOGGED = [False]
+_V3_VERIFY_GATE_LOGGED = [False]
+_V3_ARMED_LOGGED = [False]
+_V3_HIT_LOGGED = [False]
+_V3_STATS = {
+    "kicks": 0,
+    "hits": 0,
+    "misses": 0,
+    "probe_dropped": 0,
+    "fallbacks": 0,
+    "verifies": 0,
+}
+_V3_WINDOW = [0, 0]  # [fetch attempts this window, windows logged]
+_V3_WINDOW_SIZE = 312  # ~1 step at 78 layers x 4 microbatches
+_V3_WINDOW_LOG_MAX = 100
+_V3_STASH_ATTR = "_dsa_bwd_nonempty_probe_v3"
+
+
+def _v3_enabled() -> bool:
+    """Lazy env-gate read (per-call; negligible at ~2 calls/layer-pass).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_DSA_BWD_ASYNC_NONEMPTY_V3", "0") == "1"
+    if not _V3_GATE_LOGGED[0]:
+        _V3_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3=1: first-pass-anchored DSA-bwd "
+                "nonempty probe ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3 present but DISABLED (env unset or != '1'); "
+                "using the original syncing nonzero path"
+            )
+    return enabled
+
+
+def _v3_verify_enabled() -> bool:
+    """Lazy read of the v3 verify-mode gate (requires the v3 gate to matter)."""
+    verify = os.environ.get("BT_DSA_BWD_ASYNC_NONEMPTY_V3_VERIFY", "0") == "1"
+    if not _V3_VERIFY_GATE_LOGGED[0]:
+        _V3_VERIFY_GATE_LOGGED[0] = True
+        if verify and _v3_enabled():
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3_VERIFY=1: cross-pass probe verify ACTIVE "
+                "(recomputes the flag on every replay and asserts equality; soak only)"
+            )
+        elif verify:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3_VERIFY=1 ignored: "
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3 is not enabled"
+            )
+    return verify and _v3_enabled()
+
+
+def _v3_note_fetch():
+    """Per-window fetch telemetry (WARNING so it reaches trainer logs)."""
+    _V3_WINDOW[0] += 1
+    if _V3_WINDOW[0] >= _V3_WINDOW_SIZE:
+        _V3_WINDOW[0] = 0
+        _V3_WINDOW[1] += 1
+        if _V3_WINDOW[1] <= _V3_WINDOW_LOG_MAX:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3 window %d (%d probe reads): %s",
+                _V3_WINDOW[1],
+                _V3_WINDOW_SIZE,
+                dict(_V3_STATS),
+            )
+
+
+class _NonemptyProbeV3:
+    """Opaque (to autograd) carrier for one first-pass probe: the completed
+    event, the pinned host flag, and the device flag (kept alive until the
+    copy completes). Passed into FusedSparseAttentionFunc.apply as a single
+    non-tensor input so it never enters the graph (one extra None in the
+    backward return arity)."""
+
+    __slots__ = ("event", "pinned_buf", "flag_gpu")
+
+    def __init__(self, event, pinned_buf, flag_gpu):
+        self.event = event
+        self.pinned_buf = pinned_buf
+        self.flag_gpu = flag_gpu
+
+
+def _maybe_kick_nonempty_probe_v3(topk_length: Tensor):
+    """Kick the first-pass async all-rows-nonempty probe; return _NonemptyProbeV3.
+
+    Same side-stream mechanics as the v2 kick (ordering: flag on the compute
+    stream, THEN side-stream wait, pinned copy, record event). Called at the
+    dsa.py level where grad mode truthfully marks the first pass; any shape
+    works — the flag is over all elements. Returns None when the probe cannot
+    run (gate off, CPU tensor, CUDA-graph capture).
+    """
+    if not _v3_enabled():
+        return None
+    if not isinstance(topk_length, Tensor) or not topk_length.is_cuda:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    flag_gpu = (topk_length > 0).all()
+    stream = _get_nonempty_dtoh_stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        pinned_buf = torch.empty((), dtype=torch.bool, pin_memory=True)
+        pinned_buf.copy_(flag_gpu, non_blocking=True)
+        event = stream.record_event()
+    flag_gpu.record_stream(stream)
+    _V3_STATS["kicks"] += 1
+    if not _V3_ARMED_LOGGED[0]:
+        _V3_ARMED_LOGGED[0] = True
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY_V3: armed — first first-pass probe kicked"
+        )
+    return _NonemptyProbeV3(event, pinned_buf, flag_gpu)
+
+
+def _v3_stash_probe(packed_seq_params, layer_number: int, probe) -> None:
+    """Stash a first-pass probe on the per-microbatch carrier (popped on fetch)."""
+    stash = getattr(packed_seq_params, _V3_STASH_ATTR, None)
+    if stash is None:
+        stash = {}
+        setattr(packed_seq_params, _V3_STASH_ATTR, stash)
+    stash[layer_number] = probe
+
+
+def _v3_fetch_probe(packed_seq_params, layer_number: int):
+    """Pop this layer's first-pass probe from the carrier; None on miss."""
+    stash = getattr(packed_seq_params, _V3_STASH_ATTR, None)
+    probe = stash.pop(layer_number, None) if stash is not None else None
+    if probe is None:
+        _V3_STATS["misses"] += 1
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY_V3: replay found no first-pass probe for "
+            "layer %d — falling back to the syncing nonzero for this pass",
+            layer_number,
+        )
+    else:
+        _V3_STATS["hits"] += 1
+        if not _V3_HIT_LOGGED[0]:
+            _V3_HIT_LOGGED[0] = True
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3: first replay hit — first-pass probe consumed"
+            )
+    _v3_note_fetch()
+    return probe
+
+
+def _v3_probe_for_pass(packed_seq_params, layer_number: int, topk_length):
+    """dsa.py-level entry point: kick+stash in the first pass, pop in the replay.
+
+    Called from DSAttention right before _run_sparse_attention, a plain
+    function where torch.is_grad_enabled() truthfully discriminates the
+    passes (False in the checkpoint first pass — including eval forwards,
+    whose kicks are harmless and never read; True in the recompute replay).
+    Returns the probe to thread into the fused attention call (replay only),
+    else None.
+    """
+    if packed_seq_params is None or topk_length is None or not _v3_enabled():
+        return None
+    if torch.is_grad_enabled():
+        return _v3_fetch_probe(packed_seq_params, layer_number)
+    probe = _maybe_kick_nonempty_probe_v3(topk_length)
+    if probe is not None:
+        _v3_stash_probe(packed_seq_params, layer_number, probe)
+    return None
+
+
+def _read_nonempty_probe_v3(ctx) -> bool:
+    """Read the first-pass probe in backward; False means 'take the original path'.
+
+    The event completed long before the backward runs (it was recorded in the
+    no-grad first pass), so the synchronize is µs-scale in every regime.
+    """
+    probe = getattr(ctx, "dsa_nonempty_probe_v3", None)
+    if probe is None:
+        # The replay-level fetch counts misses (no probe was passed down); a
+        # missing attr here after a SUCCESSFUL fetch means the fused path was
+        # declined or the plumbing dropped it — a distinct, loud counter.
+        _V3_STATS["probe_dropped"] += 1
+        if _V3_STATS["probe_dropped"] == 1:
+            logger.warning(
+                "BT_DSA_BWD_ASYNC_NONEMPTY_V3: backward found no probe on ctx despite "
+                "a successful replay fetch — the fused path was declined or the probe "
+                "was dropped in transit (check the decline breadcrumbs)"
+            )
+        return False
+    probe.event.synchronize()
+    all_rows_nonempty = bool(probe.pinned_buf.item())
+    if not all_rows_nonempty:
+        _V3_STATS["fallbacks"] += 1
+        logger.warning(
+            "BT_DSA_BWD_ASYNC_NONEMPTY_V3: fallback to syncing nonzero (empty top-k "
+            "rows) — occurrence %d",
+            _V3_STATS["fallbacks"],
+        )
+    return all_rows_nonempty
+
+
+def _verify_nonempty_probe_v3(ctx, topk_length_flat: Tensor) -> None:
+    """Verify mode: assert the replay's fresh flag equals the first-pass value."""
+    probe = getattr(ctx, "dsa_nonempty_probe_v3", None)
+    if probe is None:
+        return
+    fresh = bool((topk_length_flat > 0).all().item())  # sync — soak only
+    probe.event.synchronize()
+    stashed = bool(probe.pinned_buf.item())
+    _V3_STATS["verifies"] += 1
+    if fresh != stashed:
+        raise RuntimeError(
+            "BT_DSA_BWD_ASYNC_NONEMPTY_V3_VERIFY: the replay's topk_length emptiness "
+            f"({fresh}) differs from the first pass's ({stashed}) — the structural-"
+            "emptiness assumption is violated on this configuration; do NOT enable "
+            "BT_DSA_BWD_ASYNC_NONEMPTY_V3"
+        )
 
 
 class CudnnDsaInterface(Protocol):
@@ -2019,6 +2496,7 @@ def _run_sparse_attention_forward(
     d_v: int,
     topk_length: Optional[Tensor] = None,
     sanitize_topk_for_backward_in_place: bool = False,
+    _nonempty_probe_out: Optional[list] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run FlashMLA sparse attention from local DSA top-k indices."""
     sq, b, num_heads, d = query.shape
@@ -2035,6 +2513,10 @@ def _run_sparse_attention_forward(
     else:
         global_idxs = _local_to_global_flat(topk_indices_attn, b)
     topk_length_flat = topk_length_attn.permute(1, 0).reshape(-1)
+    if _nonempty_probe_out is not None:
+        probe = _maybe_kick_nonempty_probe(topk_length_flat)
+        if probe is not None:
+            _nonempty_probe_out.append(probe)
 
     q_flat = query.reshape(sq * b, num_heads, d)
     kv_flat = kv_full.reshape(skv * b, kv_full.size(-1))
@@ -2077,6 +2559,7 @@ def _run_sparse_attention_backward(
     skv: int,
     grad_output: Tensor,
     all_rows_nonempty: bool = False,
+    nonempty_rows_verified: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Run sparse attention backward, skipping rows that have no valid top-k entries."""
     d_v = out_flat.shape[-1]
@@ -2127,7 +2610,15 @@ def _run_sparse_attention_backward(
         grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
         return grad_query, grad_kv_full
 
-    valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
+    if nonempty_rows_verified:
+        # BT_DSA_BWD_ASYNC_NONEMPTY fast path: the forward-side async probe verified
+        # every row has >= 1 valid top-k entry, so nonzero(topk_length > 0) is exactly
+        # arange(N) (row-major int64) — bitwise identical, without the stream drain.
+        valid_row_indices = torch.arange(
+            topk_length.numel(), dtype=torch.int64, device=topk_length.device
+        )
+    else:
+        valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
     dummy_row_index = torch.full(
         (1,), bwd_q_flat.size(0), dtype=valid_row_indices.dtype, device=valid_row_indices.device
     )
@@ -2601,15 +3092,31 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         softmax_scale: float,
         d_v: int,
         topk_length: Optional[Tensor],
+        nonempty_probe_v3=None,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
         skv = kv_full.shape[0]
+        nonempty_probe = [] if _async_nonempty_enabled() else None
         out_flat, lse, q_flat, kv_flat, attn_sink, global_idxs, topk_length_flat = (
             _run_sparse_attention_forward(
-                query, kv_full, topk_indices, softmax_scale, d_v, topk_length=topk_length
+                query,
+                kv_full,
+                topk_indices,
+                softmax_scale,
+                d_v,
+                topk_length=topk_length,
+                _nonempty_probe_out=nonempty_probe,
             )
         )
+        if nonempty_probe:
+            ctx.dsa_nonempty_probe = nonempty_probe[0]
+        if nonempty_probe_v3 is not None:
+            # BT_DSA_BWD_ASYNC_NONEMPTY_V3: the backward reads the FIRST-PASS
+            # probe (anchored seconds ago, complete long before the read).
+            ctx.dsa_nonempty_probe_v3 = nonempty_probe_v3
+            if _v3_verify_enabled():
+                _verify_nonempty_probe_v3(ctx, topk_length_flat)
 
         ctx.save_for_backward(q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse)
         ctx.softmax_scale = softmax_scale
@@ -2629,6 +3136,11 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
 
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
         skv = ctx.skv
+        if _v3_enabled():
+            # BT_DSA_BWD_ASYNC_NONEMPTY_V3 takes precedence (v2 is parked).
+            nonempty_verified = _read_nonempty_probe_v3(ctx)
+        else:
+            nonempty_verified = _read_nonempty_probe(ctx)
         grad_query, grad_kv_full = _run_sparse_attention_backward(
             q_flat=q_flat,
             kv_flat=kv_flat,
@@ -2644,9 +3156,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
+            nonempty_rows_verified=nonempty_verified,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        return grad_query, grad_kv_full, None, None, None, None, None
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2656,6 +3169,7 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    nonempty_probe_v3=None,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
@@ -2673,7 +3187,7 @@ def run_fused_absorbed_sparse_attention(
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length, nonempty_probe_v3
     )
 
 

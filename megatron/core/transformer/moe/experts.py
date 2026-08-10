@@ -858,6 +858,44 @@ class TEGroupedMLP(MegatronModule):
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
 
+    def forward_expert_group(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert_group,
+        permuted_probs_group: torch.Tensor,
+        *,
+        group_index: int,
+        num_groups: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """BT_MOE_A2A_PIPELINE: run one expert group through the unchanged
+        forward() by zero-padding the per-expert token counts.
+
+        The grouped GEMM assigns input rows to experts strictly by cumulative
+        counts, so calling the SAME module (same weights, same FP8 recipe
+        state) with a 16-entry counts list whose out-of-group entries are zero
+        maps this chunk's packed rows onto exactly their own experts — each
+        expert's row block stays whole in one GEMM call with unchanged
+        (M, N, K), and zero-row experts contribute empty problems. This keeps
+        per-expert results bitwise-identical to the monolithic call (see
+        overlap_design/DESIGN_helmholtz.md §5b) without any module/weight
+        surgery. tokens_per_expert_group is the host list of L counts for this
+        group (from the dispatcher's chunk plan).
+        """
+        L = self.num_local_experts // num_groups
+        tpe = (
+            tokens_per_expert_group.tolist()
+            if torch.is_tensor(tokens_per_expert_group)
+            else list(tokens_per_expert_group)
+        )
+        padded = [0] * (group_index * L) + tpe + [0] * (
+            self.num_local_experts - (group_index + 1) * L
+        )
+        return self.forward(
+            permuted_local_hidden_states,
+            torch.tensor(padded, dtype=torch.long),
+            permuted_probs_group,
+        )
+
     def backward_dw(self):
         """Performs backward pass for weight gradients in TEGroupedMLP.
 

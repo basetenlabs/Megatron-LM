@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -34,6 +35,8 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+
+logger = logging.getLogger(__name__)
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -382,6 +385,14 @@ class MoELayer(BaseMoELayer):
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
+        # BT_MOE_A2A_PIPELINE: arm the dispatcher's chunked pipeline if the
+        # gate and constraints allow (validates against the experts module).
+        # The requires_grad check is deferred to the first forward (LoRA
+        # freezing may happen after model construction).
+        if isinstance(self.token_dispatcher, MoEAlltoAllTokenDispatcher):
+            self.token_dispatcher.w2_try_enable_pipeline(self.experts)
+        self._w2_frozen_checked = False
+
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
 
@@ -533,6 +544,26 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
+        if getattr(self.token_dispatcher, "_w2_config", None) is not None:
+            # BT_MOE_A2A_PIPELINE: per-group pipeline — wait chunk g's
+            # dispatch, sort, run its expert group through the unchanged
+            # TEGroupedMLP (zero-padded counts), unsort, and issue its combine
+            # A2A before moving to the next group (chunk g's combine overlaps
+            # chunk g+1's expert compute). Ends with all combines waited; the
+            # returned buffer is combined exactly as the monolithic path's
+            # token_combine output (byte-identical layout for unpermute).
+            dispatcher = self.token_dispatcher
+            K = dispatcher._w2_config.K
+            chunks = dispatcher.dispatch_postprocess(hidden_states, probs)
+            unsorted = []
+            for g, (x_g, tpe_g, probs_g) in enumerate(chunks):
+                out_g, mlp_bias = apply_module(self.experts).forward_expert_group(
+                    x_g, tpe_g, probs_g, group_index=g, num_groups=K
+                )
+                assert mlp_bias is None, f"mlp_bias is not supported for {type(dispatcher)}"
+                unsorted.append(dispatcher.combine_preprocess_chunk(out_g, g))
+            output = dispatcher.token_combine_chunked(unsorted)
+            return output, None
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
@@ -622,6 +653,34 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # BT_MOE_A2A_PIPELINE: one-time frozen-experts check (deferred from
+        # __init__ because LoRA freezing can happen after construction). With
+        # trainable expert weights the chunked path is disabled: v1 does not
+        # audit the wgrad/delayed-wgrad interplay across the K chunk calls.
+        if not self._w2_frozen_checked:
+            self._w2_frozen_checked = True
+            dispatcher = self.token_dispatcher
+            if getattr(dispatcher, "_w2_config", None) is not None:
+                from megatron.core.transformer.moe.token_dispatcher import (
+                    _A2A_PIPELINE_ARMED_LOGGED,
+                    _A2A_PIPELINE_DISARM_LOGGED,
+                )
+
+                if any(p.requires_grad for p in self.experts.parameters()):
+                    if not _A2A_PIPELINE_DISARM_LOGGED[0]:
+                        _A2A_PIPELINE_DISARM_LOGGED[0] = True
+                        logger.warning(
+                            "BT_MOE_A2A_PIPELINE: armed=NO — expert weights require grad "
+                            "(wgrad over chunked calls is unaudited in v1); status-quo path"
+                        )
+                    dispatcher._w2_config = None
+                elif not _A2A_PIPELINE_ARMED_LOGGED[0]:
+                    _A2A_PIPELINE_ARMED_LOGGED[0] = True
+                    logger.warning(
+                        "BT_MOE_A2A_PIPELINE: armed — K=%d, L=%d experts/group",
+                        dispatcher._w2_config.K,
+                        dispatcher._w2_config.L,
+                    )
         # Select the active token dispatcher based on whether the inference engine
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").
