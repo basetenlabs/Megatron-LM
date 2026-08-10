@@ -509,6 +509,21 @@ def _probs_a2a_comm_enabled() -> bool:
     return enabled
 
 
+def _probs_a2a_ep_spans_world(ep_ranks, world_size) -> bool:
+    """True iff the EP group covers every rank (a single EP group).
+
+    torch.distributed.new_group with the default use_local_synchronization=False
+    requires EVERY process to enumerate the same subgroups in the same order;
+    with more than one EP group (e.g. world-32 EP16) the same-name store
+    rendezvous cross-talks (hang / corrupt communicator). The second
+    communicator is therefore only created when the EP group spans the world
+    (the configuration every on-box arm has exercised); anything else refuses
+    to arm loudly until the use_local_synchronization path is verified on a
+    multi-EP-group box.
+    """
+    return sorted(ep_ranks) == list(range(world_size))
+
+
 def _probs_a2a_comm_note_dispatch():
     """Per-window issue telemetry (WARNING so it reaches trainer logs)."""
     _PROBS_A2A_COMM_STATS["token_issues"] += 1
@@ -948,23 +963,44 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self._probs_a2a_comm = None
         if _probs_a2a_comm_enabled():
             if self.ep_size > 1:
-                if MoEAlltoAllTokenDispatcher._probs_a2a_group is None:
-                    MoEAlltoAllTokenDispatcher._probs_a2a_group = torch.distributed.new_group(
-                        torch.distributed.get_process_group_ranks(self.ep_group)
-                    )
-                    MoEAlltoAllTokenDispatcher._probs_a2a_group_parent = self.ep_group
+                ep_ranks = torch.distributed.get_process_group_ranks(self.ep_group)
+                world_size = torch.distributed.get_world_size()
+                if not _probs_a2a_ep_spans_world(ep_ranks, world_size):
+                    # Multi-EP-group world: the default new_group rendezvous is
+                    # contract-unsafe here (see _probs_a2a_ep_spans_world).
+                    # Refuse to arm loudly; the probs A2A stays on the EP comm
+                    # (status quo — the gate is a no-op).
+                    self._probs_a2a_comm = None
                     if not _PROBS_A2A_COMM_ARMED_LOGGED[0]:
                         _PROBS_A2A_COMM_ARMED_LOGGED[0] = True
                         logger.warning(
-                            "BT_MOE_PROBS_A2A_COMM: armed — second communicator created over "
-                            "%d EP ranks (shared by all MoE layers)",
-                            self.ep_size,
+                            "BT_MOE_PROBS_A2A_COMM: armed=NO — EP group (%d ranks) does "
+                            "not span the world (%d ranks); multi-EP-group communicator "
+                            "creation is unverified (use_local_synchronization path) — "
+                            "probs all-to-all stays on the EP comm",
+                            len(ep_ranks),
+                            world_size,
                         )
-                assert MoEAlltoAllTokenDispatcher._probs_a2a_group_parent is self.ep_group, (
-                    "BT_MOE_PROBS_A2A_COMM: dispatcher EP group changed after the probs "
-                    "communicator was created — unsupported"
-                )
-                self._probs_a2a_comm = MoEAlltoAllTokenDispatcher._probs_a2a_group
+                else:
+                    if MoEAlltoAllTokenDispatcher._probs_a2a_group is None:
+                        MoEAlltoAllTokenDispatcher._probs_a2a_group = (
+                            torch.distributed.new_group(
+                                ep_ranks, use_local_synchronization=True
+                            )
+                        )
+                        MoEAlltoAllTokenDispatcher._probs_a2a_group_parent = self.ep_group
+                        if not _PROBS_A2A_COMM_ARMED_LOGGED[0]:
+                            _PROBS_A2A_COMM_ARMED_LOGGED[0] = True
+                            logger.warning(
+                                "BT_MOE_PROBS_A2A_COMM: armed — second communicator created over "
+                                "%d EP ranks (shared by all MoE layers)",
+                                self.ep_size,
+                            )
+                    assert MoEAlltoAllTokenDispatcher._probs_a2a_group_parent is self.ep_group, (
+                        "BT_MOE_PROBS_A2A_COMM: dispatcher EP group changed after the probs "
+                        "communicator was created — unsupported"
+                    )
+                    self._probs_a2a_comm = MoEAlltoAllTokenDispatcher._probs_a2a_group
             elif not _PROBS_A2A_COMM_ARMED_LOGGED[0]:
                 _PROBS_A2A_COMM_ARMED_LOGGED[0] = True
                 logger.warning(
