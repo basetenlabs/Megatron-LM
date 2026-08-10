@@ -196,6 +196,13 @@ class _ReplayEntry:
         "num_out_tokens_host",
         "tokens_per_expert_host",
         "num_global_tokens_per_local_expert_host",
+        # BT_MOE_A2A_PIPELINE (W2): host count matrices the chunk plan derives
+        # from; populated only when the dispatcher's _w2_config is armed.
+        "w2_local_counts_host",
+        "w2_global_counts_host",
+        # Verify mode only: the first pass's (padded) routing_map, for the
+        # mismatch forensics' XOR detail (None otherwise — 2 MB per entry).
+        "routing_map_dev",
     )
 
     def __init__(self):
@@ -282,11 +289,78 @@ def _values_equal(fresh, cached) -> bool:
     return type(fresh) is type(cached) and fresh == cached
 
 
+def _verify_mismatch_detail(name, fresh_val, cached_val) -> str:
+    """Boundary-flip forensics for a verify mismatch (bohr's ask, ARM-1 failure).
+
+    Reports mismatch count / total / max |diff| and the first mismatching flat
+    indices — for the per-expert counts vector the index IS the expert id, for
+    the [ep] splits it is the rank. A boundary-flip signature (few elements,
+    small ±k, paired experts) points at replay-vs-fwd ULP divergence in the
+    router; wholesale mismatch points at a store/restore bug.
+    """
+    try:
+        if torch.is_tensor(fresh_val) and torch.is_tensor(cached_val):
+            f, c = fresh_val.reshape(-1), cached_val.reshape(-1)
+            if f.shape != c.shape:
+                return f"{name}: shape {tuple(fresh_val.shape)} vs {tuple(cached_val.shape)}"
+            neq = f != c
+            n_mismatch = int(neq.sum().item())
+            if n_mismatch == 0:
+                return f"{name}: torch.equal False but elementwise diff empty (dtype/metadata?)"
+            idx = neq.nonzero().reshape(-1)[:16].tolist()
+            max_abs = int((f - c).abs().max().item()) if f.numel() else 0
+            return (
+                f"{name}: {n_mismatch}/{f.numel()} elements differ, max|diff|={max_abs}, "
+                f"first flat indices={idx}, fresh[idx]={f[neq][:16].tolist()}, "
+                f"cached[idx]={c[neq][:16].tolist()}"
+            )
+    except Exception as exc:  # forensics must never mask the real failure
+        return f"{name}: (forensics failed: {exc})"
+    return f"{name}: fresh={fresh_val!r} cached={cached_val!r}"
+
+
+def _verify_routing_map_detail(dispatcher, entry) -> str:
+    """routing_map XOR forensics: the entry carries the first pass's (padded)
+    routing_map in verify mode; the replay's fresh map is on the dispatcher.
+    Returns the flip count + which token rows / experts flipped."""
+    stored = getattr(entry, "routing_map_dev", None)
+    fresh = getattr(dispatcher, "routing_map", None)
+    if stored is None or fresh is None or not (torch.is_tensor(stored) and torch.is_tensor(fresh)):
+        return "routing_map XOR: unavailable (not stashed or not tensors)"
+    if stored.shape != fresh.shape:
+        return f"routing_map XOR: shape {tuple(fresh.shape)} vs {tuple(stored.shape)}"
+    flips = fresh != stored
+    n_flips = int(flips.sum().item())
+    if n_flips == 0:
+        return "routing_map XOR: 0 flips (maps identical — divergence is downstream of routing)"
+    rows = flips.any(dim=1).nonzero().reshape(-1)
+    row_list = rows[:8].tolist()
+    per_row = {
+        int(r): flips[r].nonzero().reshape(-1).tolist()[:8] for r in rows[:8]
+    }
+    return (
+        f"routing_map XOR: {n_flips} flipped entries across {rows.numel()} token rows "
+        f"(first rows={row_list}; per-row flipped experts={per_row})"
+    )
+
+
 def _verify_device_metadata(dispatcher, entry, num_tokens_per_local_expert):
     """Verify mode: assert the replay's fresh device metadata matches the cache."""
     fresh = _capture_device_metadata(dispatcher, num_tokens_per_local_expert)
     for name, fresh_val in fresh.items():
         if not _values_equal(fresh_val, getattr(entry, name)):
+            # Boundary-flip forensics BEFORE raising (ARM-1 verify failure):
+            # per-field mismatch detail + the routing_map XOR — a few ±k flips
+            # on paired experts = replay-vs-fwd ULP divergence in the router;
+            # wholesale mismatch = a store/restore bug.
+            logger.error(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY: %s",
+                _verify_mismatch_detail(name, fresh_val, getattr(entry, name)),
+            )
+            logger.error(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY: %s",
+                _verify_routing_map_detail(dispatcher, entry),
+            )
             raise RuntimeError(
                 "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY: replay device metadata mismatch in "
                 f"{name} on {type(dispatcher).__name__} (routing_shape {entry.routing_shape}): "
@@ -310,6 +384,22 @@ def _verify_host_metadata(dispatcher, entry, tokens_per_expert_host):
                 "num_global_tokens_per_local_expert",
                 getattr(dispatcher, "num_global_tokens_per_local_expert", None),
                 entry.num_global_tokens_per_local_expert_host,
+            )
+        )
+    if entry.w2_local_counts_host is not None:
+        pairs.append(
+            (
+                "w2_local_counts",
+                getattr(dispatcher, "_w2_local_counts_host", None),
+                entry.w2_local_counts_host,
+            )
+        )
+    if entry.w2_global_counts_host is not None:
+        pairs.append(
+            (
+                "w2_global_counts",
+                getattr(dispatcher, "_w2_global_counts_host", None),
+                entry.w2_global_counts_host,
             )
         )
     for name, fresh_val, cached_val in pairs:
@@ -350,6 +440,16 @@ def _store_replay_entry(dispatcher, rec, tokens_per_expert_host):
         entry.num_global_tokens_per_local_expert_host = getattr(
             dispatcher, "num_global_tokens_per_local_expert", None
         )
+    # BT_MOE_A2A_PIPELINE: cache the chunk-metadata matrices alongside the
+    # status-quo host values so a replay hit rebuilds the chunk plan with no
+    # D2H and no event sync.
+    if getattr(dispatcher, "_w2_config", None) is not None:
+        entry.w2_local_counts_host = getattr(dispatcher, "_w2_local_counts_host", None)
+        entry.w2_global_counts_host = getattr(dispatcher, "_w2_global_counts_host", None)
+    # Verify mode only: keep the first pass's routing_map for the mismatch
+    # forensics' XOR detail (boundary flips vs wholesale corruption).
+    if _replay_verify_enabled():
+        entry.routing_map_dev = dispatcher.routing_map
     store = getattr(rec.key_obj, _REPLAY_CACHE_ATTR, None)
     if store is None:
         store = {}
@@ -525,6 +625,400 @@ def _probs_a2a_comm_note_dispatch():
                 _PROBS_A2A_COMM_WINDOW_SIZE,
                 dict(_PROBS_A2A_COMM_STATS),
             )
+
+
+# ----------------------------------------------------------------------------
+# BT_MOE_A2A_PIPELINE=K (env-gated, default OFF; K must divide
+# num_local_experts — K=2 is the validated configuration)
+#
+# Intra-MoE-layer all-to-all <-> compute pipelining for the alltoall
+# dispatcher (design: experiment_artefacts/glm/lps_1062_perf/overlap_design/
+# DESIGN_helmholtz.md §3). The 16 local experts are split into K groups of
+# L = num_local_experts/K (group g = local experts [gL, (g+1)L) on EVERY
+# rank). The dispatch all-to-all is issued as K list-form all-to-alls
+# (torch.distributed.all_to_all over per-peer contiguous VIEWS — group g's
+# rows for dest rank r' are the contiguous slice [base(r')+off_g(r') :
+# +cnt_g(r')] of the expert-major permuted buffer, because group g is the
+# g-th slice of every rank's local-expert block). Chunk g+1's dispatch
+# overlaps chunk g's expert compute; chunk g's combine overlaps chunk g+1's
+# expert compute. Every expert's row block stays whole in one grouped-GEMM
+# call (bitwise per-expert), and the combine writes each group's rows into a
+# shared combine buffer at the SAME per-source offsets the unchunked path
+# produces, so the final unpermute consumes a byte-identical buffer in the
+# byte-identical order (bitwise regardless of TE's internal reduction order).
+#
+# v1 scope: forward pipelining; backward issues+waits each reverse A2A inline
+# (status-quo backward timing). Zero-count peers and zero-row experts are
+# supported (empty views / zero m_splits entries).
+#
+# Fallbacks (gate on but constraint violated — loud WARNING + status-quo
+# path): K does not divide num_local_experts; drop_and_pad; expert-TP > 1;
+# moe_permute_fusion off; cuda graphs; fused TEGroupedMLP impl; activation
+# offloading / paged stash / moe_act recompute; expert weights requiring grad
+# (wgrad would double-compute across chunk calls);
+# overlap_dispatch_backward_with_experts_wgrad; moe_apply_probs_on_input.
+#
+# Composition:
+# * BT_MOE_PROBS_A2A_COMM (W1): with W1 on, the single full probs A2A rides
+#   the second communicator; with W1 off it rides the EP communicator and is
+#   issued BEFORE the token chunks so it does not trail them. Per-group probs
+#   are then selected on-device by one fused sort_chunks kernel (no extra
+#   latency-bound A2As).
+# * BT_MOE_DISPATCH_REPLAY_CACHE (FIX C): the two count matrices this gate
+#   D2H's per pass are cached by FIX C across the recompute replay via two
+#   W2-gated slots on its entry (w2_* below); on a replay hit the chunk plan
+#   is rebuilt from the cached host values with no D2H and no event sync.
+#
+# Telemetry (WARNING level): one-time gate-state line; one-time armed line
+# with K/L (or the fallback reason); per-window counters every 300 gated
+# layer-passes (~1 step) for the first 100 windows.
+# ----------------------------------------------------------------------------
+
+_A2A_PIPELINE_GATE_LOGGED = [False]
+_A2A_PIPELINE_ARMED_LOGGED = [False]
+# Separate one-time flag for the first-forward trainable-experts disarm — the
+# shared armed flag would suppress it (a silent disarm after a config-armed
+# layer is the v1 inert-gate trap; second-review item 3a).
+_A2A_PIPELINE_DISARM_LOGGED = [False]
+_A2A_PIPELINE_STATS = {
+    "dispatch_issues": 0,
+    "combine_issues": 0,
+    "waits": 0,
+    "fallback_passes": 0,
+}
+_A2A_PIPELINE_WINDOW = [0, 0]  # [gated layer-passes this window, windows logged]
+_A2A_PIPELINE_WINDOW_SIZE = 300
+_A2A_PIPELINE_WINDOW_LOG_MAX = 100
+
+
+def _a2a_pipeline_gate_value() -> int:
+    """Lazy env-gate read (per-call; negligible at ~1 call/layer-pass)."""
+    raw = os.environ.get("BT_MOE_A2A_PIPELINE", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not _A2A_PIPELINE_GATE_LOGGED[0]:
+        _A2A_PIPELINE_GATE_LOGGED[0] = True
+        if value > 1:
+            logger.warning("BT_MOE_A2A_PIPELINE=%s: chunked MoE A2A pipeline ACTIVE", raw)
+        else:
+            logger.warning(
+                "BT_MOE_A2A_PIPELINE present but DISABLED (env unset, '0', or K=1); "
+                "MoE dispatch/combine all-to-alls stay monolithic"
+            )
+    return value
+
+
+def _a2a_pipeline_note_pass(dispatch_issues, combine_issues, waits, advance_window=False):
+    """Per-window pipeline telemetry (WARNING so it reaches trainer logs).
+
+    The window counter advances once per gated layer-pass (at token_dispatch);
+    the dispatch_postprocess / token_combine_chunked call sites only add their
+    issue/wait counts.
+    """
+    _A2A_PIPELINE_STATS["dispatch_issues"] += dispatch_issues
+    _A2A_PIPELINE_STATS["combine_issues"] += combine_issues
+    _A2A_PIPELINE_STATS["waits"] += waits
+    if advance_window:
+        _A2A_PIPELINE_WINDOW[0] += 1
+    if _A2A_PIPELINE_WINDOW[0] >= _A2A_PIPELINE_WINDOW_SIZE:
+        _A2A_PIPELINE_WINDOW[0] = 0
+        _A2A_PIPELINE_WINDOW[1] += 1
+        if _A2A_PIPELINE_WINDOW[1] <= _A2A_PIPELINE_WINDOW_LOG_MAX:
+            logger.warning(
+                "BT_MOE_A2A_PIPELINE window %d (%d gated layer-passes): %s",
+                _A2A_PIPELINE_WINDOW[1],
+                _A2A_PIPELINE_WINDOW_SIZE,
+                dict(_A2A_PIPELINE_STATS),
+            )
+
+
+def _cumsum_excl(counts):
+    """Exclusive prefix sum as python ints (host-side; counts is array-like)."""
+    out = [0]
+    total = 0
+    for c in counts:
+        total += int(c)
+        out.append(total)
+    return out
+
+
+class _W2ChunkPlan:
+    """Per-pass host metadata for the chunked pipeline (pure index math).
+
+    All splits are python-int lists of length ep_size; all view bounds are
+    (start, length) python-int pairs into the relevant buffer:
+
+    * dispatch_send_bounds[g][d]: slice of the permuted buffer P (expert-id
+      order) holding this rank's rows for dest d's group-g experts.
+    * dispatch_recv_bounds[g][s]: slice of recv buffer g holding src s's rows.
+    * combine_send_bounds[g][d]: slice of unsorted_g (same (src, expert-in-
+      group) layout as recv buffer g) holding rows to send back to d.
+    * combine_recv_bounds[g][s]: slice of the SHARED combine buffer holding
+      the rows src s returns to this rank. The combine output mirrors the
+      permuted buffer P's layout (per-src blocks of the rows THIS rank sent
+      to s, expert-id order within a block, group g at offset [gL:(g+1)L)
+      within the block) — so the bounds derive from the LOCAL (send-side)
+      counts, not the receive-side matrix, and the final unpermute sees a
+      byte-identical buffer.
+    * tokens_per_expert[g]: host list of length L for the grouped GEMM.
+    """
+
+    __slots__ = (
+        "K",
+        "L",
+        "input_splits",
+        "output_splits",
+        "dispatch_send_bounds",
+        "dispatch_recv_bounds",
+        "combine_send_bounds",
+        "combine_recv_bounds",
+        "tokens_per_expert",
+        "total_recv_rows",
+        "total_rows",
+        "combine_works",
+    )
+
+    def __init__(self, K, L):
+        self.K = K
+        self.L = L
+        self.input_splits = []
+        self.output_splits = []
+        self.dispatch_send_bounds = []
+        self.dispatch_recv_bounds = []
+        self.combine_send_bounds = []
+        self.combine_recv_bounds = []
+        self.tokens_per_expert = []
+        self.total_recv_rows = []
+        self.total_rows = 0
+        # Async work handles for the K combine A2As. Carried on the plan (a
+        # stable-identity Python object), NEVER on the combine buffer tensor:
+        # when a custom Function returns its input tensor, autograd returns a
+        # NEW alias object and tensor attributes do not propagate — so in
+        # every grad-enabled pass the waits would silently never run
+        # (second-review BUG A).
+        self.combine_works = []
+
+
+def _w2_compute_chunk_plan(local_counts, global_counts, *, K, ep_size):
+    """Compute the per-group A2A splits and view bounds (pure host math).
+
+    Args:
+        local_counts: array-like [num_experts] — rows THIS rank sends to each
+            global expert (num_local_tokens_per_expert).
+        global_counts: array-like [ep_size, num_local_experts] — rows this
+            rank receives: [src_ep_rank, local_expert] (requires expert-TP=1).
+        K: number of expert groups (must divide num_local_experts).
+        ep_size: EP group size.
+
+    Returns:
+        _W2ChunkPlan. Bitwise-exact restriction of the unchunked metadata:
+        sum over groups of input_splits[g] == today's input_splits, etc.
+    """
+    import numpy as np
+
+    local = np.asarray(local_counts, dtype=np.int64).reshape(ep_size, -1)
+    glob = np.asarray(global_counts, dtype=np.int64)
+    num_local_experts = glob.shape[1]
+    assert num_local_experts % K == 0
+    L = num_local_experts // K
+    local_g = local.reshape(ep_size, K, L)  # [dest, group, expert-in-group]
+    glob_g = glob.reshape(ep_size, K, L)  # [src, group, expert-in-group]
+
+    plan = _W2ChunkPlan(K, L)
+    # Per-rank row totals (today's input_splits / output_splits).
+    rank_send = local.sum(axis=1)  # [ep] — rows this rank sends to each dest
+    send_base = _cumsum_excl(rank_send)  # into P (and into the combine buffer:
+    # the combine output mirrors P's layout — per-src blocks of the rows this
+    # rank sent, so it is carved by the SEND-side totals, not the recv ones)
+
+    for g in range(K):
+        in_g = [int(x) for x in local_g[:, g, :].sum(axis=1)]
+        out_g = [int(x) for x in glob_g[:, g, :].sum(axis=1)]
+        plan.input_splits.append(in_g)
+        plan.output_splits.append(out_g)
+        plan.total_recv_rows.append(sum(out_g))
+        plan.tokens_per_expert.append([int(x) for x in glob_g[:, g, :].sum(axis=0)])
+
+        # Dispatch: send views into P (per dest), recv views into recv_g (per src).
+        off_in_rank = local_g[:, :g, :].sum(axis=(1, 2)) if g > 0 else np.zeros(ep_size, np.int64)
+        plan.dispatch_send_bounds.append(
+            [(send_base[d] + int(off_in_rank[d]), in_g[d]) for d in range(ep_size)]
+        )
+        recv_base_g = _cumsum_excl(out_g)
+        plan.dispatch_recv_bounds.append(
+            [(recv_base_g[s], out_g[s]) for s in range(ep_size)]
+        )
+        # Combine: send views into unsorted_g (same layout as recv_g — rows
+        # this rank received, sent back), recv views into the shared combine
+        # buffer at P's per-src offsets (rows this rank sent, returned).
+        plan.combine_send_bounds.append(
+            [(recv_base_g[d], out_g[d]) for d in range(ep_size)]
+        )
+        off_in_src_block = local_g[:, :g, :].sum(axis=(1, 2)) if g > 0 else np.zeros(
+            ep_size, np.int64
+        )
+        plan.combine_recv_bounds.append(
+            [(send_base[s] + int(off_in_src_block[s]), in_g[s]) for s in range(ep_size)]
+        )
+    plan.total_rows = int(rank_send.sum())
+    return plan
+
+
+def _w2_narrow_views(tensor, bounds):
+    """Per-peer contiguous views of a [rows, ...] tensor (empty views kept:
+    NCCL grouped send/recv with a zero-count peer is a no-op — verified on-box
+    by the T2 gate script)."""
+    return [tensor.narrow(0, start, length) for (start, length) in bounds]
+
+
+class _ChunkedDispatchA2A(torch.autograd.Function):
+    """BT_MOE_A2A_PIPELINE: K list-form all-to-alls dispatching the permuted
+    buffer by expert group, issued back-to-back async (the per-group waits are
+    plain `wait_deferred_a2a` calls in dispatch_postprocess, so chunk g+1's
+    A2A is in flight while chunk g's expert compute runs).
+
+    One Function covers all K groups so the backward can write every group's
+    reverse-A2A rows into views of a single grad buffer for the permuted
+    input (no cross-group grad accumulation kernel, exact by disjointness).
+    """
+
+    @staticmethod
+    def forward(ctx, group, permuted_tokens, plan):
+        ctx.group = group
+        ctx.plan = plan
+        ctx.permuted_shape = permuted_tokens.shape
+        recv_bufs = []
+        for g in range(plan.K):
+            recv_g = permuted_tokens.new_empty(
+                [plan.total_recv_rows[g]] + list(permuted_tokens.size()[1:])
+            )
+            work = torch.distributed.all_to_all(
+                _w2_narrow_views(recv_g, plan.dispatch_recv_bounds[g]),
+                _w2_narrow_views(permuted_tokens, plan.dispatch_send_bounds[g]),
+                group=group,
+                async_op=True,
+            )
+            setattr(recv_g, "_deferred_a2a_work", work)
+            recv_bufs.append(recv_g)
+        return tuple(recv_bufs)
+
+    @staticmethod
+    def backward(ctx, *grad_recvs):
+        """Reverse list-A2As into views of one grad buffer for the permuted input.
+
+        v1: all K reverses issued async, then waited inline (status-quo
+        backward timing — the K half-size reverses serialize on the
+        communicator's stream like the monolithic reverse did).
+        """
+        plan = ctx.plan
+        grad_permuted = None
+        works = []
+        for g in range(plan.K):
+            if grad_permuted is None:
+                grad_permuted = grad_recvs[g].new_zeros(ctx.permuted_shape)
+            works.append(
+                torch.distributed.all_to_all(
+                    _w2_narrow_views(grad_permuted, plan.dispatch_send_bounds[g]),
+                    _w2_narrow_views(grad_recvs[g].contiguous(), plan.dispatch_recv_bounds[g]),
+                    group=ctx.group,
+                    async_op=True,
+                )
+            )
+        for work in works:
+            work.wait()
+        return None, grad_permuted, None
+
+
+class _ChunkedCombineA2A(torch.autograd.Function):
+    """BT_MOE_A2A_PIPELINE: one expert group's combine all-to-all (list form),
+    writing into the shared combine buffer at the unchunked path's per-source
+    offsets, so the final unpermute sees a byte-identical buffer.
+
+    Group 0's call allocates the combine buffer; later groups receive it as an
+    input and return it (the passthrough keeps the autograd chain intact so
+    the unpermute's backward reaches every group's reverse A2A).
+    """
+
+    @staticmethod
+    def forward(ctx, group, unsorted_g, combine_buf, plan, g):
+        ctx.had_buf = combine_buf is not None
+        if combine_buf is None:
+            combine_buf = unsorted_g.new_empty(
+                [plan.total_rows] + list(unsorted_g.size()[1:])
+            )
+        work = torch.distributed.all_to_all(
+            _w2_narrow_views(combine_buf, plan.combine_recv_bounds[g]),
+            _w2_narrow_views(unsorted_g, plan.combine_send_bounds[g]),
+            group=group,
+            async_op=True,
+        )
+        # The work handle rides on the plan (stable identity), never on the
+        # combine buffer tensor (autograd aliases lose tensor attrs — BUG A).
+        plan.combine_works.append(work)
+        ctx.group = group
+        ctx.plan = plan
+        ctx.g = g
+        ctx.unsorted_rows = unsorted_g.shape
+        return combine_buf
+
+    @staticmethod
+    def backward(ctx, grad_buf):
+        """Reverse list-A2A for this group (issued and waited inline, v1)."""
+        plan = ctx.plan
+        g = ctx.g
+        grad_unsorted = grad_buf.new_empty(ctx.unsorted_rows)
+        work = torch.distributed.all_to_all(
+            _w2_narrow_views(grad_unsorted, plan.combine_send_bounds[g]),
+            _w2_narrow_views(grad_buf, plan.combine_recv_bounds[g]),
+            group=ctx.group,
+            async_op=True,
+        )
+        work.wait()
+        # grad_buf passes through unchanged to the previous group's Function —
+        # but only when that input was actually a tensor (group 0 received
+        # None); returning a grad for a non-Variable input is a RuntimeError
+        # (second-review BUG B).
+        return None, grad_unsorted, grad_buf if ctx.had_buf else None, None, None
+
+
+class _W2PipelineConfig:
+    """Init-time (pass-independent) chunked-pipeline state."""
+
+    __slots__ = (
+        "K",
+        "L",
+        "sort_input_chunk",
+        "restore_output_chunk",
+        "probs_keep_idxs",
+        "probs_keep_idxs_host",
+    )
+
+    def __init__(self, K, L, tp_size, ep_size, device):
+        self.K = K
+        self.L = L
+        # Per-group chunk re-sort index permutations, same construction as the
+        # unchunked sort_input_by_local_experts / restore_output_by_local_experts
+        # but for L experts per group instead of num_local_experts.
+        chunk_idxs = torch.arange(L * tp_size * ep_size, device=device)
+        # [tp*ep, L] -> [L, tp*ep] -> ravel: (src, expert-in-group) -> expert-major.
+        self.sort_input_chunk = chunk_idxs.reshape(-1, L).T.ravel()
+        # [L, tp*ep] -> [tp*ep, L] -> ravel: expert-major -> (src, expert-in-group).
+        self.restore_output_chunk = chunk_idxs.reshape(L, -1).T.ravel()
+        # Fixed keep-indices selecting group g's (src, expert) blocks from the
+        # full (src, num_local_experts) grid, in (src, expert-in-group) order —
+        # used to select per-group probs from the full probs A2A output.
+        # [K, tp*ep*L]. The HOST copy feeds the UNFUSED sort_chunks call: the
+        # selection is a subset of chunks, not a permutation, and the TE fused
+        # kernel's generated backward assumes full coverage (returns a
+        # group-sized grad for the full-size input — the T2-gate defect); the
+        # unfused split/cat path's autograd scatters group grads into the
+        # full-size buffer correctly.
+        self.probs_keep_idxs = torch.arange(
+            tp_size * ep_size * K * L, device=device
+        ).reshape(tp_size * ep_size, K, L).permute(1, 0, 2).reshape(K, -1).contiguous()
+        self.probs_keep_idxs_host = [row for row in self.probs_keep_idxs.cpu().numpy()]
 
 
 class MoETokenDispatcher:
@@ -971,6 +1465,69 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     "BT_MOE_PROBS_A2A_COMM: armed=NO — EP size is 1, no all-to-all to move"
                 )
 
+        # BT_MOE_A2A_PIPELINE: set by w2_try_enable_pipeline (called from
+        # MoELayer.__init__, which owns the experts module the validation
+        # needs). Per-pass chunked state lives in self._w2_pass and is cleared
+        # with the rest of the forward state in combine_postprocess.
+        self._w2_config = None
+        self._w2_pass = None
+
+    def w2_try_enable_pipeline(self, experts):
+        """Validate constraints and arm BT_MOE_A2A_PIPELINE (K expert groups).
+
+        Called once per layer from MoELayer.__init__. Any constraint violation
+        falls back to the status-quo monolithic path with a one-time WARNING
+        naming the reason (a gate that cannot fire is never silent). The
+        expert-weights-requires_grad check is NOT done here (LoRA freezing may
+        happen after model construction) — it runs once at the top of the
+        first MoELayer.forward instead.
+        """
+        K = _a2a_pipeline_gate_value()
+        if K <= 1:
+            return
+        reason = None
+        if self.num_local_experts % K != 0:
+            reason = f"K={K} does not divide num_local_experts={self.num_local_experts}"
+        elif self.ep_size <= 1:
+            reason = "EP size is 1, no all-to-all to pipeline"
+        elif self.drop_and_pad:
+            reason = "drop_and_pad is on"
+        elif self.tp_size > 1:
+            reason = "expert-TP > 1"
+        elif not self.config.moe_permute_fusion:
+            reason = "moe_permute_fusion is off (fused sort_chunks required)"
+        elif self.config.cuda_graph_impl != "none":
+            reason = "cuda graphs are on"
+        elif getattr(experts, "_with_fused_impl", False):
+            reason = "fused TEGroupedMLP impl (use_transformer_engine_op_fuser)"
+        elif getattr(experts, "offload_expert_fc1", False) or getattr(
+            experts, "offload_moe_act", False
+        ) or getattr(experts, "offload_fused_group_mlp", False):
+            reason = "fine-grained activation offloading"
+        elif self.config.moe_paged_stash:
+            reason = "moe_paged_stash"
+        elif getattr(experts, "activation_recompute", False):
+            reason = "moe_act selective recompute"
+        elif self.config.overlap_dispatch_backward_with_experts_wgrad:
+            reason = "overlap_dispatch_backward_with_experts_wgrad"
+        elif self.config.overlap_moe_expert_parallel_comm:
+            reason = "overlap_moe_expert_parallel_comm"
+        elif self.config.moe_apply_probs_on_input:
+            reason = "moe_apply_probs_on_input"
+        if reason is not None:
+            if not _A2A_PIPELINE_ARMED_LOGGED[0]:
+                _A2A_PIPELINE_ARMED_LOGGED[0] = True
+                logger.warning(
+                    "BT_MOE_A2A_PIPELINE: armed=NO — %s; status-quo monolithic A2A path",
+                    reason,
+                )
+            return
+        L = self.num_local_experts // K
+        self._w2_config = _W2PipelineConfig(K, L, self.tp_size, self.ep_size, self.permute_idx_device)
+        # The "armed" line is emitted by MoELayer's first-forward check once
+        # the frozen-experts stage also passes (a config-armed but
+        # frozen-disabled pipeline must not log armed).
+
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = [
@@ -1046,6 +1603,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
+        if self._w2_config is not None:
+            # BT_MOE_A2A_PIPELINE: keep the device counts for the D2H batch
+            # (per-chunk host metadata derives from this and
+            # num_global_tokens_per_local_expert).
+            self._w2_local_counts_dev = num_local_tokens_per_expert
 
         if (
             self.config.moe_expert_capacity_factor is not None
@@ -1218,6 +1780,49 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        if self._w2_config is not None:
+            # BT_MOE_A2A_PIPELINE: K expert-group list-A2As issued back-to-back
+            # (chunk g+1's dispatch overlaps chunk g's expert compute). The
+            # probs A2A stays a single full call: on the W1 second
+            # communicator when armed (concurrent with the token chunks), else
+            # on the EP communicator issued FIRST so it does not trail the
+            # token chunks. Per-group probs are selected on-device in
+            # dispatch_postprocess. Push order (matters at
+            # CUDA_DEVICE_MAX_CONNECTIONS=1): all issues -> shared fc1 ->
+            # probs wait; the per-group token waits happen in
+            # dispatch_postprocess right before each group's sort.
+            chunk_plan = _w2_compute_chunk_plan(
+                self._w2_local_counts_host,
+                self._w2_global_counts_host,
+                K=self._w2_config.K,
+                ep_size=self.ep_size,
+            )
+            probs_group = (
+                self._probs_a2a_comm if self._probs_a2a_comm is not None else self.ep_group
+            )
+            if probs_group is self.ep_group:
+                global_probs = all_to_all_deferred(
+                    probs_group, permuted_probs, self.output_splits, self.input_splits
+                )
+            recv_bufs = _ChunkedDispatchA2A.apply(
+                self.ep_group, permutated_local_input_tokens, chunk_plan
+            )
+            if probs_group is not self.ep_group:
+                global_probs = all_to_all_deferred(
+                    probs_group, permuted_probs, self.output_splits, self.input_splits
+                )
+            if self.shared_experts is not None:
+                self.shared_experts.linear_fc1_forward_and_act(recv_bufs[0])
+            wait_deferred_a2a(global_probs)
+            self._w2_pass = {
+                "plan": chunk_plan,
+                "recv_bufs": recv_bufs,
+                "global_probs": global_probs,
+            }
+            _a2a_pipeline_note_pass(
+                dispatch_issues=chunk_plan.K, combine_issues=0, waits=1, advance_window=True
+            )
+            return recv_bufs, global_probs
         if self._probs_a2a_comm is not None:
             # BT_MOE_PROBS_A2A_COMM: issue both all-to-alls before waiting
             # either. The probs A2A rides the second communicator so its
@@ -1284,6 +1889,46 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of processed tokens, token counts per expert, and processed probabilities.
         """
+        if self._w2_config is not None:
+            # BT_MOE_A2A_PIPELINE: per-group wait -> probs selection -> sort.
+            # Returns a list of K (sorted_tokens, tokens_per_expert host list,
+            # sorted probs) tuples for MoELayer's chunked experts loop.
+            cfg = self._w2_config
+            state = self._w2_pass
+            plan = state["plan"]
+            counts_ge = self.num_global_tokens_per_local_expert  # device [tp*ep, K*L]
+            probs_full = state["global_probs"]  # already waited in token_dispatch
+            chunks = []
+            for g in range(cfg.K):
+                # Wait chunk g's dispatch A2A (stream wait, host-non-blocking).
+                wait_deferred_a2a(state["recv_bufs"][g])
+                # Select group g's probs rows ((src, expert-in-group) order)
+                # from the full probs buffer. This is a SUBSET of chunks, not
+                # a permutation — the TE fused sort's generated backward
+                # assumes full coverage and returns a group-sized grad for the
+                # full-size input (the T2-gate defect). The UNFUSED split/cat
+                # path's autograd (views + cat) scatters group grads into the
+                # full-size buffer correctly and is bitwise-exact; host
+                # split/index lists mean no new syncs.
+                probs_g = sort_chunks_by_idxs(
+                    probs_full,
+                    self._w2_global_counts_host.ravel(),
+                    cfg.probs_keep_idxs_host[g],
+                    fused=False,
+                )[0]
+                # Sort chunk g's received tokens by local expert within the group.
+                sorted_g, probs_g_sorted = sort_chunks_by_idxs(
+                    state["recv_bufs"][g],
+                    counts_ge[:, g * cfg.L : (g + 1) * cfg.L].reshape(-1),
+                    cfg.sort_input_chunk,
+                    probs=probs_g,
+                    fused=self.config.moe_permute_fusion,
+                )
+                chunks.append((sorted_g, plan.tokens_per_expert[g], probs_g_sorted))
+            state["chunks"] = chunks
+            self.tokens_per_expert = None
+            _a2a_pipeline_note_pass(dispatch_issues=0, combine_issues=0, waits=cfg.K)
+            return chunks
         if self.tp_size > 1:
             if self.output_splits_tp is None:
                 output_split_sizes = None
@@ -1380,6 +2025,49 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return hidden_states
 
+    def combine_preprocess_chunk(self, hidden_states, group_index):
+        """BT_MOE_A2A_PIPELINE: unsort one expert group's expert outputs from
+        expert-major-within-group order back to (src, expert-in-group) order
+        for the combine A2A. Same fused sort_chunks restriction as the
+        unchunked combine_preprocess."""
+        cfg = self._w2_config
+        counts_g = self.num_global_tokens_per_local_expert[
+            :, group_index * cfg.L : (group_index + 1) * cfg.L
+        ]
+        unsorted_g, _ = sort_chunks_by_idxs(
+            hidden_states,
+            counts_g.T.reshape(-1),
+            cfg.restore_output_chunk,
+            fused=self.config.moe_permute_fusion,
+        )
+        return unsorted_g
+
+    def token_combine_chunked(self, unsorted_list):
+        """BT_MOE_A2A_PIPELINE: issue the K groups' combine list-A2As into the
+        shared combine buffer (at the unchunked path's per-source offsets), then
+        wait them all. Returns the combine buffer, which combine_postprocess
+        unpermutes exactly as today."""
+        state = self._w2_pass
+        plan = state["plan"]
+        # Make sure the shared experts fc2 is not overlapped with routed experts fc1
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1 (same ordering as token_combine).
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
+        combine_buf = None
+        for g, unsorted_g in enumerate(unsorted_list):
+            combine_buf = _ChunkedCombineA2A.apply(
+                self.ep_group, unsorted_g, combine_buf, plan, g
+            )
+        # Shared-expert fc2 after all combine issues, before the waits (push
+        # order at CUDA_DEVICE_MAX_CONNECTIONS=1).
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(combine_buf)
+            self.shared_experts.post_forward_comm()
+        for work in plan.combine_works:
+            work.wait()
+        _a2a_pipeline_note_pass(dispatch_issues=0, combine_issues=plan.K, waits=plan.K)
+        return combine_buf
+
     def token_combine(
         self,
         hidden_states: torch.Tensor,
@@ -1401,6 +2089,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             Tokens after the All-to-All communication for combining.
         """
+        if self._w2_config is not None:
+            # BT_MOE_A2A_PIPELINE: the combine already happened per-group in
+            # token_combine_chunked (called from MoELayer.routed_experts_compute).
+            return hidden_states
         # Make sure the shared experts fc2 is not overlapped with routed experts fc1
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
@@ -1465,6 +2157,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "num_global_tokens_per_local_expert",
             "capacity",
             "d2h_event",
+            "_w2_pass",
+            "_w2_local_counts_dev",
+            "_w2_local_counts_host",
+            "_w2_global_counts_host",
         )
         return output
 
@@ -1501,6 +2197,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                         self.num_global_tokens_per_local_expert = (
                             entry.num_global_tokens_per_local_expert_host
                         )
+                    if self._w2_config is not None:
+                        # BT_MOE_A2A_PIPELINE: restore the cached chunk-metadata
+                        # matrices (no D2H, no event sync on a replay hit).
+                        self._w2_local_counts_host = entry.w2_local_counts_host
+                        self._w2_global_counts_host = entry.w2_global_counts_host
                     tokens_per_expert = entry.tokens_per_expert_host
                     self.d2h_event = None
                 return tokens_per_expert
@@ -1529,6 +2230,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
                         self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
                             self.num_global_tokens_per_local_expert, record_stream=on_side_stream
+                        )
+                    if self._w2_config is not None:
+                        # BT_MOE_A2A_PIPELINE: add the two count matrices the
+                        # chunk plan derives from to the SAME D2H batch (one
+                        # event, one sync per layer-pass — unchanged).
+                        self._w2_local_counts_host = maybe_move_tensor_to_cpu(
+                            self._w2_local_counts_dev, as_numpy=True,
+                            record_stream=on_side_stream,
+                        )
+                        self._w2_global_counts_host = maybe_move_tensor_to_cpu(
+                            self.num_global_tokens_per_local_expert, as_numpy=True,
+                            record_stream=on_side_stream,
                         )
                 self.d2h_event = self.cuda_dtoh_stream.record_event()
 
