@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import warnings
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -33,6 +35,76 @@ try:
     from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
 except ImportError:
     apply_rotary_emb_flash = None
+
+
+# ----------------------------------------------------------------------------
+# BT_THD_ROPE_HOST_CACHE (env-gated, default OFF)
+#
+# `_apply_rotary_pos_emb_thd` reads per-sequence lengths/offsets from the CUDA
+# cu_seqlens tensor via `.tolist()` + per-sequence `.item()` — each a blocking
+# pageable D2H that drains the compute stream (measured ~620 calls >1ms /
+# 14.8s CPU per 524K-token step on GLM-5.2 CP16: 2 calls per layer (q/k rope)
+# × 78 layers × 2 microbatches × (fwd + recompute replay); see
+# experiment_artefacts/glm/lps_1062_perf/dispatcher_opt/). cu_seqlens is a
+# per-microbatch constant shared by every layer, so when the gate is on the
+# host copy is taken once per unique tensor and cached; all host reads then
+# run on the cached copy with identical integer arithmetic (bitwise-exact —
+# the same int32 values, the same ops, zero device syncs in steady state).
+#
+# The cache is keyed by id(tensor) and each entry holds a strong reference to
+# the tensor, so an id can never be recycled by a different tensor while
+# cached; entries are FIFO-evicted (bound: a few KB). Because the cache lives
+# for the whole run, each entry also records the tensor's `_version` counter
+# and hits only when it still matches: an in-place mutation of a cached
+# cu_seqlens then misses and re-copies instead of silently serving stale
+# seqlens. fwd (main thread) and the recompute replay (autograd thread) may
+# race on get/set — dict ops are GIL-atomic and a lost race costs one
+# duplicate D2H of identical values.
+# ----------------------------------------------------------------------------
+
+_THD_ROPE_HOST_CACHE: "OrderedDict[int, tuple]" = OrderedDict()
+_THD_ROPE_HOST_CACHE_MAX = 64
+_THD_ROPE_GATE_LOGGED = [False]
+
+
+def _thd_rope_host_cache_enabled() -> bool:
+    """Lazy env-gate read (per-call; negligible at ~4 calls/layer).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_THD_ROPE_HOST_CACHE", "0") == "1"
+    if not _THD_ROPE_GATE_LOGGED[0]:
+        _THD_ROPE_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning("BT_THD_ROPE_HOST_CACHE=1: THD RoPE cu_seqlens host cache ACTIVE")
+        else:
+            logger.warning(
+                "BT_THD_ROPE_HOST_CACHE present but DISABLED (env unset or != '1'); "
+                "reading cu_seqlens per call"
+            )
+    return enabled
+
+
+def _host_cu_seqlens(cu_seqlens: Tensor) -> Tensor:
+    """Return a host (CPU) copy of cu_seqlens, cached per unique tensor object.
+
+    Hits require both object identity and an unchanged `_version` counter, so
+    in-place mutation of a cached tensor forces a fresh copy.
+    """
+    key = id(cu_seqlens)
+    version = cu_seqlens._version
+    entry = _THD_ROPE_HOST_CACHE.get(key)
+    if entry is not None and entry[0] is cu_seqlens and entry[1] == version:
+        _THD_ROPE_HOST_CACHE.move_to_end(key)
+        return entry[2]
+    host = cu_seqlens.cpu()  # returns self when already on CPU
+    _THD_ROPE_HOST_CACHE[key] = (cu_seqlens, version, host)
+    _THD_ROPE_HOST_CACHE.move_to_end(key)
+    while len(_THD_ROPE_HOST_CACHE) > _THD_ROPE_HOST_CACHE_MAX:
+        _THD_ROPE_HOST_CACHE.popitem(last=False)
+    return host
 
 
 __all__ = [
@@ -219,9 +291,15 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    if _thd_rope_host_cache_enabled():
+        # Read from a cached host copy: identical integer values/arithmetic with
+        # no per-call device sync (one D2H per unique cu_seqlens tensor).
+        cu_seqlens_host = _host_cu_seqlens(cu_seqlens)
+    else:
+        cu_seqlens_host = cu_seqlens
+    seqlens = ((cu_seqlens_host[1:] - cu_seqlens_host[:-1]) // cp_size).tolist()
     sequence_splits = torch.split(t, seqlens)
-    total_seqlen = int(cu_seqlens[-1].item())
+    total_seqlen = int(cu_seqlens_host[-1].item())
     has_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == total_seqlen
 
     # Handle two different frequency tensor formats:
@@ -236,7 +314,7 @@ def _apply_rotary_pos_emb_thd(
         local_freqs = []
         for i, x in enumerate(sequence_splits):
             # cu_seqlens[i] is the starting offset of this sequence in the original batch
-            seq_start_offset = cu_seqlens[i].item()
+            seq_start_offset = cu_seqlens_host[i].item()
             local_freqs.append(
                 _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
             )
