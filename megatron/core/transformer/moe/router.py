@@ -45,7 +45,12 @@ logger = logging.getLogger(__name__)
 # C-prime makes the replay's routing DECISION bitwise-identical to the first
 # pass BY CONSTRUCTION instead of by assumption: the first pass stashes its
 # routing_map on the per-microbatch packed_seq_params carrier (via the FIX C
-# checkpoint-pass frames) keyed by layer_number; the replay pops it and masks
+# checkpoint-pass frames) keyed by id(router) — NOT layer_number: MTP routers
+# reuse main-stack layer numbers, so a layer_number key collides across router
+# instances (the id() discipline matches FIX C's id(dispatcher) keying; the
+# router object is the same across a microbatch's first pass and replay, and
+# the stash dies with the microbatch carrier, so id() reuse after GC is not
+# reachable); the replay pops it and masks
 # its own recomputed logits with -inf on every unsaved (token, expert) pair
 # before the score function, so the top-k selection is forced to the saved
 # set. The returned routing_map IS the saved map (bitwise); the probs are
@@ -175,7 +180,7 @@ def _routing_force_replay_saved_map(router):
     if frame is None or not frame.is_replay:
         return None
     stash = getattr(frame.key_obj, _ROUTING_FORCE_STASH_ATTR, None)
-    saved = stash.pop(router.layer_number, None) if stash is not None else None
+    saved = stash.pop(id(router), None) if stash is not None else None
     _routing_force_note_pass()
     if saved is None:
         _ROUTING_FORCE_STATS["misses"] += 1
@@ -212,7 +217,7 @@ def _routing_force_stash(router, routing_map):
     if stash is None:
         stash = {}
         setattr(frame.key_obj, _ROUTING_FORCE_STASH_ATTR, stash)
-    stash[router.layer_number] = routing_map
+    stash[id(router)] = routing_map
     _ROUTING_FORCE_BYTES[0] += routing_map.numel()
     if _ROUTING_FORCE_BYTES[0] > _ROUTING_FORCE_BYTES_PEAK[0]:
         _ROUTING_FORCE_BYTES_PEAK[0] = _ROUTING_FORCE_BYTES[0]
