@@ -19,6 +19,7 @@ from .layers import (
 from .mappings import (
     all_gather_last_dim_from_tensor_parallel_region,
     all_to_all,
+    all_to_all_deferred,
     all_to_all_hp2sp,
     all_to_all_sp2hp,
     copy_to_tensor_model_parallel_region,
@@ -29,6 +30,7 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
+    wait_deferred_a2a,
 )
 from .random import (
     CheckpointWithoutOutput,
@@ -68,6 +70,8 @@ __all__ = [
     "reduce_scatter_to_sequence_parallel_region",
     "scatter_to_tensor_model_parallel_region",
     "scatter_to_sequence_parallel_region",
+    "all_to_all_deferred",
+    "wait_deferred_a2a",
     # random.py
     "checkpoint",
     "convert_cuda_rng_state",

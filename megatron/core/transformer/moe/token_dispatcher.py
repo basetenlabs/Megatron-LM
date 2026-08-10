@@ -15,8 +15,10 @@ from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import (
     all_to_all,
+    all_to_all_deferred,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    wait_deferred_a2a,
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
@@ -434,6 +436,97 @@ def _replay_pass_record(dispatcher):
     return frame.scratch.get(id(dispatcher))
 
 
+# ----------------------------------------------------------------------------
+# BT_MOE_PROBS_A2A_COMM (env-gated, default OFF)
+#
+# The alltoall dispatcher issues two all-to-alls per dispatch: the tokens A2A
+# (bandwidth-bound; 805 MB bf16 at GLM-5.2 EP16/131k, p50 ~10.7 ms) and the
+# probs A2A (latency-bound; ~66 KB f32 per peer, ~5.7 ms). Both ride the same
+# EP communicator, so they serialize on its internal NCCL stream, and the
+# probs call sits fully exposed between the tokens A2A and the expert
+# sort/GEMM that consumes both (measured 5.13 s per 4x131k step over 900
+# layer-passes; see experiment_artefacts/glm/lps_1062_perf/overlap_design/
+# DESIGN_helmholtz.md). With this gate on, the probs A2A rides a SECOND
+# communicator over the same ranks (created once per EP group, shared by all
+# layers) and both A2As are issued before either wait
+# (all_to_all_deferred/wait_deferred_a2a), so the probs call overlaps the
+# tokens call. The shared-expert fc1 keeps its existing overlap: it is still
+# launched between the issues and the waits (push order matters at
+# CUDA_DEVICE_MAX_CONNECTIONS=1 — every independent op is pushed before the
+# first compute-stream wait).
+#
+# Composition with BT_MOE_DISPATCH_REPLAY_CACHE: this gate consumes only
+# self.input_splits / self.output_splits, which are valid host values at
+# token_dispatch time in every replay-cache mode (normal: D2H'd; hit: restored
+# from the cache with the D2H/event sync skipped; verify: freshly D2H'd). The
+# issue/issue/wait-both ordering adds no dependency on the D2H event.
+#
+# Numerics: bitwise-safe. Both collectives move bytes verbatim; the second
+# communicator carries the identical messages the EP communicator would.
+#
+# Backward: each deferred A2A's backward is the status-quo reverse all-to-all
+# (issued and waited inline, on its own communicator — the probs reverse no
+# longer serializes between the two token reverses on the EP communicator's
+# stream when CUDA_DEVICE_MAX_CONNECTIONS > 1; at =1 the backward timing is
+# unchanged because the probs-reverse wait head-of-line-blocks the tokens
+# reverse issue).
+#
+# Telemetry (WARNING level; logger.info from megatron.core does not reach
+# trainer_srun.log): one-time gate-state line, one-time armed line when the
+# second communicator is created, and per-window issue counters every 300
+# gated dispatches (~1 step at 75 MoE layers x 4 microbatches) for the first
+# 100 windows. A present-but-inert patch is never silent: gate ON with EP=1
+# (no all-to-all at all) logs armed=NO once.
+# ----------------------------------------------------------------------------
+
+_PROBS_A2A_COMM_GATE_LOGGED = [False]
+_PROBS_A2A_COMM_ARMED_LOGGED = [False]
+_PROBS_A2A_COMM_STATS = {"token_issues": 0, "probs_issues": 0, "waits": 0}
+_PROBS_A2A_COMM_WINDOW = [0, 0]  # [gated dispatches this window, windows logged]
+_PROBS_A2A_COMM_WINDOW_SIZE = 300
+_PROBS_A2A_COMM_WINDOW_LOG_MAX = 100
+
+
+def _probs_a2a_comm_enabled() -> bool:
+    """Lazy env-gate read (per-call; negligible at ~1 call/layer-pass).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_MOE_PROBS_A2A_COMM", "0") == "1"
+    if not _PROBS_A2A_COMM_GATE_LOGGED[0]:
+        _PROBS_A2A_COMM_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning(
+                "BT_MOE_PROBS_A2A_COMM=1: MoE probs all-to-all on a second communicator ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_MOE_PROBS_A2A_COMM present but DISABLED (env unset or != '1'); "
+                "probs all-to-all stays serialized behind the tokens all-to-all"
+            )
+    return enabled
+
+
+def _probs_a2a_comm_note_dispatch():
+    """Per-window issue telemetry (WARNING so it reaches trainer logs)."""
+    _PROBS_A2A_COMM_STATS["token_issues"] += 1
+    _PROBS_A2A_COMM_STATS["probs_issues"] += 1
+    _PROBS_A2A_COMM_STATS["waits"] += 2
+    _PROBS_A2A_COMM_WINDOW[0] += 1
+    if _PROBS_A2A_COMM_WINDOW[0] >= _PROBS_A2A_COMM_WINDOW_SIZE:
+        _PROBS_A2A_COMM_WINDOW[0] = 0
+        _PROBS_A2A_COMM_WINDOW[1] += 1
+        if _PROBS_A2A_COMM_WINDOW[1] <= _PROBS_A2A_COMM_WINDOW_LOG_MAX:
+            logger.warning(
+                "BT_MOE_PROBS_A2A_COMM window %d (%d gated dispatches): %s",
+                _PROBS_A2A_COMM_WINDOW[1],
+                _PROBS_A2A_COMM_WINDOW_SIZE,
+                dict(_PROBS_A2A_COMM_STATS),
+            )
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -758,6 +851,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     # DtoH copies are performed on this stream for overlapping with the main stream.
     cuda_dtoh_stream = None
 
+    # BT_MOE_PROBS_A2A_COMM: second communicator over the EP ranks carrying the
+    # probs all-to-all. Class-level and created once per EP group (the
+    # pg_collection EP group is shared by all layers), mirroring
+    # cuda_dtoh_stream; torch.distributed.new_group is a world-wide collective,
+    # so creation happens at model build on every rank at the same point (the
+    # first MoE layer's dispatcher __init__).
+    _probs_a2a_group = None
+    _probs_a2a_group_parent = None
+
     def __init__(
         self,
         num_local_experts: int,
@@ -839,6 +941,35 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_dtoh_point = "before_ep_alltoall"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
+
+        # BT_MOE_PROBS_A2A_COMM: create/reuse the second communicator for the
+        # probs all-to-all. EP=1 bypasses the all-to-all entirely, so the gate
+        # is armed but pointless there (logged once, no communicator created).
+        self._probs_a2a_comm = None
+        if _probs_a2a_comm_enabled():
+            if self.ep_size > 1:
+                if MoEAlltoAllTokenDispatcher._probs_a2a_group is None:
+                    MoEAlltoAllTokenDispatcher._probs_a2a_group = torch.distributed.new_group(
+                        torch.distributed.get_process_group_ranks(self.ep_group)
+                    )
+                    MoEAlltoAllTokenDispatcher._probs_a2a_group_parent = self.ep_group
+                    if not _PROBS_A2A_COMM_ARMED_LOGGED[0]:
+                        _PROBS_A2A_COMM_ARMED_LOGGED[0] = True
+                        logger.warning(
+                            "BT_MOE_PROBS_A2A_COMM: armed — second communicator created over "
+                            "%d EP ranks (shared by all MoE layers)",
+                            self.ep_size,
+                        )
+                assert MoEAlltoAllTokenDispatcher._probs_a2a_group_parent is self.ep_group, (
+                    "BT_MOE_PROBS_A2A_COMM: dispatcher EP group changed after the probs "
+                    "communicator was created — unsupported"
+                )
+                self._probs_a2a_comm = MoEAlltoAllTokenDispatcher._probs_a2a_group
+            elif not _PROBS_A2A_COMM_ARMED_LOGGED[0]:
+                _PROBS_A2A_COMM_ARMED_LOGGED[0] = True
+                logger.warning(
+                    "BT_MOE_PROBS_A2A_COMM: armed=NO — EP size is 1, no all-to-all to move"
+                )
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
@@ -1087,6 +1218,36 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        if self._probs_a2a_comm is not None:
+            # BT_MOE_PROBS_A2A_COMM: issue both all-to-alls before waiting
+            # either. The probs A2A rides the second communicator so its
+            # latency-bound call overlaps the tokens A2A instead of
+            # serializing behind it on the EP communicator's stream. The
+            # shared-expert fc1 stays between the issues and the waits so its
+            # launch is not blocked by a compute-stream wait at
+            # CUDA_DEVICE_MAX_CONNECTIONS=1.
+            # Forward launch order: tokens A2A issue -> probs A2A issue (comm 2)
+            #   -> shared experts fc1 -> wait tokens -> wait probs
+            # Backward launch order: probs A2A reverse (comm 2) -> tokens A2A
+            #   reverse -> shared experts fc1 (as upstream).
+            global_input_tokens = all_to_all_deferred(
+                self.ep_group,
+                permutated_local_input_tokens,
+                self.output_splits,
+                self.input_splits,
+            )
+            global_probs = all_to_all_deferred(
+                self._probs_a2a_comm,
+                permuted_probs,
+                self.output_splits,
+                self.input_splits,
+            )
+            if self.shared_experts is not None:
+                self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
+            wait_deferred_a2a(global_input_tokens)
+            wait_deferred_a2a(global_probs)
+            _probs_a2a_comm_note_dispatch()
+            return global_input_tokens, global_probs
         global_input_tokens = all_to_all(
             self.ep_group,
             permutated_local_input_tokens,

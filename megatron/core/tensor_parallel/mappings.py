@@ -484,6 +484,127 @@ class _AllToAll(torch.autograd.Function):
         )
 
 
+# ----------------------------------------------------------------------------
+# BT_MOE_PROBS_A2A_COMM support — deferred-wait all-to-all.
+#
+# `_AllToAll` with use_nccl_stream=True issues the collective with
+# async_op=True and immediately calls work.wait(), i.e. the compute stream is
+# made to wait for the NCCL stream before the next op is launched. The MoE
+# alltoall dispatcher issues TWO all-to-alls per dispatch (tokens, then
+# probs); because both ride the same communicator they serialize on its
+# internal NCCL stream, and the latency-bound probs call (~5.7 ms for ~66 KB
+# f32 at GLM-5.2 EP16/131k) sits fully exposed between the tokens A2A and the
+# expert sort/GEMM that consumes both.
+#
+# `_AllToAllDeferredWait` splits issue from wait: forward only *issues* the
+# collective (async_op=True, no wait) and stashes the work handle on the
+# output tensor as `_deferred_a2a_work`; the caller launches other independent
+# work (a second A2A on a second communicator, the shared-expert fc1) and then
+# calls `wait_deferred_a2a` to enqueue the compute-stream wait. With both A2As
+# issued before either wait, the probs A2A (own communicator/stream) overlaps
+# the tokens A2A; the shared-expert fc1 keeps its existing overlap because it
+# is still launched before any compute-stream wait (push order matters at
+# CUDA_DEVICE_MAX_CONNECTIONS=1: every independent op must be pushed before
+# the first stream wait).
+#
+# Backward is identical to `_AllToAll.backward` (reverse all-to-all with
+# swapped splits, issued and waited inline): the downstream consumers of the
+# input grad are not wait-aware, so the wait cannot be deferred there.
+# ----------------------------------------------------------------------------
+
+# Attribute on the output tensor carrying the async work handle.
+_DEFERRED_A2A_WORK_ATTR = "_deferred_a2a_work"
+
+
+class _AllToAllDeferredWait(torch.autograd.Function):
+    """All-to-all issued asynchronously; the compute-stream wait is deferred
+    to a later `wait_deferred_a2a` call on the returned tensor."""
+
+    @staticmethod
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+        """Issue the all-to-all with async_op=True and stash the work handle."""
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+
+        world_size = group.size()
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input
+
+        input = input.contiguous()
+        if output_split_sizes is None:
+            # Equal split (all2all)
+            output = torch.empty_like(input)
+        else:
+            # Unequal split (all2all-v). new_empty inherits input's device
+            # (unlike _AllToAll's explicit torch.cuda.current_device()) so the
+            # op stays device-agnostic and CPU-testable; on the dispatcher
+            # path input is already on the rank's current CUDA device.
+            output = input.new_empty(
+                size=[sum(output_split_sizes)] + list(input.size()[1:]),
+                dtype=input.dtype,
+            )
+        work = torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=True,
+        )
+        # Hand the handle to the caller on the tensor itself: autograd
+        # Function outputs must be tensors, and the wait has no gradient
+        # semantics (identity), so it intentionally stays outside the graph.
+        setattr(output, _DEFERRED_A2A_WORK_ATTR, work)
+        return output
+
+    @staticmethod
+    def backward(ctx, *grad_output):
+        """Reverse all-to-all (swapped splits), issued and waited inline.
+
+        Same semantics as `_AllToAll.backward` but self-contained (no
+        torch.cuda.current_device() in the allocation) so the op stays
+        device-agnostic and CPU-testable.
+        """
+        (grad,) = grad_output
+        if ctx.group.size() == 1:
+            return None, grad, None, None
+        grad = grad.contiguous()
+        if ctx.input_split_sizes is None:
+            grad_input = torch.empty_like(grad)
+        else:
+            grad_input = grad.new_empty(
+                size=[sum(ctx.input_split_sizes)] + list(grad.size()[1:]),
+                dtype=grad.dtype,
+            )
+        work = torch.distributed.all_to_all_single(
+            grad_input,
+            grad,
+            output_split_sizes=ctx.input_split_sizes,
+            input_split_sizes=ctx.output_split_sizes,
+            group=ctx.group,
+            async_op=True,
+        )
+        work.wait()
+        return None, grad_input, None, None
+
+
+def wait_deferred_a2a(tensor):
+    """Enqueue the compute-stream wait for a tensor from `_AllToAllDeferredWait`.
+
+    Host-non-blocking (for NCCL, work.wait() only makes the current stream
+    wait on the communicator's internal stream). No-op for tensors without a
+    deferred work handle (e.g. the world_size == 1 bypass). Safe to call at
+    most once per issue; the handle is dropped after waiting.
+    """
+    work = getattr(tensor, _DEFERRED_A2A_WORK_ATTR, None)
+    if work is not None:
+        work.wait()
+        setattr(tensor, _DEFERRED_A2A_WORK_ATTR, None)
+    return tensor
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -561,6 +682,16 @@ def all_to_all(
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
     return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
+
+
+def all_to_all_deferred(group, input_, output_split_sizes_=None, input_split_sizes=None):
+    """Wrapper for the deferred-wait all-to-all (BT_MOE_PROBS_A2A_COMM).
+
+    Returns the output tensor with the async work handle attached; the caller
+    must call `wait_deferred_a2a` on it before any compute-stream consumer.
+    """
+    assert group is not None, "group should not be None"
+    return _AllToAllDeferredWait.apply(group, input_, output_split_sizes_, input_split_sizes)
 
 
 def all_to_all_sp2hp(input_, group=None):
