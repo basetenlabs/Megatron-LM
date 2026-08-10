@@ -11,6 +11,11 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.lookahead_checkpoint import (
+    lookahead_check_config_once as _lookahead_check_config_once,
+    lookahead_checkpoint,
+    lookahead_recompute_enabled as _lookahead_checkpoint_enabled,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -222,9 +227,26 @@ def checkpointed_forward(
             # Mark the first pass / recompute replay for the gated MoE
             # dispatcher replay-metadata cache (no-op when the gate is off).
             cf = _wrap_checkpoint_chunk_pass(cf, packed_seq_params)
+            if _lookahead_checkpoint_enabled():
+                # BT_MOE_LOOKAHEAD_RECOMPUTE: cross-layer lookahead recompute.
+                # The chunk key is the chunk's global layer index (uniform) or
+                # first layer (block); the registry lives on the
+                # packed_seq_params carrier. Dropout must be off: the kick's
+                # RNG fork/restore is host-atomic on the autograd thread, but
+                # production runs dropout=0 and we keep it that way by assert.
+                _lookahead_check_config_once(self.config)
+                hidden_states, context = lookahead_checkpoint(
+                    cf,
+                    self.config.distribute_saved_activations,
+                    # All-positional, signature order: keywords before *args
+                    # collide with the positional fill (TypeError at boot).
+                    start + layer_offset,  # chunk_key
+                    packed_seq_params,  # carrier
+                    *args,
+                )
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
-            if self.config.fp8 or self.config.fp4:
+            elif self.config.fp8 or self.config.fp4:
                 hidden_states, context = te_checkpoint(
                     cf,
                     self.config.distribute_saved_activations,
