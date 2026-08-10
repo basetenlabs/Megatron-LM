@@ -20,6 +20,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_cudnn_kernels,
     dsa_indexer_loss,
     dsa_kernels,
     dsa_layout,
@@ -193,6 +194,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    nonempty_probe_v3=None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -220,6 +222,7 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
+                nonempty_probe_v3=nonempty_probe_v3,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
@@ -2349,6 +2352,15 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        # BT_DSA_BWD_ASYNC_NONEMPTY_V3: first-pass-anchored nonempty probe.
+        # At this plain-function level torch.is_grad_enabled() truthfully
+        # discriminates the passes: False in the checkpoint first pass (kick +
+        # stash on the per-microbatch carrier keyed by layer_number), True in
+        # the recompute replay (pop + pass down so the backward's ctx
+        # references the first-pass probe — complete long before the read).
+        nonempty_probe_v3 = dsa_cudnn_kernels._v3_probe_for_pass(
+            packed_seq_params, self.layer_number, topk_length
+        )
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
@@ -2360,6 +2372,7 @@ class DSAttention(MegatronModule):
             softmax_scale=self.softmax_scale,
             config=self.config,
             mask=float_mask,
+            nonempty_probe_v3=nonempty_probe_v3,
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
