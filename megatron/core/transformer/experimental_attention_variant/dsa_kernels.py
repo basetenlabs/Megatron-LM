@@ -208,12 +208,21 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    nonempty_probe_v3=None,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    # BT_DSA_BWD_ASYNC_NONEMPTY_V3: pass the first-pass probe only when present
+    # — backends that predate this kwarg see a byte-identical call otherwise.
+    if nonempty_probe_v3 is not None:
+        result = fn(
+            query, key, topk_indices, softmax_scale, v_channels, topk_length,
+            nonempty_probe_v3=nonempty_probe_v3,
+        )
+    else:
+        result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
