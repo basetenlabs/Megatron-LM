@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -25,6 +27,227 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# BT_MOE_ROUTING_REPLAY_FORCE (env-gated, default OFF) — FIX C-prime.
+#
+# Motivating evidence (ARM-1 verify failure, 2026-08-09, deterministic 2/2):
+# BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY failed on
+# num_tokens_per_local_expert_dev at routing_shape (8192, 256) in the 131k
+# boot warmup replay — the recompute replay's routing_map is NOT bitwise-equal
+# to the first pass's on this stack (grad-mode kernel/algo selection upstream
+# of the router — TE/FP8 activation-caching variants under enable_grad — drifts
+# the replay's hidden states at ULP level, and boundary tokens flip topk).
+#
+# C-prime makes the replay's routing DECISION bitwise-identical to the first
+# pass BY CONSTRUCTION instead of by assumption: the first pass stashes its
+# routing_map on the per-microbatch packed_seq_params carrier (via the FIX C
+# checkpoint-pass frames) keyed by id(router) — NOT layer_number: MTP routers
+# reuse main-stack layer numbers, so a layer_number key collides across router
+# instances (the id() discipline matches FIX C's id(dispatcher) keying; the
+# router object is the same across a microbatch's first pass and replay, and
+# the stash dies with the microbatch carrier, so id() reuse after GC is not
+# reachable); the replay pops it and masks
+# its own recomputed logits with -inf on every unsaved (token, expert) pair
+# before the score function, so the top-k selection is forced to the saved
+# set. The returned routing_map IS the saved map (bitwise); the probs are
+# recomputed from the replay's masked logits — grad-connected, so the
+# router-path term in dL/d(hidden_states) is preserved exactly as in the
+# status-quo replay (consuming detached saved probs would drop it — a
+# structural grad change, not ULP; rejected). Rows with no saved entries
+# (THD padding) are left unmasked (their routing_map is all-False either way
+# and their probs are never gathered), avoiding all-(-inf) NaN rows.
+#
+# The dispatcher's replay-metadata cache (FIX C) then works unchanged: the
+# replay's routing_map bitwise-equals the first pass's, so the cached split
+# metadata is exact by construction. The router GEMM still runs in the replay
+# (logits are needed for the grad-connected probs) — the win is the metadata
+# path (all-gather + D2H + event sync), exactly as FIX C intended.
+#
+# Fallbacks (loud, counted): aux/z-loss enabled (the -inf mask would perturb
+# loss-term computations on the logits — off in the ship config); replay with
+# no saved map (miss); saved-map shape mismatch. Gate off or no checkpoint
+# frame (eval / non-recompute training): byte-identical status-quo path.
+#
+# Telemetry (WARNING level): one-time gate-state line, one-time armed line,
+# one-time first-force line, per-window counters every 312 replay passes
+# (~1 step at 78 layers x 4 mb): stashes / forces / misses / shape_mismatches
+# / verify_asserts, plus in-flight stash bytes (2 MB per entry; the peak must
+# plateau at layers x in-flight microbatches — entries are popped on replay
+# fetch and otherwise die with their microbatch carrier, so growth across
+# steps would mean a leak).
+# ----------------------------------------------------------------------------
+
+_ROUTING_FORCE_GATE_LOGGED = [False]
+_ROUTING_FORCE_ARMED_LOGGED = [False]
+_ROUTING_FORCE_HIT_LOGGED = [False]
+_ROUTING_FORCE_LOSS_DISABLED = [False]
+_ROUTING_FORCE_STATS = {
+    "stashes": 0,
+    "forces": 0,
+    "misses": 0,
+    "shape_mismatches": 0,
+    "verify_asserts": 0,
+}
+_ROUTING_FORCE_WINDOW = [0, 0]  # [replay passes this window, windows logged]
+_ROUTING_FORCE_WINDOW_SIZE = 312
+_ROUTING_FORCE_LOG_MAX = 100
+_ROUTING_FORCE_STASH_ATTR = "_moe_routing_replay_force"
+_ROUTING_FORCE_BYTES = [0]  # in-flight stash bytes (bool = 1 byte/elem)
+_ROUTING_FORCE_BYTES_PEAK = [0]
+
+
+def _routing_force_enabled() -> bool:
+    """Lazy env-gate read (per-call; ~1 call/layer-pass).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_MOE_ROUTING_REPLAY_FORCE", "0") == "1"
+    if not _ROUTING_FORCE_GATE_LOGGED[0]:
+        _ROUTING_FORCE_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning(
+                "BT_MOE_ROUTING_REPLAY_FORCE=1: recompute-replay routing forced to the "
+                "first-pass decision (FIX C-prime) ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_MOE_ROUTING_REPLAY_FORCE present but DISABLED (env unset or != '1'); "
+                "the replay recomputes routing"
+            )
+    return enabled
+
+
+def _routing_force_loss_disabled(router) -> bool:
+    """True (once, loud) when z-loss/aux-loss make the -inf mask unsafe."""
+    if _ROUTING_FORCE_LOSS_DISABLED[0]:
+        return True
+    if router.config.moe_z_loss_coeff is not None or router.is_aux_loss_enabled():
+        _ROUTING_FORCE_LOSS_DISABLED[0] = True
+        logger.warning(
+            "BT_MOE_ROUTING_REPLAY_FORCE: armed=NO — moe_z_loss_coeff or an aux loss is "
+            "enabled; the -inf logit mask would perturb loss-term computations. "
+            "Status-quo replay routing."
+        )
+        return True
+    return False
+
+
+def _routing_force_note_pass():
+    """Per-window replay-pass telemetry (WARNING so it reaches trainer logs)."""
+    _ROUTING_FORCE_WINDOW[0] += 1
+    if _ROUTING_FORCE_WINDOW[0] >= _ROUTING_FORCE_WINDOW_SIZE:
+        _ROUTING_FORCE_WINDOW[0] = 0
+        _ROUTING_FORCE_WINDOW[1] += 1
+        if _ROUTING_FORCE_WINDOW[1] <= _ROUTING_FORCE_LOG_MAX:
+            logger.warning(
+                "BT_MOE_ROUTING_REPLAY_FORCE window %d (%d replay passes): %s; "
+                "in-flight stash %.1f MB (peak %.1f MB)",
+                _ROUTING_FORCE_WINDOW[1],
+                _ROUTING_FORCE_WINDOW_SIZE,
+                dict(_ROUTING_FORCE_STATS),
+                _ROUTING_FORCE_BYTES[0] / 1e6,
+                _ROUTING_FORCE_BYTES_PEAK[0] / 1e6,
+            )
+
+
+def _routing_force_frame():
+    """Innermost FIX C checkpoint-pass frame on this thread, or None.
+
+    Lazy import: megatron.core.recompute imports the transformer layer stack,
+    which leads back here — a module-level import would cycle.
+    """
+    from megatron.core.recompute import current_checkpoint_pass_frame
+
+    return current_checkpoint_pass_frame()
+
+
+def _routing_force_replay_saved_map(router):
+    """Replay: pop this layer's saved first-pass routing_map, or None.
+
+    None means 'route normally' (gate off, loss-terms on, no frame, first
+    pass, or a miss/shape fallback). The pop is one-shot: the entry dies here
+    or with the microbatch carrier.
+    """
+    if not _routing_force_enabled() or _routing_force_loss_disabled(router):
+        return None
+    frame = _routing_force_frame()
+    if frame is None or not frame.is_replay:
+        return None
+    stash = getattr(frame.key_obj, _ROUTING_FORCE_STASH_ATTR, None)
+    saved = stash.pop(id(router), None) if stash is not None else None
+    _routing_force_note_pass()
+    if saved is None:
+        _ROUTING_FORCE_STATS["misses"] += 1
+        logger.warning(
+            "BT_MOE_ROUTING_REPLAY_FORCE: replay found no saved routing_map for layer "
+            "%s — routing freely for this pass (status quo)",
+            getattr(router, "layer_number", None),
+        )
+        return None
+    _ROUTING_FORCE_BYTES[0] -= saved.numel()
+    _ROUTING_FORCE_STATS["forces"] += 1
+    if not _ROUTING_FORCE_HIT_LOGGED[0]:
+        _ROUTING_FORCE_HIT_LOGGED[0] = True
+        # Informational config check (the hybrid preserves router grads
+        # regardless — this documents the ship-config assumption).
+        trainable = [n for n, p in router.named_parameters() if p.requires_grad]
+        logger.warning(
+            "BT_MOE_ROUTING_REPLAY_FORCE: first replay force — saved first-pass "
+            "routing_map consumed; router params trainable=%s (assumed frozen under "
+            "attention-only LoRA; the hybrid preserves router grads either way)",
+            trainable if trainable else "none",
+        )
+    return saved
+
+
+def _routing_force_stash(router, routing_map):
+    """First pass: stash this layer's routing_map on the microbatch carrier."""
+    if not _routing_force_enabled() or _ROUTING_FORCE_LOSS_DISABLED[0]:
+        return
+    frame = _routing_force_frame()
+    if frame is None or frame.is_replay:
+        return
+    stash = getattr(frame.key_obj, _ROUTING_FORCE_STASH_ATTR, None)
+    if stash is None:
+        stash = {}
+        setattr(frame.key_obj, _ROUTING_FORCE_STASH_ATTR, stash)
+    stash[id(router)] = routing_map
+    _ROUTING_FORCE_BYTES[0] += routing_map.numel()
+    if _ROUTING_FORCE_BYTES[0] > _ROUTING_FORCE_BYTES_PEAK[0]:
+        _ROUTING_FORCE_BYTES_PEAK[0] = _ROUTING_FORCE_BYTES[0]
+    _ROUTING_FORCE_STATS["stashes"] += 1
+    if not _ROUTING_FORCE_ARMED_LOGGED[0]:
+        _ROUTING_FORCE_ARMED_LOGGED[0] = True
+        logger.warning(
+            "BT_MOE_ROUTING_REPLAY_FORCE: armed — first routing_map stashed on the carrier"
+        )
+
+
+def _routing_force_verify_set_equality(router, recomputed_map, saved_map):
+    """Verify mode (BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY=1): per-token, the
+    masked-topk output set must equal the saved set EXACTLY. Ties among the
+    selected are impossible (unselected are -inf); assert anyway. Rows with no
+    saved entries (padding) are exempt (left unmasked)."""
+    if os.environ.get("BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY", "0") != "1":
+        return
+    has_any = saved_map.any(dim=1)
+    per_row_equal = (recomputed_map == saved_map).all(dim=1)
+    mismatched = (~per_row_equal) & has_any
+    _ROUTING_FORCE_STATS["verify_asserts"] += 1
+    if mismatched.any():
+        rows = mismatched.nonzero().reshape(-1)[:8].tolist()
+        raise RuntimeError(
+            "BT_MOE_ROUTING_REPLAY_FORCE verify: the masked-topk selection differs from "
+            f"the saved routing_map on layer {getattr(router, 'layer_number', None)} "
+            f"in {int(mismatched.sum().item())} token rows (first={rows}) — the forcing "
+            "is broken; do NOT enable BT_MOE_ROUTING_REPLAY_FORCE"
+        )
 
 
 class Router(ABC, MegatronModule):
@@ -734,7 +957,48 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
+        # BT_MOE_ROUTING_REPLAY_FORCE (FIX C-prime): in the recompute replay,
+        # force the top-k selection to the first pass's saved routing_map by
+        # masking unsaved logits with -inf (the probs recompute grad-connected
+        # from the replay's logits — the router-path activation grad is
+        # preserved). Rows with no saved entries (padding) stay unmasked so
+        # their score function never sees an all-(-inf) row.
+        saved_map = _routing_force_replay_saved_map(self)
+        if saved_map is not None:
+            # routing() flattens logits to [-1, num_experts] internally; the
+            # saved map is [tokens, experts] — compare on numel/last-dim and
+            # reshape for the mask.
+            if saved_map.numel() != logits.numel() or saved_map.size(-1) != logits.size(-1):
+                _ROUTING_FORCE_STATS["shape_mismatches"] += 1
+                logger.warning(
+                    "BT_MOE_ROUTING_REPLAY_FORCE: saved routing_map shape %s incompatible "
+                    "with logits shape %s on layer %s — routing freely for this pass "
+                    "(status quo)",
+                    tuple(saved_map.shape),
+                    tuple(logits.shape),
+                    getattr(self, "layer_number", None),
+                )
+                saved_map = None
+            else:
+                # Reshape for the mask only — the returned/stashed map keeps
+                # its [tokens, experts] form (routing() flattens logits).
+                mask = (~saved_map).reshape(logits.shape)
+                has_any = saved_map.any(dim=-1).reshape(
+                    logits.shape[:-1] + (1,)
+                )  # per token row
+                logits = logits.masked_fill(mask & has_any, float("-inf"))
+
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+
+        if saved_map is not None:
+            _routing_force_verify_set_equality(self, routing_map, saved_map)
+            # Return the saved map itself: the dispatch decision is bitwise the
+            # first pass's by construction (the recomputed map must equal it —
+            # asserted in verify mode).
+            routing_map = saved_map
+        else:
+            # First pass (or an unforced pass): stash this layer's decision.
+            _routing_force_stash(self, routing_map)
 
         return probs, routing_map
 

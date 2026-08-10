@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
+import threading
 from contextlib import nullcontext
 from typing import List, Optional, Set, Tuple, Union
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -16,6 +19,112 @@ te_checkpoint = None
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
+
+
+# ----------------------------------------------------------------------------
+# BT_MOE_DISPATCH_REPLAY_CACHE support — checkpoint-pass frames (env-gated,
+# default OFF; the gate is read by the consumer, MoEAlltoAllTokenDispatcher).
+#
+# Full recompute runs every checkpointed chunk twice: a no-grad first pass
+# (inside the checkpoint Function's forward — always no-grad by the torch
+# invariant that autograd.Function.forward runs under no-grad) and, later, a
+# grad-enabled recompute replay (inside its backward, under enable_grad). The
+# replay recomputes the MoE dispatcher's routing-derived split metadata
+# bit-identically, so the dispatcher can reuse the first pass's host splits
+# instead of re-running the tp_ep all-gather + D2H + event sync — IF it can
+# tell the two passes apart and key metadata to the right microbatch.
+#
+# The machinery below marks each pass. `_CheckpointChunkPassMarker` wraps the
+# chunk's run_function before it is handed to the checkpoint implementation
+# (mcore's tensor_parallel.checkpoint or TE's te_checkpoint — wrapping here
+# covers both, and any future checkpoint backend that re-runs run_function
+# under enable_grad in backward). The marker is a plain callable, NOT an
+# autograd.Function, so torch.is_grad_enabled() inside it truthfully
+# discriminates the passes (False = first pass, True = replay). Each call
+# pushes a CheckpointPassFrame onto a thread-local stack for the duration of
+# the pass; the first pass runs on the main thread, the replay on the
+# autograd worker thread, and the two never share a stack.
+#
+# The frame's key_obj is the microbatch's packed_seq_params carrier when
+# present (the same per-microbatch lifetime pattern as the DSA top-k holder
+# and the BT_DSA_CP_LAYOUT_CACHE — the object is closure-captured by the
+# chunk's custom_forward and is therefore identical in both passes), falling
+# back to the marker instance itself (held alive by the checkpoint context
+# from first pass through backward). Consumers key per-layer state on
+# (key_obj, id(self)); entries stored on the key_obj die with the microbatch,
+# so no stale read can cross a step boundary.
+# ----------------------------------------------------------------------------
+
+
+class CheckpointPassFrame:
+    """One checkpointed chunk pass: first pass (is_replay=False) or replay (True).
+
+    scratch is a per-pass, per-thread scratchpad keyed by id(consumer) so a
+    consumer can hand state between its own call sites within the pass without
+    writing to shared instance attributes (which the main and autograd threads
+    may touch concurrently for different microbatches).
+    """
+
+    __slots__ = ("is_replay", "key_obj", "scratch")
+
+    def __init__(self, is_replay: bool, key_obj):
+        self.is_replay = is_replay
+        self.key_obj = key_obj
+        self.scratch = {}
+
+
+_replay_pass_local = threading.local()
+
+
+def _replay_pass_stack() -> list:
+    stack = getattr(_replay_pass_local, "stack", None)
+    if stack is None:
+        stack = _replay_pass_local.stack = []
+    return stack
+
+
+def current_checkpoint_pass_frame() -> Optional[CheckpointPassFrame]:
+    """Return the innermost checkpoint-pass frame on this thread, or None.
+
+    None means the caller is not inside a wrapped checkpointed chunk (eval,
+    inference, non-recompute training, or the gate is off) and must follow
+    the status-quo path.
+    """
+    stack = _replay_pass_stack()
+    return stack[-1] if stack else None
+
+
+class _CheckpointChunkPassMarker:
+    """Wraps a checkpointed chunk's run_function; executes in both passes.
+
+    Pushes a CheckpointPassFrame for the duration of each call. is_replay is
+    torch.is_grad_enabled() at call time: False in the no-grad first pass,
+    True in the enable_grad recompute replay.
+    """
+
+    def __init__(self, fn, packed_seq_params):
+        self.fn = fn
+        self.packed_seq_params = packed_seq_params
+
+    def __call__(self, *args, **kwargs):
+        key_obj = self.packed_seq_params if self.packed_seq_params is not None else self
+        _replay_pass_stack().append(CheckpointPassFrame(torch.is_grad_enabled(), key_obj))
+        try:
+            return self.fn(*args, **kwargs)
+        finally:
+            _replay_pass_stack().pop()
+
+
+def _wrap_checkpoint_chunk_pass(fn, packed_seq_params):
+    """Wrap a checkpointed chunk's run_function with the pass marker.
+
+    No-op unless BT_MOE_DISPATCH_REPLAY_CACHE=1 (default OFF): with the gate
+    off the checkpoint receives the unwrapped function, no frames exist, and
+    the code path is byte-identical to upstream.
+    """
+    if os.environ.get("BT_MOE_DISPATCH_REPLAY_CACHE", "0") != "1":
+        return fn
+    return _CheckpointChunkPassMarker(fn, packed_seq_params)
 
 
 def checkpointed_forward(
@@ -110,6 +219,9 @@ def checkpointed_forward(
         cf = custom(start, end)
         args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
         if use_checkpoint:
+            # Mark the first pass / recompute replay for the gated MoE
+            # dispatcher replay-metadata cache (no-op when the gate is off).
+            cf = _wrap_checkpoint_chunk_pass(cf, packed_seq_params)
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
             if self.config.fp8 or self.config.fp4:

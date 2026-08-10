@@ -5,6 +5,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core import utils
@@ -53,6 +54,384 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# BT_MOE_DISPATCH_REPLAY_CACHE (env-gated, default OFF)
+#
+# Under full recompute, every MoE layer-microbatch runs this dispatcher twice:
+# the no-grad first pass and the grad-enabled recompute replay. The replay
+# recomputes routing_map bit-identically (recompute is deterministic by
+# design: same inputs, same restored RNG state), so the split metadata the
+# dispatcher derives from it — input_splits / output_splits / output_splits_tp
+# / num_out_tokens / tokens_per_expert / num_global_tokens_per_local_expert —
+# is also bit-identical. The first pass produces those values anyway (16-rank
+# all-gather over tp_ep in preprocess, then a side-stream D2H + deferred
+# d2h_event.synchronize()); the replay re-derives them at full cost
+# (measured 300 replay event-syncs = 23.7s CPU per 4x131k step, plus 300
+# replay all-gathers; see experiment_artefacts/glm/lps_1062_perf/
+# dispatcher_opt/). With this gate on, the first pass stores the metadata and
+# the replay reuses it, skipping the replay all-gather, D2H copies, and event
+# sync entirely. Skipping the all-gather is collective-consistent: every rank
+# replays the same layers in the same order, so no rank waits on a skipped
+# collective.
+#
+# Pass classification and microbatch keying come from the checkpoint-pass
+# frames in megatron/core/recompute.py (the marker wraps the checkpointed
+# chunk's run_function, so it works for both mcore's CheckpointFunction and
+# TE's te_checkpoint). The frame's key_obj is the per-microbatch
+# packed_seq_params carrier (identical object in both passes via closure
+# capture), falling back to the marker instance. Entries are stored on the
+# key_obj keyed by id(dispatcher) — one entry per layer per microbatch — and
+# popped on first replay use, so they can never outlive their microbatch and
+# no stale entry can cross a step (or grad-accumulation) boundary. Any number
+# of microbatches in flight is supported; the first pass (main thread) and
+# replays (autograd thread) never share a frame stack or a carrier.
+#
+# SAFETY:
+# * BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY=1 (requires the main gate): on every
+#   replay, recompute the metadata at full cost AND assert bitwise equality
+#   with the cached entry (raises on mismatch). Validation soaks only — this
+#   mode keeps the replay's all-gather + D2H + event sync and adds compares.
+# * Any key miss or routing_map shape mismatch on a replay falls back to the
+#   status-quo recompute path with a WARNING + counter.
+# * Gate off, or no checkpoint frame (eval / inference / non-recompute
+#   training): the code path is byte-identical to upstream.
+#
+# Telemetry (WARNING level; logger.info from megatron.core does not reach
+# trainer_srun.log): one-time gate-state line, one-time armed / first-hit
+# lines, an immediate WARNING on every fallback, and per-window counters
+# (stores / hits / misses / shape_mismatches / verifies) every 300 replay
+# lookups (~1 step at 75 MoE layers x 4 microbatches) for the first 100
+# windows. A present-but-inert patch is never silent: gate ON with no replay
+# hits shows up as misses.
+# ----------------------------------------------------------------------------
+
+_REPLAY_CACHE_ATTR = "_moe_dispatch_replay_cache"
+_REPLAY_CACHE_GATE_LOGGED = [False]
+_REPLAY_VERIFY_GATE_LOGGED = [False]
+_REPLAY_ARMED_LOGGED = [False]
+_REPLAY_HIT_LOGGED = [False]
+_REPLAY_STATS = {"stores": 0, "hits": 0, "misses": 0, "shape_mismatches": 0, "verifies": 0}
+_REPLAY_WINDOW = [0, 0]  # [replay lookups this window, windows logged]
+_REPLAY_WINDOW_SIZE = 300
+_REPLAY_WINDOW_LOG_MAX = 100
+
+
+def _replay_cache_enabled() -> bool:
+    """Lazy env-gate read (per-call; negligible at ~5 calls/layer-pass).
+
+    Logs the gate state once per process at WARNING level (logger.info from
+    megatron.core does not reach trainer_srun.log) so a present-but-inert
+    patch is never silent.
+    """
+    enabled = os.environ.get("BT_MOE_DISPATCH_REPLAY_CACHE", "0") == "1"
+    if not _REPLAY_CACHE_GATE_LOGGED[0]:
+        _REPLAY_CACHE_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE=1: MoE dispatcher replay-metadata cache ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE present but DISABLED (env unset or != '1'); "
+                "recomputing dispatcher split metadata in the recompute replay"
+            )
+    return enabled
+
+
+def _replay_verify_enabled() -> bool:
+    """Lazy read of the verify-mode gate (requires the main gate to matter)."""
+    verify = os.environ.get("BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY", "0") == "1"
+    if not _REPLAY_VERIFY_GATE_LOGGED[0]:
+        _REPLAY_VERIFY_GATE_LOGGED[0] = True
+        if verify and _replay_cache_enabled():
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY=1: replay-metadata verify mode ACTIVE "
+                "(every replay also recomputes the metadata and asserts bitwise equality; "
+                "validation soaks only — no performance benefit)"
+            )
+        elif verify:
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY=1 ignored: "
+                "BT_MOE_DISPATCH_REPLAY_CACHE is not enabled"
+            )
+    return verify and _replay_cache_enabled()
+
+
+def _current_pass_frame():
+    """Innermost checkpoint-pass frame on this thread, or None.
+
+    Lazy import: megatron.core.recompute imports the transformer layer stack,
+    which leads back to this module — a module-level import would cycle.
+    """
+    from megatron.core.recompute import current_checkpoint_pass_frame
+
+    return current_checkpoint_pass_frame()
+
+
+class _ReplayEntry:
+    """One layer-microbatch of dispatcher split metadata (first-pass values).
+
+    The *_dev fields are the device tensors as produced by preprocess (needed
+    to reproduce the exact instance-state transitions of the status-quo
+    replay); the *_host fields are the post-D2H host values installed at the
+    DtoH point. num_out_tokens_fwd / num_out_tokens_host are python ints in
+    the dropless no-capacity path (the same object serves both slots).
+    """
+
+    __slots__ = (
+        "routing_shape",
+        "input_splits_dev",
+        "output_splits_dev",
+        "output_splits_tp_dev",
+        "num_out_tokens_fwd",
+        "num_tokens_per_local_expert_dev",
+        "num_global_tokens_per_local_expert_dev",
+        "input_splits_host",
+        "output_splits_host",
+        "output_splits_tp_host",
+        "num_out_tokens_host",
+        "tokens_per_expert_host",
+        "num_global_tokens_per_local_expert_host",
+    )
+
+    def __init__(self):
+        for field in self.__slots__:
+            setattr(self, field, None)
+
+
+class _ReplayPassRecord:
+    """Per-(dispatcher, pass) state, kept on the frame's thread-local scratch.
+
+    mode: "store" (first pass — capture at the sync point), "hit" (replay
+    reuse), "fallback" (replay without a usable entry — status-quo path).
+    """
+
+    __slots__ = ("mode", "key_obj", "entry", "verify", "device_vals")
+
+    def __init__(self, mode, key_obj, entry=None, verify=False):
+        self.mode = mode
+        self.key_obj = key_obj
+        self.entry = entry
+        self.verify = verify
+        self.device_vals = None
+
+
+def _replay_note_lookup():
+    """Per-window replay-lookup telemetry (WARNING so it reaches trainer logs)."""
+    _REPLAY_WINDOW[0] += 1
+    if _REPLAY_WINDOW[0] >= _REPLAY_WINDOW_SIZE:
+        _REPLAY_WINDOW[0] = 0
+        _REPLAY_WINDOW[1] += 1
+        if _REPLAY_WINDOW[1] <= _REPLAY_WINDOW_LOG_MAX:
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE window %d (%d replay lookups): %s",
+                _REPLAY_WINDOW[1],
+                _REPLAY_WINDOW_SIZE,
+                dict(_REPLAY_STATS),
+            )
+
+
+def _capture_device_metadata(dispatcher, num_tokens_per_local_expert):
+    """Snapshot the device-side split metadata at the end of preprocess."""
+    return {
+        "input_splits_dev": dispatcher.input_splits,
+        "output_splits_dev": dispatcher.output_splits,
+        "output_splits_tp_dev": dispatcher.output_splits_tp,
+        "num_out_tokens_fwd": dispatcher.num_out_tokens,
+        "num_tokens_per_local_expert_dev": num_tokens_per_local_expert,
+        "num_global_tokens_per_local_expert_dev": getattr(
+            dispatcher, "num_global_tokens_per_local_expert", None
+        ),
+    }
+
+
+def _restore_device_metadata(dispatcher, entry):
+    """Install the cached first-pass device metadata (pre-DtoH state)."""
+    dispatcher.input_splits = entry.input_splits_dev
+    dispatcher.output_splits = entry.output_splits_dev
+    dispatcher.output_splits_tp = entry.output_splits_tp_dev
+    dispatcher.num_out_tokens = entry.num_out_tokens_fwd
+    if entry.num_global_tokens_per_local_expert_dev is not None:
+        dispatcher.num_global_tokens_per_local_expert = (
+            entry.num_global_tokens_per_local_expert_dev
+        )
+
+
+def _values_equal(fresh, cached) -> bool:
+    """Bitwise equality across the metadata value types (tensor/ndarray/int)."""
+    if fresh is None or cached is None:
+        return fresh is None and cached is None
+    if torch.is_tensor(fresh):
+        return (
+            torch.is_tensor(cached)
+            and fresh.shape == cached.shape
+            and fresh.dtype == cached.dtype
+            and torch.equal(fresh, cached)
+        )
+    if isinstance(fresh, np.ndarray):
+        return (
+            isinstance(cached, np.ndarray)
+            and fresh.shape == cached.shape
+            and fresh.dtype == cached.dtype
+            and np.array_equal(fresh, cached)
+        )
+    return type(fresh) is type(cached) and fresh == cached
+
+
+def _verify_device_metadata(dispatcher, entry, num_tokens_per_local_expert):
+    """Verify mode: assert the replay's fresh device metadata matches the cache."""
+    fresh = _capture_device_metadata(dispatcher, num_tokens_per_local_expert)
+    for name, fresh_val in fresh.items():
+        if not _values_equal(fresh_val, getattr(entry, name)):
+            raise RuntimeError(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY: replay device metadata mismatch in "
+                f"{name} on {type(dispatcher).__name__} (routing_shape {entry.routing_shape}): "
+                "the recompute replay did not reproduce the first pass bitwise — "
+                "do NOT enable BT_MOE_DISPATCH_REPLAY_CACHE on this configuration"
+            )
+
+
+def _verify_host_metadata(dispatcher, entry, tokens_per_expert_host):
+    """Verify mode: assert the replay's fresh host metadata matches the cache."""
+    pairs = [
+        ("input_splits", dispatcher.input_splits, entry.input_splits_host),
+        ("output_splits", dispatcher.output_splits, entry.output_splits_host),
+        ("output_splits_tp", dispatcher.output_splits_tp, entry.output_splits_tp_host),
+        ("num_out_tokens", dispatcher.num_out_tokens, entry.num_out_tokens_host),
+        ("tokens_per_expert", tokens_per_expert_host, entry.tokens_per_expert_host),
+    ]
+    if entry.num_global_tokens_per_local_expert_host is not None:
+        pairs.append(
+            (
+                "num_global_tokens_per_local_expert",
+                getattr(dispatcher, "num_global_tokens_per_local_expert", None),
+                entry.num_global_tokens_per_local_expert_host,
+            )
+        )
+    for name, fresh_val, cached_val in pairs:
+        if not _values_equal(fresh_val, cached_val):
+            raise RuntimeError(
+                "BT_MOE_DISPATCH_REPLAY_CACHE_VERIFY: replay host metadata mismatch in "
+                f"{name} on {type(dispatcher).__name__} (routing_shape {entry.routing_shape}): "
+                "the recompute replay did not reproduce the first pass bitwise — "
+                "do NOT enable BT_MOE_DISPATCH_REPLAY_CACHE on this configuration"
+            )
+    _REPLAY_STATS["verifies"] += 1
+
+
+def _store_replay_entry(dispatcher, rec, tokens_per_expert_host):
+    """First pass: stash this layer-microbatch's metadata on the frame's key_obj.
+
+    Called at the sync point, right after d2h_event.synchronize(), when all
+    host values are valid. The entry is popped by the matching replay (at
+    preprocess time) and otherwise dies with the microbatch carrier.
+    """
+    if rec.device_vals is None:
+        # preprocess did not run in this pass (cannot happen in the dispatch
+        # flow); refuse to store rather than stash a partial entry.
+        return
+    entry = _ReplayEntry()
+    entry.routing_shape = tuple(dispatcher.routing_map.shape)
+    for name, val in rec.device_vals.items():
+        setattr(entry, name, val)
+    entry.input_splits_host = dispatcher.input_splits
+    entry.output_splits_host = dispatcher.output_splits
+    entry.output_splits_tp_host = dispatcher.output_splits_tp
+    entry.num_out_tokens_host = dispatcher.num_out_tokens
+    entry.tokens_per_expert_host = tokens_per_expert_host
+    # num_global_tokens_per_local_expert is host-moved at the DtoH point only
+    # in the unfused path (moe_permute_fusion=False); record the host form
+    # only when the status-quo path would have produced one.
+    if dispatcher.num_local_experts > 1 and not dispatcher.config.moe_permute_fusion:
+        entry.num_global_tokens_per_local_expert_host = getattr(
+            dispatcher, "num_global_tokens_per_local_expert", None
+        )
+    store = getattr(rec.key_obj, _REPLAY_CACHE_ATTR, None)
+    if store is None:
+        store = {}
+        setattr(rec.key_obj, _REPLAY_CACHE_ATTR, store)
+    store[id(dispatcher)] = entry
+    _REPLAY_STATS["stores"] += 1
+    if not _REPLAY_ARMED_LOGGED[0]:
+        _REPLAY_ARMED_LOGGED[0] = True
+        logger.warning(
+            "BT_MOE_DISPATCH_REPLAY_CACHE: armed — first replay-metadata entry stored"
+        )
+
+
+def _replay_pass_begin(dispatcher, routing_map):
+    """Classify this dispatcher pass and, on a replay hit, restore the cache.
+
+    Returns the per-pass record (also kept on the frame scratch for the
+    dispatcher's later call sites in the same pass), or None when the gate is
+    off or the pass is not inside a wrapped checkpoint (eval / inference /
+    non-recompute training — status-quo path).
+    """
+    if not _replay_cache_enabled():
+        return None
+    frame = _current_pass_frame()
+    if frame is None:
+        return None
+    rec = frame.scratch.get(id(dispatcher))
+    if rec is not None:
+        # Repeat call within one frame (e.g. a nested MLP-level recompute
+        # replaying inside a block-level replay): re-install the cached state
+        # so the pass is self-consistent.
+        if rec.mode == "hit" and not rec.verify:
+            _restore_device_metadata(dispatcher, rec.entry)
+        return rec
+    if not frame.is_replay:
+        rec = _ReplayPassRecord("store", frame.key_obj)
+        frame.scratch[id(dispatcher)] = rec
+        return rec
+    # Replay pass: consume the entry the matching first pass stored.
+    store = getattr(frame.key_obj, _REPLAY_CACHE_ATTR, None)
+    entry = store.pop(id(dispatcher), None) if store is not None else None
+    if entry is None:
+        rec = _ReplayPassRecord("fallback", frame.key_obj)
+        _REPLAY_STATS["misses"] += 1
+        logger.warning(
+            "BT_MOE_DISPATCH_REPLAY_CACHE: replay cache MISS on %s — falling back to the "
+            "recompute path (all-gather + D2H + event sync) for this pass",
+            type(dispatcher).__name__,
+        )
+    elif entry.routing_shape != tuple(routing_map.shape):
+        rec = _ReplayPassRecord("fallback", frame.key_obj)
+        _REPLAY_STATS["shape_mismatches"] += 1
+        logger.warning(
+            "BT_MOE_DISPATCH_REPLAY_CACHE: routing_map shape %s != cached %s on %s — "
+            "falling back to the recompute path",
+            tuple(routing_map.shape),
+            entry.routing_shape,
+            type(dispatcher).__name__,
+        )
+    else:
+        verify = _replay_verify_enabled()
+        rec = _ReplayPassRecord("hit", frame.key_obj, entry=entry, verify=verify)
+        _REPLAY_STATS["hits"] += 1
+        if not verify:
+            _restore_device_metadata(dispatcher, entry)
+        if not _REPLAY_HIT_LOGGED[0]:
+            _REPLAY_HIT_LOGGED[0] = True
+            logger.warning(
+                "BT_MOE_DISPATCH_REPLAY_CACHE: first replay cache hit — replay all-gather, "
+                "D2H copies, and d2h_event.synchronize() skipped"
+            )
+    frame.scratch[id(dispatcher)] = rec
+    _replay_note_lookup()
+    return rec
+
+
+def _replay_pass_record(dispatcher):
+    """Return this pass's record for the dispatcher, or None (gate off / no frame)."""
+    if not _replay_cache_enabled():
+        return None
+    frame = _current_pass_frame()
+    if frame is None:
+        return None
+    return frame.scratch.get(id(dispatcher))
 
 
 class MoETokenDispatcher:
@@ -526,6 +905,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
             return num_tokens_per_local_expert
 
+        # BT_MOE_DISPATCH_REPLAY_CACHE: classify this pass. On a replay hit the
+        # first pass's metadata is restored onto the instance and we skip the
+        # split recompute below (including the tp_ep all-gather); the replay's
+        # D2H copies and event sync are skipped in _maybe_dtoh_and_synchronize.
+        replay_rec = _replay_pass_begin(self, routing_map)
+        if replay_rec is not None and replay_rec.mode == "hit" and not replay_rec.verify:
+            return replay_rec.entry.num_tokens_per_local_expert_dev
+
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
@@ -606,6 +993,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_sync_point_priority[self.cuda_dtoh_point]
             <= self.cuda_sync_point_priority[self.cuda_sync_point]
         ), "cuda_sync_point must be after cuda_dtoh_point."
+        if replay_rec is not None:
+            if replay_rec.mode == "store":
+                # First pass: keep the device-side metadata on the frame
+                # scratch; it is stored on the microbatch carrier at the sync
+                # point (see _maybe_dtoh_and_synchronize).
+                replay_rec.device_vals = _capture_device_metadata(
+                    self, num_tokens_per_local_expert
+                )
+            elif replay_rec.mode == "hit" and replay_rec.verify:
+                # Verify mode: the full recompute ran above; assert it
+                # reproduces the cached first-pass metadata bitwise.
+                _verify_device_metadata(self, replay_rec.entry, num_tokens_per_local_expert)
         return num_tokens_per_local_expert
 
     def dispatch_preprocess(
@@ -926,6 +1325,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
         if not self.drop_and_pad:
+            # BT_MOE_DISPATCH_REPLAY_CACHE: on a replay hit, install the cached
+            # first-pass host values at the DtoH point and skip the copies, the
+            # event record, and the event sync entirely.
+            replay_rec = _replay_pass_record(self)
+            if replay_rec is not None and replay_rec.mode == "hit" and not replay_rec.verify:
+                if point == self.cuda_dtoh_point:
+                    entry = replay_rec.entry
+                    self.input_splits = entry.input_splits_host
+                    self.output_splits = entry.output_splits_host
+                    self.output_splits_tp = entry.output_splits_tp_host
+                    self.num_out_tokens = entry.num_out_tokens_host
+                    if entry.num_global_tokens_per_local_expert_host is not None:
+                        self.num_global_tokens_per_local_expert = (
+                            entry.num_global_tokens_per_local_expert_host
+                        )
+                    tokens_per_expert = entry.tokens_per_expert_host
+                    self.d2h_event = None
+                return tokens_per_expert
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
                 on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
@@ -957,6 +1374,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             if point == self.cuda_sync_point:
                 # Synchronize with the DtoH stream at self.cuda_sync_point.
                 self.d2h_event.synchronize()
+                if replay_rec is not None and replay_rec.mode == "store":
+                    # First pass: all host values are valid now — stash them
+                    # for this layer-microbatch's recompute replay.
+                    _store_replay_entry(self, replay_rec, tokens_per_expert)
+                elif replay_rec is not None and replay_rec.mode == "hit" and replay_rec.verify:
+                    # Verify mode: the full D2H + sync ran above; assert the
+                    # fresh host values match the cached entry bitwise.
+                    _verify_host_metadata(self, replay_rec.entry, tokens_per_expert)
 
         return tokens_per_expert
 
