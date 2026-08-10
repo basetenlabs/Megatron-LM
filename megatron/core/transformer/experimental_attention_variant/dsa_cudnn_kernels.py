@@ -2291,7 +2291,15 @@ def _run_sparse_attention_backward(
     all_rows_nonempty: bool = False,
     nonempty_rows_verified: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Run sparse attention backward, skipping rows that have no valid top-k entries."""
+    """Run sparse attention backward, skipping rows that have no valid top-k entries.
+
+    ``all_rows_nonempty`` takes the direct wrapper path (the caller guarantees
+    every row has >= 1 valid top-k entry, so no compaction is needed at all).
+    ``nonempty_rows_verified`` (FIX A's async probe) keeps the compaction path
+    but replaces the syncing ``nonzero(topk_length > 0)`` with the exact
+    ``arange(N)`` substitution. Distinct knobs: the first skips compaction,
+    the second de-syncs it.
+    """
     d_v = out_flat.shape[-1]
     dO_flat = grad_output.reshape(sq * b, num_heads, d_v)
 
