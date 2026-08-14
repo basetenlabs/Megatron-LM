@@ -113,13 +113,11 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
+            build_checkpointed_layer_callables,
             build_layer_callables,
         )
         from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-        # build the forward and backward callables for the transformer/mtp layer
-        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
 
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
@@ -127,10 +125,37 @@ class TransformerLayerSchedulePlan:
         is_moe = isinstance(transformer_layer.mlp, MoELayer)
         num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
+        # The per-layer recompute dial: the leading `moe_ep_overlap_checkpoint_num_layers`
+        # MoE layers of each stage run as one opaque whole-layer checkpoint (the attn
+        # node carries the entire layer; the comm/mlp slots become no-ops, so the layer
+        # gets no a2a overlap but keeps only the checkpoint's saved input in memory).
+        # MTP layers are excluded (their callables carry extra embedding/loss structure).
+        # A missing layer_local_index (non-standard construction) disables the dial for
+        # the layer rather than risking a wrong assignment.
+        dial_k = getattr(self.layer.config, "moe_ep_overlap_checkpoint_num_layers", None)
+        layer_local_index = extra_args.get("layer_local_index", None)
+        is_dial_checkpointed = (
+            dial_k is not None
+            and not is_mtp
+            and is_moe
+            and layer_local_index is not None
+            and layer_local_index < dial_k
+        )
+
+        # build the forward and backward callables for the transformer/mtp layer
+        if is_dial_checkpointed:
+            fwd_callables, bwd_dw_callable_map = build_checkpointed_layer_callables(self.layer)
+        else:
+            fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
         extra_args["num_local_experts"] = num_local_experts
-        extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
+        # The checkpoint's monolithic backward computes weight grads inline; there is
+        # nothing to defer for a dial-checkpointed layer.
+        extra_args["delay_wgrad_compute"] = (
+            False if is_dial_checkpointed else self.layer.config.delay_wgrad_compute
+        )
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
@@ -158,13 +183,21 @@ class TransformerLayerSchedulePlan:
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
         self.attn = create_node(comp_stream, attn_module, "attn")
-        self.mlp = create_node(comp_stream, mlp_module, "mlp")
-        if is_moe:
-            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
-            self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
-        else:
+        if is_dial_checkpointed:
+            # Opaque checkpointed layer: the attn node carries the whole layer;
+            # every other slot is a no-op. (mlp must be a NoopScheduleNode, not a
+            # real node — the schedule calls mlp.backward_dw() unconditionally.)
+            self.mlp = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+        else:
+            self.mlp = create_node(comp_stream, mlp_module, "mlp")
+            if is_moe:
+                self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
+                self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            else:
+                self.moe_dispatch = NoopScheduleNode()
+                self.moe_combine = NoopScheduleNode()
 
         if is_mtp:
             self.mtp_post_process = create_node(
@@ -205,10 +238,13 @@ class TransformerLayerSchedulePlan:
         self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
         # Determine the last node in forward order.
-        if isinstance(self.moe_combine, NoopScheduleNode):
+        if not isinstance(self.moe_combine, NoopScheduleNode):
+            last_fwd_node = self.moe_combine
+        elif not isinstance(self.mlp, NoopScheduleNode):
             last_fwd_node = self.mlp
         else:
-            last_fwd_node = self.moe_combine
+            # Opaque recompute-dial layer: the attn node carries the whole layer.
+            last_fwd_node = self.attn
 
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
@@ -381,6 +417,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.context_mask = None
         self._model_chunk_state.attention_bias = None
 
+        # The recompute dial checkpoints whole layers; it cannot exceed the number
+        # of layers on this pipeline stage.
+        dial_k = getattr(model.config, "moe_ep_overlap_checkpoint_num_layers", None)
+        if dial_k is not None and getattr(model, "decoder", None) is not None:
+            assert dial_k <= len(model.decoder.layers), (
+                f"moe_ep_overlap_checkpoint_num_layers ({dial_k}) must be <= the number of "
+                f"layers on this pipeline stage ({len(model.decoder.layers)})"
+            )
+
         # build preprocess
         self.pre_process = PreProcessNode(
             model, self._model_chunk_state, self._event, get_comp_stream
@@ -408,6 +453,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_args = {
                 "is_first_layer": layer_idx == 0,
                 "is_last_layer": layer_idx == num_layers - 1,
+                # Stage-local layer index, consumed by the per-layer recompute dial
+                # (moe_ep_overlap_checkpoint_num_layers) in _build_callable_nodes.
+                "layer_local_index": layer_idx,
             }
             layer_plan = TransformerLayerSchedulePlan(
                 module.layers[layer_idx],

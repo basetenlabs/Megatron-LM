@@ -269,6 +269,18 @@ class ModelParallelConfig:
     in 1f1b phase of pipelining or non-pipelining schedule.
     """
 
+    moe_ep_overlap_checkpoint_num_layers: Optional[int] = None
+    """Number of leading MoE layers per pipeline stage to run as opaque whole-layer
+    checkpoints when overlap_moe_expert_parallel_comm is enabled. The fine-grained
+    EP-overlap schedule cannot see inside a whole-layer checkpoint, which is why the
+    flag otherwise forbids full recompute; this dial runs the first K MoE layers of
+    each stage as monolithic checkpointed nodes (no overlap, minimal saved memory) and
+    the remaining layers with the stock five-node overlapped decomposition, trading
+    overlap coverage for memory at long sequence lengths. Dense (non-MoE) layers and
+    the MTP layer are never checkpointed by this dial. None (default) = today's
+    behavior (no checkpointed layers). 0 = all layers eager (no-op dial).
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 

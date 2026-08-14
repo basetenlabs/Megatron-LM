@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
+import os
 import weakref
 from contextlib import nullcontext
 from functools import partial
@@ -24,6 +26,15 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+
+logger = logging.getLogger(__name__)
+
+_DIAL_MEM_PROBE_ENV = "BT_DIAL_MEM_PROBE"
+
+
+def _dial_mem_probe_enabled() -> bool:
+    """Whether the per-layer recompute-dial memory probe is on (read per call)."""
+    return os.environ.get(_DIAL_MEM_PROBE_ENV, "0") == "1"
 
 
 def weak_method(method):
@@ -799,6 +810,122 @@ def build_mtp_layer_callables(layer):
     else:
         backward_dw["attn"] = [backward_dw["attn"], layer.eh_proj]
 
+    return forward_funcs, backward_dw
+
+
+def build_checkpointed_layer_callables(layer: TransformerLayer):
+    """Callables for an opaque whole-layer-checkpointed MoE layer (recompute dial).
+
+    Used when ``config.moe_ep_overlap_checkpoint_num_layers`` is set: the leading
+    MoE layers of each pipeline stage run as one monolithic checkpointed node in
+    the fine-grained EP-overlap schedule instead of the five-node decomposition.
+    The checkpointed layer exposes no dispatch/combine nodes to the scheduler (the
+    plan builder installs ``NoopScheduleNode``\\ s for those slots), so it gets no
+    a2a overlap — the dial trades overlap coverage for the checkpoint's minimal
+    saved-memory footprint. The remaining layers of the stage run the stock
+    overlapped path.
+
+    Structure contract (consumed by ``TransformerLayerSchedulePlan``):
+    - the ``attn`` slot carries the whole layer under the same checkpoint
+      primitive the block-level recompute path uses (``te_checkpoint`` under
+      fp8/fp4, else ``tensor_parallel.checkpoint`` — mirrors recompute.py);
+    - the ``moe_dispatch`` / ``mlp`` / ``moe_combine`` / ``mtp_post_process``
+      slots are never built (the caller installs no-op nodes);
+    - the backward-dw map is empty and the node's ``delay_wgrad_compute`` is
+      False, so every dw-deferral call site in the schedule no-ops (the
+      checkpoint's monolithic backward computes weight grads inline).
+
+    LoRA / frozen-base note: ``CheckpointFunction`` is a plain
+    ``autograd.Function`` whose output requires grad only if an input does —
+    parameter grads alone do NOT register a backward. The schedule framework
+    detaches inter-node tensors, so a layer whose input arrives with
+    ``requires_grad=False`` (frozen embedding output, p2p-received stage input)
+    would never run the checkpoint's backward and adapter grads would be
+    silently zero. The stock block path forces ``requires_grad=True`` on the
+    block input (transformer_block.py ``make_viewless_tensor``); we do the same
+    here, localized to the node's (already detached) input tensor. Mutating the
+    framework's detached leaf — rather than detaching again — keeps the input
+    gradient flowing to ``ScheduleNode.get_grad`` and hence upstream.
+
+    Args:
+        layer: The MoE transformer layer to wrap.
+
+    Returns:
+        forward_funcs: [whole-layer checkpoint callable, None, None, None, None].
+        backward_dw: empty dict (no deferrable weight-grad callables).
+    """
+
+    def submodule_checkpointed_layer_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """Run the whole transformer layer under the checkpoint primitive."""
+        chunk_state = node.chunk_state
+
+        # LoRA trap fix: the checkpoint's backward never fires if no input
+        # requires grad. Force it on the framework's detached input leaf (see
+        # the docstring); harmless when already True.
+        if not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
+
+        probe = _dial_mem_probe_enabled() and torch.cuda.is_available()
+        if probe:
+            alloc_before = torch.cuda.memory_allocated()
+
+        def custom_forward(hidden_states):
+            output, _ = layer(
+                hidden_states=hidden_states,
+                attention_mask=chunk_state.attention_mask,
+                rotary_pos_emb=chunk_state.rotary_pos_emb,
+                rotary_pos_cos=chunk_state.rotary_pos_cos,
+                rotary_pos_sin=chunk_state.rotary_pos_sin,
+                packed_seq_params=chunk_state.packed_seq_params,
+                sequence_len_offset=chunk_state.sequence_len_offset,
+                padding_mask=chunk_state.padding_mask,
+            )
+            return output
+
+        # Same checkpoint primitive as the block-level recompute path
+        # (recompute.py checkpointed_forward): TE under fp8/fp4, else
+        # tensor_parallel.checkpoint. RNG save/restore is owned by the
+        # checkpoint primitive, so the recompute is bitwise-identical to the
+        # eager forward.
+        if layer.config.fp8 or layer.config.fp4:
+            from megatron.core.extensions.transformer_engine import te_checkpoint
+
+            output = te_checkpoint(
+                custom_forward,
+                layer.config.distribute_saved_activations,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                layer.pg_collection.tp,
+                hidden_states,
+            )
+        else:
+            output = tensor_parallel.checkpoint(
+                custom_forward, layer.config.distribute_saved_activations, hidden_states
+            )
+
+        # Final-layernorm tail for the stage's last layer, applied OUTSIDE the
+        # checkpoint — mirrors the stock combine-node site
+        # (submodule_combine_forward) and the block-recompute path, neither of
+        # which checkpoints it.
+        final_layernorm = chunk_state.model.decoder.final_layernorm
+        if final_layernorm and node.is_last_layer:
+            output = final_layernorm(output)
+            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+
+        if probe:
+            alloc_after = torch.cuda.memory_allocated()
+            logger.warning(
+                "[dial_mem] layer=%s kind=ckpt alloc_before_mib=%.1f alloc_after_mib=%.1f "
+                "delta_mib=%.1f",
+                layer.layer_number,
+                alloc_before / 2**20,
+                alloc_after / 2**20,
+                (alloc_after - alloc_before) / 2**20,
+            )
+
+        return output
+
+    forward_funcs = [submodule_checkpointed_layer_forward, None, None, None, None]
+    backward_dw = {}
     return forward_funcs, backward_dw
 
 

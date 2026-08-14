@@ -2641,6 +2641,14 @@ class TransformerConfig(ModelParallelConfig):
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
+            if self.moe_ep_overlap_checkpoint_num_layers is not None:
+                assert isinstance(self.moe_ep_overlap_checkpoint_num_layers, int) and (
+                    self.moe_ep_overlap_checkpoint_num_layers >= 0
+                ), (
+                    'moe_ep_overlap_checkpoint_num_layers must be a non-negative int or None, '
+                    f'got {self.moe_ep_overlap_checkpoint_num_layers}'
+                )
+
             # Check if bf16 or fp16 is used
             assert (
                 self.bf16 or self.fp16
@@ -2714,6 +2722,12 @@ class TransformerConfig(ModelParallelConfig):
             assert self.overlap_moe_expert_parallel_comm, (
                 'overlap_moe_expert_parallel_comm must be enabled when enabling '
                 'ep_overlap_early_attn_memory_release'
+            )
+
+        if self.moe_ep_overlap_checkpoint_num_layers is not None:
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'moe_ep_overlap_checkpoint_num_layers'
             )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:

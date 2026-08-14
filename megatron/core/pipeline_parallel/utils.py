@@ -140,6 +140,14 @@ class NoopScheduleNode:
         """Passes through gradients unchanged in the backward pass."""
         return outgrads
 
+    def backward_dw(self):
+        """No-op weight-gradient hook.
+
+        The layer schedule calls ``mlp.backward_dw()`` / ``attn.backward_dw()``
+        unconditionally; placeholder nodes (dense-layer comm slots, opaque
+        recompute-dial layers) have no deferrable weight-gradient work.
+        """
+
 
 class ScheduleNode:
     """Base node for fine-grained scheduling.
