@@ -418,9 +418,14 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # The recompute dial checkpoints whole layers; it cannot exceed the number
-        # of layers on this pipeline stage.
+        # of layers on this pipeline stage. (An empty-decoder stage is legal at
+        # pipeline edges — the dial is a no-op there, so don't bound-check it.)
         dial_k = getattr(model.config, "moe_ep_overlap_checkpoint_num_layers", None)
-        if dial_k is not None and getattr(model, "decoder", None) is not None:
+        if (
+            dial_k is not None
+            and getattr(model, "decoder", None) is not None
+            and len(model.decoder.layers) > 0
+        ):
             assert dial_k <= len(model.decoder.layers), (
                 f"moe_ep_overlap_checkpoint_num_layers ({dial_k}) must be <= the number of "
                 f"layers on this pipeline stage ({len(model.decoder.layers)})"

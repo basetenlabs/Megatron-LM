@@ -174,6 +174,15 @@ class PreProcessNode(ScheduleNode):
             padding_mask=self.chunk_state.padding_mask,
         )
 
+        # Adapter-only (LoRA) training freezes the embedding, so decoder_input
+        # arrives with requires_grad=False and the schedule's closing
+        # pre_process.backward would root a backward at a non-grad tensor
+        # (RuntimeError) — and no layer-0 input grad would ever be produced.
+        # Force the grad root here, the same maneuver the block-level path uses
+        # (make_viewless_tensor(requires_grad=True) in TransformerBlock.forward).
+        if decoder_input.is_floating_point() and not decoder_input.requires_grad:
+            decoder_input = decoder_input.detach().requires_grad_(True)
+
         # Saved for later use
         self.chunk_state.decoder_input = decoder_input
         self.chunk_state.rotary_pos_emb = rotary_pos_emb
@@ -870,6 +879,12 @@ def build_checkpointed_layer_callables(layer: TransformerLayer):
             alloc_before = torch.cuda.memory_allocated()
 
         def custom_forward(hidden_states):
+            # Note: padding_mask is threaded through to the MoE router here
+            # (matching the block-level recompute path), whereas the stock eager
+            # overlap path calls layer.mlp.route() without it — under a set
+            # padding_mask + moe_z_loss_coeff the two paths' z-loss token counts
+            # would differ (pre-existing eager-path asymmetry, not introduced
+            # here; THD packed runs carry padding_mask=None).
             output, _ = layer(
                 hidden_states=hidden_states,
                 attention_mask=chunk_state.attention_mask,

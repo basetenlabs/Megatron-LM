@@ -10,7 +10,8 @@ validation only; the plan-structure and grad-equivalence tests live with the
 validation harness (see the campaign's VALIDATION_LADDER doc).
 
 CPU-runnable (no distributed init, no CUDA); on Darwin it needs the
-stubbed-import harness for the megatron.core import chain (triton et al.).
+stubbed-import harness for the megatron.core import chain (triton et al.) —
+trainers repo: experiment_artefacts/glm/lps_1062_perf/tools/run_server_tests_mac.py.
 """
 
 import pytest

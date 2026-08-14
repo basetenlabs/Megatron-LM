@@ -2642,8 +2642,10 @@ class TransformerConfig(ModelParallelConfig):
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             if self.moe_ep_overlap_checkpoint_num_layers is not None:
-                assert isinstance(self.moe_ep_overlap_checkpoint_num_layers, int) and (
-                    self.moe_ep_overlap_checkpoint_num_layers >= 0
+                assert (
+                    isinstance(self.moe_ep_overlap_checkpoint_num_layers, int)
+                    and not isinstance(self.moe_ep_overlap_checkpoint_num_layers, bool)
+                    and self.moe_ep_overlap_checkpoint_num_layers >= 0
                 ), (
                     'moe_ep_overlap_checkpoint_num_layers must be a non-negative int or None, '
                     f'got {self.moe_ep_overlap_checkpoint_num_layers}'
