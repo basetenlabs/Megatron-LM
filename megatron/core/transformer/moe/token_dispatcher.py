@@ -39,9 +39,13 @@ from megatron.core.transformer.moe.moe_utils import (
     pad_routing_map,
     permute,
     sort_chunks_by_idxs,
+    sort_probs_chunks_early_bwd,
     unpermute,
 )
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.moe.shared_experts import (
+    SharedExpertMLP,
+    set_tensor_grad_fn_sequence_sr,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -155,6 +159,95 @@ def _probs_a2a_ep_spans_world(ep_ranks, world_size) -> bool:
     record is unambiguous.
     """
     return sorted(ep_ranks) == list(range(world_size))
+
+
+# ----------------------------------------------------------------------------
+# BT_MOE_PROBS_BWD_REORDER (option 6): backward-chain reorder for the probs
+# reverse. The probs grad is produced late in the layer's backward chain
+# today: the fused with-probs sort emits d(probs) in the same node as
+# d(tokens), which needs the full MLP backward (behind the fc1-dgrad pack) —
+# so the probs reverse A2A lands exposed at the end of the backward window
+# (the documented W1 residual). Option 6 (a) splits the probs sort edge out
+# of the fused joint backward (moe_utils.sort_probs_chunks_early_bwd), (b)
+# seq-bumps the probs-path nodes above the fc1 pack so the reverse issues
+# right after fc2-dgrad (the shared_experts set_tensor_grad_fn_sequence_sr
+# mechanism), and (c) defers the reverse's compute-stream wait to the tokens
+# reverse (the mappings.py bwd_defer early/late protocol), so the flight
+# overlaps the remaining expert dgrads instead of stalling them. Pure
+# scheduling; bitwise-expected (row permutations + byte-identical comm).
+# Requires W1 (the probs reverse needs its own communicator to fly
+# independently of the tokens reverse).
+# ----------------------------------------------------------------------------
+
+_PROBS_BWD_REORDER_GATE_LOGGED = [False]
+_PROBS_BWD_REORDER_ARMED_LOGGED = [False]
+_PROBS_BWD_REORDER_STATS = {"early_issues": 0, "sort_splits": 0}
+_PROBS_BWD_REORDER_WINDOW = [0, 0]  # [gated dispatches this window, windows logged]
+_PROBS_BWD_REORDER_WINDOW_SIZE = 300
+_PROBS_BWD_REORDER_WINDOW_LOG_MAX = 100
+
+
+def _probs_bwd_reorder_enabled() -> bool:
+    """Lazy env-gate read (per-call; ~1 call/layer-pass), one-time WARNING."""
+    enabled = os.environ.get("BT_MOE_PROBS_BWD_REORDER", "0") == "1"
+    if not _PROBS_BWD_REORDER_GATE_LOGGED[0]:
+        _PROBS_BWD_REORDER_GATE_LOGGED[0] = True
+        if enabled:
+            logger.warning(
+                "BT_MOE_PROBS_BWD_REORDER=1: probs-reverse backward-chain reorder "
+                "(option 6) ACTIVE"
+            )
+        else:
+            logger.warning(
+                "BT_MOE_PROBS_BWD_REORDER present but DISABLED (env unset or != '1'); "
+                "status-quo probs-reverse timing"
+            )
+    return enabled
+
+
+def _probs_bwd_reorder_armable(
+    probs_a2a_comm_present: bool,
+    w2_pipeline: bool,
+    drop_and_pad: bool,
+    tp_size: int,
+    num_local_experts: int,
+    moe_permute_fusion: bool,
+) -> Optional[str]:
+    """None iff option 6 can arm, else the loud-fallback reason (pure; the
+    dispatcher logs it once). The probs reverse needs W1's second
+    communicator to fly independently of the tokens reverse; the sort split
+    needs the fused sort (the row_id_map path); the W2/drop-and-pad/TP>1
+    paths have their own probs plumbing (out of scope)."""
+    if not probs_a2a_comm_present:
+        return "W1 second communicator not armed (BT_MOE_PROBS_A2A_COMM off or refused)"
+    if w2_pipeline:
+        return "W2 chunked pipeline active (its own probs path; option 6 is the non-W2 lever)"
+    if drop_and_pad:
+        return "drop_and_pad path (capacity transpose) not covered"
+    if tp_size != 1:
+        return "TP>1 (the SP probs gather) not covered"
+    if num_local_experts <= 1:
+        return "single local expert — no sort to split"
+    if not moe_permute_fusion:
+        return "moe_permute_fusion off (the early-bwd path uses the fused sort's row_id_map)"
+    return None
+
+
+def _probs_bwd_reorder_note_dispatch():
+    """Per-window telemetry (WARNING so it reaches trainer logs). A gate that
+    armed but never split a sort is loud by absence of these lines."""
+    _PROBS_BWD_REORDER_STATS["early_issues"] += 1
+    _PROBS_BWD_REORDER_WINDOW[0] += 1
+    if _PROBS_BWD_REORDER_WINDOW[0] >= _PROBS_BWD_REORDER_WINDOW_SIZE:
+        _PROBS_BWD_REORDER_WINDOW[0] = 0
+        _PROBS_BWD_REORDER_WINDOW[1] += 1
+        if _PROBS_BWD_REORDER_WINDOW[1] <= _PROBS_BWD_REORDER_WINDOW_LOG_MAX:
+            logger.warning(
+                "BT_MOE_PROBS_BWD_REORDER window %d (%d gated dispatches): %s",
+                _PROBS_BWD_REORDER_WINDOW[1],
+                _PROBS_BWD_REORDER_WINDOW_SIZE,
+                dict(_PROBS_BWD_REORDER_STATS),
+            )
 
 
 def _probs_a2a_comm_note_dispatch():
@@ -642,6 +735,34 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     "BT_MOE_PROBS_A2A_COMM: armed=NO — EP size is 1, no all-to-all to move"
                 )
 
+        # BT_MOE_PROBS_BWD_REORDER (option 6): evaluate arming once per
+        # dispatcher (all conditions are static). Loud either way on the
+        # first dispatcher when the gate is on — an armed gate that can never
+        # fire is the v1 trap.
+        self._probs_bwd_reorder_active = False
+        if _probs_bwd_reorder_enabled():
+            reason = _probs_bwd_reorder_armable(
+                self._probs_a2a_comm is not None,
+                getattr(self, "_w2_config", None) is not None,
+                self.drop_and_pad,
+                self.tp_size,
+                self.num_local_experts,
+                self.config.moe_permute_fusion,
+            )
+            if reason is None:
+                self._probs_bwd_reorder_active = True
+            if not _PROBS_BWD_REORDER_ARMED_LOGGED[0]:
+                _PROBS_BWD_REORDER_ARMED_LOGGED[0] = True
+                if self._probs_bwd_reorder_active:
+                    logger.warning(
+                        "BT_MOE_PROBS_BWD_REORDER: armed — probs sort split + seq-bump "
+                        "+ deferred reverse wait (option 6)"
+                    )
+                else:
+                    logger.warning(
+                        "BT_MOE_PROBS_BWD_REORDER: armed=NO — %s (status-quo path)", reason
+                    )
+
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = [
@@ -881,18 +1002,33 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             #   -> shared experts fc1 -> wait tokens -> wait probs
             # Backward launch order: probs A2A reverse (comm 2) -> tokens A2A
             #   reverse -> shared experts fc1 (as upstream).
+            # BT_MOE_PROBS_BWD_REORDER (option 6): the per-pass early/late
+            # carrier defers the probs reverse's compute-stream wait to the
+            # tokens reverse (see _AllToAllDeferredWait); the seq-bump makes
+            # the probs reverse node fire ahead of the MLP's fc1-dgrad pack
+            # (replay-only: the first pass has no grad_fn — the helper no-ops).
+            bwd_defer_tokens = bwd_defer_probs = None
+            if self._probs_bwd_reorder_active:
+                bwd_carrier: dict = {}
+                bwd_defer_tokens = {"role": "late", "carrier": bwd_carrier}
+                bwd_defer_probs = {"role": "early", "carrier": bwd_carrier}
+                _probs_bwd_reorder_note_dispatch()
             global_input_tokens = all_to_all_deferred(
                 self.ep_group,
                 permutated_local_input_tokens,
                 self.output_splits,
                 self.input_splits,
+                bwd_defer=bwd_defer_tokens,
             )
             global_probs = all_to_all_deferred(
                 self._probs_a2a_comm,
                 permuted_probs,
                 self.output_splits,
                 self.input_splits,
+                bwd_defer=bwd_defer_probs,
             )
+            if bwd_defer_probs is not None:
+                set_tensor_grad_fn_sequence_sr(global_probs, torch.iinfo(torch.int).max)
             if self.shared_experts is not None:
                 self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
             wait_deferred_a2a(global_input_tokens)
@@ -976,13 +1112,38 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
-                global_input_tokens, global_probs = sort_chunks_by_idxs(
-                    global_input_tokens,
-                    self.num_global_tokens_per_local_expert.ravel(),
-                    self.sort_input_by_local_experts,
-                    probs=global_probs,
-                    fused=self.config.moe_permute_fusion,
-                )
+                if self._probs_bwd_reorder_active:
+                    # BT_MOE_PROBS_BWD_REORDER (option 6, part i): tokens on
+                    # the fused tokens-only sort (unchanged path); probs on
+                    # the early-bwd sort — its backward depends ONLY on
+                    # d(permuted_probs) (produced mid-MLP-backward, right
+                    # after fc2-dgrad), not on the fused with-probs sort's
+                    # joint (tokens, probs) backward behind the fc1-dgrad
+                    # pack. Both directions are row permutations (bitwise).
+                    # The seq-bump fires the probs-sort node ahead of the fc1
+                    # pack (replay-only: no grad_fn in the first pass).
+                    global_input_tokens, _ = sort_chunks_by_idxs(
+                        global_input_tokens,
+                        self.num_global_tokens_per_local_expert.ravel(),
+                        self.sort_input_by_local_experts,
+                        probs=None,
+                        fused=self.config.moe_permute_fusion,
+                    )
+                    global_probs = sort_probs_chunks_early_bwd(
+                        global_probs,
+                        self.num_global_tokens_per_local_expert.ravel(),
+                        self.sort_input_by_local_experts,
+                    )
+                    set_tensor_grad_fn_sequence_sr(global_probs, torch.iinfo(torch.int).max)
+                    _PROBS_BWD_REORDER_STATS["sort_splits"] += 1
+                else:
+                    global_input_tokens, global_probs = sort_chunks_by_idxs(
+                        global_input_tokens,
+                        self.num_global_tokens_per_local_expert.ravel(),
+                        self.sort_input_by_local_experts,
+                        probs=global_probs,
+                        fused=self.config.moe_permute_fusion,
+                    )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_finish", self.tokens_per_expert

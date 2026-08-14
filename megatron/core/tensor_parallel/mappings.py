@@ -1,11 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
+
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
 
 from .utils import split_tensor_along_last_dim
+
+logger = logging.getLogger(__name__)
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -508,8 +512,11 @@ class _AllToAll(torch.autograd.Function):
 # the first stream wait).
 #
 # Backward is identical to `_AllToAll.backward` (reverse all-to-all with
-# swapped splits, issued and waited inline): the downstream consumers of the
-# input grad are not wait-aware, so the wait cannot be deferred there.
+# swapped splits, issued and waited inline) UNLESS the caller passes
+# bwd_defer (BT_MOE_PROBS_BWD_REORDER, option 6): then the backward's wait
+# follows the early/late carrier protocol described on the class — the
+# probs reverse issues early without stalling the compute stream and the
+# tokens reverse waits both handles late.
 # ----------------------------------------------------------------------------
 
 # Attribute on the output tensor carrying the async work handle.
@@ -518,14 +525,30 @@ _DEFERRED_A2A_WORK_ATTR = "_deferred_a2a_work"
 
 class _AllToAllDeferredWait(torch.autograd.Function):
     """All-to-all issued asynchronously; the compute-stream wait is deferred
-    to a later `wait_deferred_a2a` call on the returned tensor."""
+    to a later `wait_deferred_a2a` call on the returned tensor.
+
+    BT_MOE_PROBS_BWD_REORDER (option 6): when `bwd_defer` is given (a dict
+    {"role": "early"|"late", "carrier": per-pass dict}), the BACKWARD's wait
+    is also deferred. The "early" sibling (the probs reverse — its grad
+    arrives mid-backward under the option-6 sort split) issues its reverse
+    A2A and stashes the work handle in the carrier WITHOUT waiting: the only
+    consumer of its output grad is downstream of the "late" sibling (the
+    tokens reverse — its grad needs the full MLP backward, so it always fires
+    after the early one by data dependency), which waits its own work AND the
+    stashed early handle. The early issue's flight then overlaps the
+    remaining backward instead of stalling the compute stream at the early
+    point, and the late wait lands when the early reverse has long completed
+    (free). Belt-and-suspenders: if the late sibling somehow ran first
+    (unreachable by data dependency), the early sibling waits inline and
+    logs loud."""
 
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, bwd_defer=None):
         """Issue the all-to-all with async_op=True and stash the work handle."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        ctx.bwd_defer = bwd_defer
 
         world_size = group.size()
         # Bypass the function if we are using only 1 GPU.
@@ -569,7 +592,7 @@ class _AllToAllDeferredWait(torch.autograd.Function):
         """
         (grad,) = grad_output
         if ctx.group.size() == 1:
-            return None, grad, None, None
+            return None, grad, None, None, None
         grad = grad.contiguous()
         if ctx.input_split_sizes is None:
             grad_input = torch.empty_like(grad)
@@ -586,8 +609,35 @@ class _AllToAllDeferredWait(torch.autograd.Function):
             group=ctx.group,
             async_op=True,
         )
-        work.wait()
-        return None, grad_input, None, None
+        bd = ctx.bwd_defer
+        if bd is None:
+            work.wait()
+        elif bd["role"] == "early":
+            # Option 6: issue-only. The late sibling waits this handle (see
+            # the class docstring); if it somehow ran first (unreachable by
+            # data dependency), wait inline and log loud.
+            if bd["carrier"].pop("late_done", False):
+                logger.warning(
+                    "BT_MOE_PROBS_BWD_REORDER: early reverse ran AFTER the late "
+                    "sibling — inline-waiting (structural anomaly; report)"
+                )
+                work.wait()
+            else:
+                bd["carrier"]["early_work"] = work
+        else:  # "late"
+            work.wait()
+            bd["carrier"]["late_done"] = True
+            if "early_work" not in bd["carrier"]:
+                logger.warning(
+                    "BT_MOE_PROBS_BWD_REORDER: late reverse found no early work "
+                    "handle — structural bug; the probs reverse was not waited "
+                    "here (report)"
+                )
+            else:
+                early_work = bd["carrier"].pop("early_work")
+                if early_work is not None:
+                    early_work.wait()
+        return None, grad_input, None, None, None
 
 
 def wait_deferred_a2a(tensor):
@@ -684,14 +734,22 @@ def all_to_all(
     return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
 
 
-def all_to_all_deferred(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all_deferred(
+    group, input_, output_split_sizes_=None, input_split_sizes=None, bwd_defer=None
+):
     """Wrapper for the deferred-wait all-to-all (BT_MOE_PROBS_A2A_COMM).
 
     Returns the output tensor with the async work handle attached; the caller
     must call `wait_deferred_a2a` on it before any compute-stream consumer.
+
+    bwd_defer (BT_MOE_PROBS_BWD_REORDER): optional {"role", "carrier"} dict
+    deferring the BACKWARD's wait per the option-6 early/late protocol (see
+    the _AllToAllDeferredWait docstring).
     """
     assert group is not None, "group should not be None"
-    return _AllToAllDeferredWait.apply(group, input_, output_split_sizes_, input_split_sizes)
+    return _AllToAllDeferredWait.apply(
+        group, input_, output_split_sizes_, input_split_sizes, bwd_defer
+    )
 
 
 def all_to_all_sp2hp(input_, group=None):

@@ -3274,12 +3274,33 @@ try:
     fused_sort_chunks_by_index_with_probs = moe_sort_chunks_by_index_with_probs
     fused_unpermute = moe_unpermute
 
+    def fused_sort_chunks_by_index_with_row_id_map(inp, split_sizes, sorted_idxs):
+        """chunk_sort_fwd exposing the row_id_map (BT_MOE_PROBS_BWD_REORDER).
+
+        The moe_sort_chunks_by_index wrapper discards the row_id_map; the
+        option-6 probs early-backward path needs it to drive the fused
+        inverse sort in its own backward edge.
+        """
+        output, _, row_id_map = torch.ops.te_moe.chunk_sort_fwd(
+            inp, split_sizes, sorted_idxs, None
+        )
+        return output, row_id_map
+
+    def fused_sort_chunks_by_index_bwd(d_permuted, row_id_map, num_tokens, hidden_size):
+        """chunk_sort_bwd for a single-tensor (probs-only) grad (BT_MOE_PROBS_BWD_REORDER)."""
+        grad, _ = torch.ops.te_moe.chunk_sort_bwd(
+            d_permuted, None, row_id_map, num_tokens, hidden_size
+        )
+        return grad
+
 except ImportError:
     fused_permute = None
     fused_permute_with_probs = None
     fused_sort_chunks_by_index = None
     fused_sort_chunks_by_index_with_probs = None
     fused_unpermute = None
+    fused_sort_chunks_by_index_with_row_id_map = None
+    fused_sort_chunks_by_index_bwd = None
 
 try:
     from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs

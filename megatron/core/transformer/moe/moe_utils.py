@@ -33,7 +33,9 @@ if HAVE_TE:
         fused_permute_and_pad_with_probs,
         fused_permute_with_probs,
         fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_bwd,
         fused_sort_chunks_by_index_with_probs,
+        fused_sort_chunks_by_index_with_row_id_map,
         fused_topk_with_score_function,
         fused_unpermute,
         te_general_gemm,
@@ -46,11 +48,13 @@ else:
         fused_permute_and_pad_with_probs,
         fused_permute_with_probs,
         fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_bwd,
         fused_sort_chunks_by_index_with_probs,
+        fused_sort_chunks_by_index_with_row_id_map,
         fused_topk_with_score_function,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -529,6 +533,60 @@ def unpermute(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
     return output_tokens.to(dtype=input_dtype)
+
+
+# BT_MOE_PROBS_BWD_REORDER (option 6): the fused with-probs sort
+# (fused_sort_chunks_by_index_with_probs) produces d(tokens) and d(probs) in
+# ONE autograd node, so d(probs) is held until the token path's grad arrives
+# — i.e. after the full MLP backward (behind the fc1-dgrad pack), which is
+# why the probs reverse A2A lands exposed at the end of the layer's backward
+# window. This wrapper runs the same fused chunk sort for the probs tensor
+# ALONE and gives it its own backward edge (the fused inverse sort via the
+# saved row_id_map), so d(global_probs) depends only on d(permuted_probs) —
+# produced mid-MLP-backward, right after fc2-dgrad. Bitwise-exact: both
+# directions are row permutations (no reductions); the backward is the same
+# te_moe op the fused path's own autograd uses.
+class _SortProbsEarlyBwd(torch.autograd.Function):
+    """Probs chunk-sort with a probs-only backward edge (option 6)."""
+
+    @staticmethod
+    def forward(ctx, probs, split_sizes, sorted_idxs):
+        # The fused kernel wants a 2-D input; probs is [rows] -> [rows, 1]
+        # (views only, no kernels).
+        out, row_id_map = fused_sort_chunks_by_index_with_row_id_map(
+            probs.unsqueeze(-1), split_sizes, sorted_idxs
+        )
+        ctx.save_for_backward(row_id_map)
+        ctx.num_rows = probs.size(0)
+        return out.squeeze(-1)
+
+    @staticmethod
+    def backward(ctx, d_permuted):
+        (row_id_map,) = ctx.saved_tensors
+        d_global = fused_sort_chunks_by_index_bwd(
+            d_permuted.unsqueeze(-1).contiguous(), row_id_map, ctx.num_rows, 1
+        )
+        return d_global.squeeze(-1), None, None
+
+
+def sort_probs_chunks_early_bwd(
+    probs: torch.Tensor,
+    split_sizes: torch.Tensor,
+    sorted_idxs: torch.Tensor,
+) -> torch.Tensor:
+    """Chunk-sort the probs tensor with its own (early-firing) backward edge.
+
+    Same values as the fused with-probs sort's probs output (a row
+    permutation); the backward produces d(probs) as soon as the permuted
+    probs grad arrives, without waiting for the token path. Requires the TE
+    fused sort (moe_permute_fusion on).
+    """
+    if not HAVE_TE or fused_sort_chunks_by_index_with_row_id_map is None:
+        raise ValueError(
+            "fused_sort_chunks_by_index_with_row_id_map is not available. "
+            "Please install TE >= 2.1.0."
+        )
+    return _SortProbsEarlyBwd.apply(probs, split_sizes, sorted_idxs)
 
 
 def sort_chunks_by_idxs(
