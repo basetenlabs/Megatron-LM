@@ -928,9 +928,15 @@ def build_checkpointed_layer_callables(layer: TransformerLayer):
 
         if probe:
             alloc_after = torch.cuda.memory_allocated()
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else -1
+            )
             logger.warning(
-                "[dial_mem] layer=%s kind=ckpt alloc_before_mib=%.1f alloc_after_mib=%.1f "
-                "delta_mib=%.1f",
+                "[dial_mem] rank=%s layer=%s kind=ckpt alloc_before_mib=%.1f "
+                "alloc_after_mib=%.1f delta_mib=%.1f",
+                rank,
                 layer.layer_number,
                 alloc_before / 2**20,
                 alloc_after / 2**20,
