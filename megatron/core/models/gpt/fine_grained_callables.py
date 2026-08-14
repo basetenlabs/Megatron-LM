@@ -163,6 +163,15 @@ class PreProcessNode(ScheduleNode):
             padding_mask=self.chunk_state.padding_mask,
         )
 
+        # Adapter-only (LoRA) training freezes the embedding, so decoder_input
+        # arrives with requires_grad=False and the schedule's closing
+        # pre_process.backward would root a backward at a non-grad tensor
+        # (RuntimeError) — and no layer-0 input grad would ever be produced.
+        # Force the grad root here, the same maneuver the block-level path uses
+        # (make_viewless_tensor(requires_grad=True) in TransformerBlock.forward).
+        if decoder_input.is_floating_point() and not decoder_input.requires_grad:
+            decoder_input = decoder_input.detach().requires_grad_(True)
+
         # Saved for later use
         self.chunk_state.decoder_input = decoder_input
         self.chunk_state.rotary_pos_emb = rotary_pos_emb
