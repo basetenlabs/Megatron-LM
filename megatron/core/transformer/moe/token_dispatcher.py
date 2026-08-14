@@ -83,14 +83,15 @@ logger = logging.getLogger(__name__)
 # issue/issue/wait-both ordering adds no dependency on the D2H event.
 #
 # Multi-EP-group topologies (LPS-1062 guard relax): the second communicator is
-# created with use_local_synchronization=True (member-local rendezvous — every
-# rank creates exactly one group, its own EP group's, so torch's
-# same-global-creation-order rule is trivially satisfied and non-member ranks
-# do not participate) and a per-EP-group group_desc (moe_probs_a2a_ep_<first
-# rank>) so disjoint groups never share store keys. The EP-span check is
-# telemetry-only: a non-spanning group arms the same way and is flagged in the
-# armed line. On-box multi-EP-group verification: pending at port time
-# (PP2/CP8/EP8 2x8 B300 canary, LPS-1062 W1 V0-V3).
+# created with use_local_synchronization=True — member-local rendezvous, and
+# torch names the group by hashing its ranks, so disjoint EP groups never
+# share store keys by construction; every rank creates exactly one group (its
+# own EP group's), satisfying torch's same-global-creation-order rule. A
+# per-EP-group group_desc (moe_probs_a2a_ep_<first rank>) labels the comm in
+# PG dumps / flight recorder. The EP-span check is telemetry-only: a
+# non-spanning group arms the same way and is flagged in the armed line.
+# On-box multi-EP-group verification: pending at port time (PP2/CP8/EP8
+# 2x8 B300 canary, LPS-1062 W1 V0-V3).
 #
 # Numerics: bitwise-safe. Both collectives move bytes verbatim; the second
 # communicator carries the identical messages the EP communicator would.
@@ -600,13 +601,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 spans_world = _probs_a2a_ep_spans_world(ep_ranks, world_size)
                 if MoEAlltoAllTokenDispatcher._probs_a2a_group is None:
                     # use_local_synchronization=True: the creation rendezvous is
-                    # member-local, so disjoint EP groups create their second
-                    # communicators concurrently without cross-talk (each rank
-                    # creates exactly one group — its own EP group's — so
-                    # torch's same-global-creation-order rule is trivially
-                    # satisfied). group_desc keeps the groups' store keys
-                    # distinct; the first EP rank deterministically identifies
-                    # the group.
+                    # member-local, and torch names the group by a HASH of its
+                    # ranks (_process_group_name(use_hashed_name=True)), so
+                    # disjoint EP groups get distinct store keys by
+                    # construction — no cross-talk — and each rank creates
+                    # exactly one group (its own EP group's), satisfying
+                    # torch's same-global-creation-order rule. group_desc is
+                    # not part of the store key; it labels the communicator in
+                    # torch's PG dumps / flight recorder so the per-EP-group
+                    # comms are distinguishable on-box.
                     MoEAlltoAllTokenDispatcher._probs_a2a_group = (
                         torch.distributed.new_group(
                             ep_ranks,
