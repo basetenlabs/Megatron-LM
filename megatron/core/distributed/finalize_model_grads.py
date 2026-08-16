@@ -374,9 +374,17 @@ def _allreduce_non_tensor_model_parallel_grads(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
-    All-reduce both layernorm grads (for sequence parallelism) and
-    gradients from modules with average_gradients_across_tp_domain=True
-    across tensor-model-parallel ranks.
+    All-reduce layernorm grads (for sequence parallelism) and gradients from
+    modules marked for TP-domain reduction, across tensor-model-parallel ranks.
+
+    Two per-parameter markers select the reduction operator:
+      - ``average_gradients_across_tp_domain=True`` -> ReduceOp.AVG
+      - ``sum_gradients_across_tp_domain=True``     -> ReduceOp.SUM
+
+    Sequence-parallel and qk_layernorm parameters also use SUM. A parameter
+    carrying neither marker (and not sequence-parallel/qk_layernorm) is not
+    reduced here at all, so a model that sets an unrecognized marker name will
+    silently desynchronize its replicas under TP>1.
     """
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     if tp_group.size() <= 1:
@@ -403,9 +411,17 @@ def _allreduce_non_tensor_model_parallel_grads(
                     else:
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
-                # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                # Check if this param needs sum reduction. Three sources:
+                #  - sum_gradients_across_tp_domain: an explicit per-parameter
+                #    marker, symmetric with average_gradients_across_tp_domain
+                #    above. Models with TP-replicated parameters whose gradients
+                #    must be summed (rather than averaged) set this directly.
+                #  - sequence parallel
+                #  - qk_layernorm
+                elif (
+                    getattr(param, "sum_gradients_across_tp_domain", False)
+                    or (config.sequence_parallel and getattr(param, "sequence_parallel", False))
+                    or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))
                 ):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)

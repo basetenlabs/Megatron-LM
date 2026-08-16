@@ -192,3 +192,130 @@ class TestAllReduceLNGrads:
         embd_group = parallel_state.get_embedding_group()
 
         _allreduce_word_embedding_grads([self.model], self.transformer_config, embd_group, pp_group)
+
+
+class _TPReplicatedMarkerModel(torch.nn.Module):
+    """Minimal module exposing parameters with explicit TP-domain markers.
+
+    Deliberately avoids a full GPTModel: this test is about which reduction
+    operator ``_allreduce_non_tensor_model_parallel_grads`` applies to a marked
+    parameter, not about model construction.
+    """
+
+    def __init__(self, marker: str = None):
+        super().__init__()
+        self.ddp_config = DistributedDataParallelConfig()
+        # Parameter under test: carries the marker (if any).
+        self.marked = torch.nn.Parameter(torch.zeros(4))
+        # Control parameter: never marked, must not be touched.
+        self.unmarked = torch.nn.Parameter(torch.zeros(4))
+        if marker is not None:
+            setattr(self.marked, marker, True)
+
+
+def _marker_test_config():
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        # Both off, so the only thing that can select a reduction is the
+        # explicit per-parameter marker.
+        sequence_parallel=False,
+        qk_layernorm=False,
+    )
+
+
+class TestTPDomainGradientReductionOperator:
+    """Lock the *operator* used for TP-domain gradient reduction.
+
+    Regression coverage for the Kimi-K3 defect where a model marked
+    replicated parameters with ``sum_gradients_across_tp_domain`` but MCore
+    consumed only the ``average_`` variant, so the marker was silently ignored
+    and replicas drifted apart under TP>1 full-weight training.
+
+    These tests give each rank a *distinct* local gradient, which is what makes
+    the reduction operator observable. A test that only compared replicas for
+    equality would pass under SUM and AVG alike, and would therefore certify a
+    wrong operator.
+    """
+
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _rank_distinct_grad(param, rank):
+        # rank 0 -> 1.0, rank 1 -> 10.0. Chosen so SUM (11.0), AVG (5.5) and
+        # no-reduction (1.0 or 10.0) are all mutually distinguishable.
+        return torch.full_like(param, 1.0 if rank == 0 else 10.0)
+
+    def _run(self, marker):
+        tp_size = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        rank = parallel_state.get_tensor_model_parallel_rank()
+
+        model = _TPReplicatedMarkerModel(marker=marker).cuda()
+        config = _marker_test_config()
+        for param in model.parameters():
+            param.grad = self._rank_distinct_grad(param, rank)
+
+        _allreduce_non_tensor_model_parallel_grads(
+            [model], config, parallel_state.get_tensor_model_parallel_group()
+        )
+        return model
+
+    def test_sum_marker_reduces_with_sum_not_average(self):
+        """The marked gradient must equal the SUM across TP ranks."""
+        model = self._run("sum_gradients_across_tp_domain")
+
+        expected_sum = 11.0  # 1.0 + 10.0
+        average = 5.5
+
+        actual = model.marked.grad
+        torch.testing.assert_close(
+            actual, torch.full_like(actual, expected_sum), rtol=0, atol=1e-6
+        )
+
+        # Explicitly pin the failure modes this test exists to catch, so the
+        # intent survives future edits.
+        assert not torch.allclose(actual, torch.full_like(actual, average)), (
+            "gradient was AVG-reduced; sum_gradients_across_tp_domain requires SUM"
+        )
+        assert not torch.allclose(actual, torch.full_like(actual, 1.0)) and not torch.allclose(
+            actual, torch.full_like(actual, 10.0)
+        ), "gradient was not reduced at all; the marker was ignored"
+
+    def test_sum_marker_leaves_replicas_equal(self):
+        """Separately from the operator, replicas must agree afterwards.
+
+        Asserted independently of the SUM check above: replica equality is
+        necessary but *not* sufficient, since it also holds under AVG.
+        """
+        model = self._run("sum_gradients_across_tp_domain")
+
+        actual = model.marked.grad
+        gathered = [torch.empty_like(actual) for _ in range(2)]
+        dist.all_gather(gathered, actual, group=parallel_state.get_tensor_model_parallel_group())
+        torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=1e-6)
+
+    def test_average_marker_still_reduces_with_average(self):
+        """The pre-existing average contract is unchanged by the sum routing."""
+        model = self._run("average_gradients_across_tp_domain")
+
+        actual = model.marked.grad
+        torch.testing.assert_close(actual, torch.full_like(actual, 5.5), rtol=0, atol=1e-6)
+
+    def test_unmarked_parameter_is_not_reduced(self):
+        """Control: routing the sum marker must not over-reduce other params."""
+        rank_value = None
+        model = self._run("sum_gradients_across_tp_domain")
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        rank_value = 1.0 if rank == 0 else 10.0
+
+        actual = model.unmarked.grad
+        torch.testing.assert_close(
+            actual, torch.full_like(actual, rank_value), rtol=0, atol=1e-6
+        )
