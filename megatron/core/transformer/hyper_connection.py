@@ -50,6 +50,7 @@ def finalize_mhc_recompute_layer(
     if mhc_manager is not None and is_last_in_recompute_block:
         mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
+
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
 
@@ -277,9 +278,13 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        x_2d = x.reshape(s * b, nC)
-        proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
-        return proj.view(s, b, -1), r.view(s, b, 1)
+        # The mHC mapping computation runs in FP32: the parameters are kept in
+        # FP32 and the activations are upcast here, then compute_mappings casts
+        # the bounded mixing weights back to the activation dtype.
+        x_2d = x.reshape(s * b, nC).to(torch.float32)
+        weight = self.mapping_proj.weight.to(torch.float32)
+        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
