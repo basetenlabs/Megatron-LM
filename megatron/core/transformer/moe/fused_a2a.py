@@ -666,6 +666,10 @@ def nccl_ep_finalize():
 
 if HAVE_TE_EP:
 
+    def alloc_ep_symm_buffer(shape, dtype, ep_group):
+        """Allocate one persistent NCCL symmetric-memory payload buffer."""
+        return te_ep.symm_mem_alloc(shape, dtype, ep_group)
+
     def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
@@ -676,8 +680,8 @@ if HAVE_TE_EP:
     ):
         """Build a fresh TE EpBuffer for one dispatch/combine pair.
 
-        The buffer owns handle_mem (the routing table dispatch writes and combine reads) and
-        the receive buffers; a new one is built per dispatch and dropped after combine.
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads). Payload
+        buffers are caller supplied for zero-copy or allocated by TE for the normal path.
         """
         return te_ep.EpBuffer(
             top_k=top_k,
@@ -688,7 +692,9 @@ if HAVE_TE_EP:
             alignment=alignment,
         )
 
-    def nccl_ep_dispatch(buffer, tokens, topk_idx, topk_weights):
+    def nccl_ep_dispatch(
+        buffer, tokens, topk_idx, topk_weights, recv_tokens=None, recv_topk_weights=None
+    ):
         """Autograd-aware prepare + dispatch via TransformerEngine NCCL EP.
 
         Args:
@@ -698,6 +704,8 @@ if HAVE_TE_EP:
             topk_idx (torch.Tensor): ``int64`` ``[num_local_tokens, top_k]`` global expert
                 ids per token.
             topk_weights (torch.Tensor): ``float32`` ``[num_local_tokens, top_k]`` weights.
+            recv_tokens, recv_topk_weights (torch.Tensor, optional): caller-owned symmetric
+                dispatch receive buffers. When omitted, Transformer Engine allocates them.
 
         Returns:
             tuple: ``(recv_tokens, tokens_per_expert, dispatched_probs)``:
@@ -712,11 +720,16 @@ if HAVE_TE_EP:
             ``tokens_per_expert`` is non-differentiable.
         """
         recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
-            buffer, tokens, topk_idx, topk_weights
+            buffer,
+            tokens,
+            topk_idx,
+            topk_weights,
+            recv_tokens=recv_tokens,
+            recv_topk_weights=recv_topk_weights,
         )
         return recv_tokens, tokens_per_expert, dispatched_probs
 
-    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None):
+    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None, grad_out=None):
         """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
 
         Args:
@@ -725,14 +738,19 @@ if HAVE_TE_EP:
                 already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
                 forward). When None, TE uses ``buffer.max_tokens_per_rank``.
+            grad_out (torch.Tensor, optional): caller-owned symmetric buffer used by combine
+                backward for the expert-output gradient.
 
         Returns:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
-        return te_ep.ep_combine(buffer, expert_out, num_local_tokens=num_local_tokens)
+        return te_ep.ep_combine(
+            buffer, expert_out, num_local_tokens=num_local_tokens, grad_out=grad_out
+        )
 
 else:
+    alloc_ep_symm_buffer = None
     new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None

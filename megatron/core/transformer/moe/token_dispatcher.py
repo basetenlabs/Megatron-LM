@@ -2,6 +2,7 @@
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
@@ -212,6 +214,10 @@ class MoETokenDispatcher:
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
+
+    def get_expert_zero_copy_buffers(self):
+        """Return expert output/dgrad buffers when a dispatcher supports zero-copy."""
+        return None, None
 
     def _clear_forward_state(self, *attr_names: str) -> None:
         """Drop per-forward hand-off references once the dispatcher has consumed them."""
@@ -1461,6 +1467,11 @@ class _NCCLEPManager(_DispatchManager):
     lazily on the first dispatch, when the local token count is known.
     """
 
+    # Persistent symmetric payload buffers are shared by every per-layer manager.
+    _zc_fwd_token_buf = None
+    _zc_bwd_token_buf = None
+    _zc_recv_topk_weights_buf = None
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -1493,29 +1504,25 @@ class _NCCLEPManager(_DispatchManager):
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
-        if config.moe_ncclep_use_symm_mem:
-            raise NotImplementedError(
-                "moe_ncclep_use_symm_mem (symm-mem / zero-copy EP payload buffers) is not "
-                "supported yet."
+        self.zero_copy = config.moe_ncclep_zero_copy
+        self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
+        if self.zero_copy and not self.static_shape:
+            raise ValueError(
+                "moe_ncclep_zero_copy requires moe_ncclep_static_shape for fixed symmetric buffers"
             )
         if self.static_shape:
-            if torch.cuda.get_device_capability()[0] < 10:
+            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_ncclep_static_shape=True requires an sm100+ (Blackwell or later) GPU with "
-                    "a CuTe DSL / device-offset grouped GEMM; leave it False (dynamic shape) on "
-                    "older GPUs."
+                    "moe_ncclep_static_shape=True requires both the Transformer Engine op-fuser "
+                    "and grouped GEMM"
                 )
-            if not (config.use_transformer_engine_op_fuser or config.moe_grouped_gemm):
-                raise ValueError(
-                    "moe_ncclep_static_shape=True requires the fused grouped GEMM; enable "
-                    "use_transformer_engine_op_fuser (or moe_grouped_gemm)."
-                )
-            if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                raise ValueError(
-                    "moe_ncclep_static_shape=True requires the CuTe DSL grouped GEMM; set "
-                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume ragged "
-                    "per-expert counts on device)."
-                )
+            if config.fp8 or config.fp4:
+                if torch.cuda.get_device_capability()[0] < 10:
+                    raise ValueError("quantized NCCL-EP static shapes require Blackwell or later")
+                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+                    raise ValueError(
+                        "quantized NCCL-EP static shapes require NVTE_CUTEDSL_FUSED_GROUPED_MLP=1"
+                    )
 
         if nccl_ep_dispatch is None:
             raise ImportError(
@@ -1581,8 +1588,27 @@ class _NCCLEPManager(_DispatchManager):
                 if self.config.moe_flex_dispatcher_num_sms is not None
                 else 0
             ),
-            zero_copy=False,
+            zero_copy=self.zero_copy,
         )
+        if self.zero_copy and _NCCLEPManager._zc_bwd_token_buf is None:
+            if self.config.overlap_moe_expert_parallel_comm:
+                warnings.warn(
+                    "NCCL-EP zero-copy with 1F1B overlap stages dispatch-backward dgrad once",
+                    stacklevel=2,
+                )
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("allocate NCCL-EP zero-copy buffers before graph capture")
+            rc, hidden = self._recv_capacity, self.hidden_dim
+            _NCCLEPManager._zc_bwd_token_buf = alloc_ep_symm_buffer(
+                (rc, hidden), torch.bfloat16, self.group
+            )
+            _NCCLEPManager._zc_fwd_token_buf = alloc_ep_symm_buffer(
+                (rc, hidden), torch.bfloat16, self.group
+            )
+            if self._zc_quant:
+                _NCCLEPManager._zc_recv_topk_weights_buf = alloc_ep_symm_buffer(
+                    (rc,), torch.float32, self.group
+                )
         self._bootstrapped = True
 
     def dispatch(
@@ -1611,10 +1637,15 @@ class _NCCLEPManager(_DispatchManager):
         #   tokens_per_expert: [num_local_experts]
         #   dispatched_probs: [recv_capacity_per_rank]
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
-            self._buffer, hidden_states, topk_idx, topk_weights
+            self._buffer,
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
+            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-        self.dispatched_probs = dispatched_probs
+        self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1653,7 +1684,10 @@ class _NCCLEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
         hidden_states = nccl_ep_combine(
-            self._buffer, hidden_states, num_local_tokens=self.num_local_tokens
+            self._buffer,
+            hidden_states,
+            num_local_tokens=self.num_local_tokens,
+            grad_out=_NCCLEPManager._zc_bwd_token_buf,
         )
         # Drop the buffer; backward keeps handle_mem alive via save_for_backward.
         self._buffer = None
@@ -1722,6 +1756,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
             )
+
+    def get_expert_zero_copy_buffers(self):
+        """Return detached symmetric expert buffers for NCCL-EP zero-copy."""
+
+        def detached(name):
+            buffer = getattr(self._comm_manager, name, None)
+            return buffer.detach() if buffer is not None else None
+
+        grad_input = (
+            None
+            if self.config.overlap_moe_expert_parallel_comm
+            else detached("_zc_bwd_token_buf")
+        )
+        return detached("_zc_fwd_token_buf"), grad_input
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

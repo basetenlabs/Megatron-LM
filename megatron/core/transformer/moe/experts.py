@@ -61,9 +61,18 @@ if HAVE_TE:
     import transformer_engine as te
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+    try:
+        from transformer_engine.pytorch.ops.basic.grouped_linear import (
+            GRAD_INPUT_BUFFER_KEY,
+            OUTPUT_BUFFER_KEY,
+        )
+    except ImportError:
+        GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
+    GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 
 try:
     import flashinfer.fused_moe as fused_moe
@@ -561,6 +570,8 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        output_buffer: Optional[torch.Tensor] = None,
+        grad_input_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
@@ -618,15 +629,29 @@ class TEGroupedMLP(MegatronModule):
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
             forced_released_tensors = (
-                [permuted_local_hidden_states] if fine_grained_activation_offloading else []
+                [permuted_local_hidden_states]
+                if fine_grained_activation_offloading and output_buffer is None
+                else []
             )
             with stash_context:
+                op_kwargs = {}
+                if output_buffer is not None:
+                    if OUTPUT_BUFFER_KEY is None:
+                        raise RuntimeError("Transformer Engine lacks grouped-linear output buffers")
+                    op_kwargs[-1] = {OUTPUT_BUFFER_KEY: output_buffer}
+                if grad_input_buffer is not None:
+                    if GRAD_INPUT_BUFFER_KEY is None:
+                        raise RuntimeError(
+                            "Transformer Engine lacks grouped-linear grad-input buffers"
+                        )
+                    op_kwargs[0] = {GRAD_INPUT_BUFFER_KEY: grad_input_buffer}
                 # Call fused impl
                 output = ops(
                     permuted_local_hidden_states,
                     tokens_per_expert,  # FC1
                     permuted_probs,  # Scaled activation
                     tokens_per_expert,  # FC2
+                    **({"op_kwargs": op_kwargs} if op_kwargs else {}),
                 )
         output = fused_group_mlp_manager.group_offload(
             output, forced_released_tensors=forced_released_tensors
@@ -652,6 +677,8 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        output_buffer: Optional[torch.Tensor] = None,
+        grad_input_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -660,6 +687,8 @@ class TEGroupedMLP(MegatronModule):
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
             permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            output_buffer (torch.Tensor, optional): Preallocated symmetric FC2 output buffer.
+            grad_input_buffer (torch.Tensor, optional): Preallocated symmetric FC1 dgrad buffer.
 
         Return:
             output (torch.Tensor): The output of the local experts.
@@ -668,10 +697,17 @@ class TEGroupedMLP(MegatronModule):
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                output_buffer,
+                grad_input_buffer,
             )
             output_bias = None
             return output, output_bias
+        assert (
+            output_buffer is None and grad_input_buffer is None
+        ), "NCCL-EP zero-copy buffers require the Transformer Engine op-fuser path"
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
