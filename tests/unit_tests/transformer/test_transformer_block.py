@@ -20,7 +20,10 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    get_transformer_layer_offset,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -959,3 +962,35 @@ class TestPipelineParallelLayoutTransformerBlock:
                 f"Expected: {expected_repr!r}\n"
                 f"Got: {repr_result!r}"
             )
+
+    @pytest.mark.parametrize(
+        "layout_str, pp_size, num_layers, expected_offsets",
+        [
+            # 3 stages holding 2, 3 and 2 decoder layers.
+            ("Et*2|t*3|t*2,L", 3, 7, [0, 2, 5]),
+            # 4 stages holding 1, 3, 3 and 1 decoder layers.
+            ("Et|t*3|t*3|t,L", 4, 8, [0, 1, 4, 7]),
+        ],
+    )
+    def test_layer_offset_honours_explicit_pp_rank(
+        self, layout_str, pp_size, num_layers, expected_offsets
+    ):
+        """get_transformer_layer_offset must answer for the rank it is given.
+
+        A caller that needs every stage's first layer index asks for each rank in
+        turn from one process. The custom-layout branch dropped the argument and
+        answered for the local rank every time, collapsing the answers to one
+        value.
+        """
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=128,
+            num_attention_heads=8,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_layout=PipelineParallelLayerLayout.from_str(
+                layout_str, pp_size
+            ),
+        )
+        offsets = [get_transformer_layer_offset(config, None, rank) for rank in range(pp_size)]
+        assert offsets == expected_offsets
