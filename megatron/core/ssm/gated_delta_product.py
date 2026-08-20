@@ -422,7 +422,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+<<<<<<< HEAD
             pg_collection=self.pg_collection,
+=======
+            b10_mgr_demo_kwarg=True,
+>>>>>>> 1a044a355 ([baseten] gdp: manager-demo kwarg on out_proj)
             name=(name + f".out_proj") if name is not None else None,
         )
 
