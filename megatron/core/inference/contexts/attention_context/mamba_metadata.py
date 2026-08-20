@@ -1,6 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+<<<<<<< HEAD
 from typing import Optional, Tuple
+=======
+from typing import Optional, Sequence
+>>>>>>> 82ee93e1b ([baseten] inference: Sequence typing for mamba metadata (overnight-sim L2))
 
 import torch
 
