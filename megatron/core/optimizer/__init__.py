@@ -573,8 +573,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 # Otherwise, master weight will be managed by TransformerEngine.
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
+<<<<<<< HEAD
                 if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
                     model_chunks[0], FullyShardedDataParallelV2
+=======
+                if (
+                    config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    and not getattr(config, "b10_force_te_master_weights_off", False)
+>>>>>>> e97cd41fb ([baseten] optimizer: gate TE master weights behind b10_force_te_master_weights_off)
                 ):
                     kwargs.update(
                         {
