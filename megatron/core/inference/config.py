@@ -43,10 +43,15 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+<<<<<<< HEAD
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+=======
+    b10_demo_state_budget_mb: int = 0
+    """Demo: per-request inference state budget (MB); 0 disables the check."""
+>>>>>>> 621b7e5fc ([baseten] inference: demo state-budget field (multi-conflict A))
 
     @classmethod
     def from_model(
