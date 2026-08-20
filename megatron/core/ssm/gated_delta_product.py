@@ -422,7 +422,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+<<<<<<< HEAD
             pg_collection=self.pg_collection,
+=======
+            second_demo_kwarg_conflict=True,
+>>>>>>> 7df9d66d6 ([baseten] e2e-demo2: second synthetic conflict (out_proj site))
             name=(name + f".out_proj") if name is not None else None,
         )
 
