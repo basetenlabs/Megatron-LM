@@ -135,7 +135,11 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
-    "flash-linear-attention==0.5.1",
+    # Kimi-K3 needs >= 0.5.2, not just 0.5.x: before 0.5.2, chunk_kda accepts
+    # A_log and dt_bias through **kwargs and silently discards them, so the KDA
+    # forget gate trains wrong with nothing raised. Upstream's ==0.5.1 is below
+    # that line.
+    "flash-linear-attention>=0.5.2,<0.6",
 ]
 
 [dependency-groups]
