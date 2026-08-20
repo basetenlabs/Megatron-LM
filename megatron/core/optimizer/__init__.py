@@ -1148,11 +1148,9 @@ def get_megatron_optimizer(
             if (
                 not USING_PYTORCH_OPTIMIZER
                 and config.use_precision_aware_optimizer
-<<<<<<< HEAD
                 and not is_mfsdp_v2
-=======
                 and not getattr(config, "b10_skip_master_weight_swap", False)
->>>>>>> c08499a4a ([baseten] optimizer: master-weight swap skip flag (sim3))
+                and getattr(optimizer_part.optimizer, "master_weights", None) is not None
                 and getattr(optimizer_part.optimizer, "master_weights", None) is not None
             ):
                 # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
