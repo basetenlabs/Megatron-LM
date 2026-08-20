@@ -140,7 +140,8 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
-    "flash-linear-attention==0.5.1",
+    # Kimi K3 requires the chunk_kda A_log and dt_bias support added in 0.5.2.
+    "flash-linear-attention>=0.5.2,<0.6",
 ]
 
 [dependency-groups]
