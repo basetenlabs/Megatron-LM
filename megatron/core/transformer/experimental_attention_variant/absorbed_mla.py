@@ -34,6 +34,9 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -919,7 +922,25 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        # LPS-1062: attn_proj offload hook on
+        # the AbsorbedMLA path. The stock attention.py:1577 site never fires
+        # for this class (its forward does not run here). self.offload_attn_proj
+        # is baked by the Attention base __init__ from config.offload_modules.
+        #
+        # Safety under core_attn recompute (code-map §d, accepted by banach):
+        # the checkpoint RETURNS its output (CheckpointFunction, random.py:595)
+        # so core_attn_out is a genuine forward tensor whose only remaining
+        # consumer is linear_proj; the kernel's backward reads the recomputed
+        # graph, never this tensor. On this path _apply_absorbed_v_up_projection
+        # is a no-op (DSAttention consumes the V-up weight), so core_attn_out is
+        # single-consumer and force-release is safe. Backward ordering: the
+        # group's commit node sits downstream of linear_proj, so the reload-wait
+        # fires before linear_proj.backward reads the input; the core-attn
+        # checkpoint backward runs later and needs nothing from this group.
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
 
