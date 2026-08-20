@@ -58,7 +58,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
+<<<<<<< HEAD
         self._casted_grads = []
+=======
+        self.b10_sim_grad_norm_probe = None
+>>>>>>> d1642daed ([baseten] mfsdp: sim grad-norm probe hook (overnight-sim L1))
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
