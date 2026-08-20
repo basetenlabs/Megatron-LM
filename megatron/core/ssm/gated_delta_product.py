@@ -303,7 +303,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+<<<<<<< HEAD
             pg_collection=self.pg_collection,
+=======
+            b10_multi_demo_flag=True,
+>>>>>>> 6517ac642 ([baseten] gdp: demo flag on in_proj (multi-conflict B))
             name=(name + f".in_proj") if name is not None else None,
         )
         setattr(self.in_proj.weight, "use_muon", False)
