@@ -2093,11 +2093,37 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
-            if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
+            # ------------------------------------------------------------------
+            # LPS-1062 (CONDITIONAL relaxation — do not
+            # broaden): the guard below protects the EAGER core-attention case,
+            # where the fused attention kernel saves its own output for backward
+            # and attn_proj's force-release of that same tensor would corrupt
+            # core_attn.backward. When core_attn is instead RECOMPUTED
+            # (selective granularity), the kernel's backward reads the
+            # recomputed graph and the original output's only remaining consumer
+            # is attn_proj itself, so offloading it is safe. The relaxation is
+            # exactly: recompute_granularity == "selective" AND "core_attn" in
+            # recompute_modules (which __post_init__ has already defaulted to
+            # ["core_attn"] when unset). Under full granularity the guard still
+            # fires. This condition text is shared verbatim with the trainer-side
+            # validator (trainers control.py
+            # TrainerControllerConfig._require_core_attn_for_attn_proj_offload).
+            # ------------------------------------------------------------------
+            if (
+                "attn_proj" in self.offload_modules
+                and "core_attn" not in self.offload_modules
+                and not (
+                    self.recompute_granularity == "selective"
+                    and "core_attn" in self.recompute_modules
+                )
+            ):
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
-                    "which is needed in core_attn.backward()."
+                    "which is needed in core_attn.backward(). (Allowed when core_attn "
+                    "is recomputed: recompute_granularity == 'selective' with "
+                    "'core_attn' in recompute_modules — the backward then reads the "
+                    "recomputed graph, not the original output tensor.)"
                 )
             if (
                 "gdp_qkv" in self.offload_modules
