@@ -48,6 +48,9 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
+    b10_demo_state_budget_mb: int = 0
+    """Demo: per-request inference state budget (MB); 0 disables the check."""
+
     @classmethod
     def from_model(
         cls,
