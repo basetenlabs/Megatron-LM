@@ -75,12 +75,26 @@ def _parse_cpulist(cpulist):
 
 def _current_gpu_pci_bus_id(device_index):
     """Return the PCI bus ID ('0000:65:00.0') of the given CUDA device."""
-    # Preferred: recent torch exposes pci_bus_id on device properties.
+    # torch DOES expose pci_bus_id on device properties, but it is the integer
+    # BUS NUMBER (e.g. 26 == 0x1a), not the domain:bus:device.function string
+    # this function promises. Feeding it to /sys/bus/pci/devices/<bdf>/ builds
+    # a path that cannot exist ("/sys/bus/pci/devices/26/numa_node"), the
+    # caller catches the ENOENT, and every rank silently falls back to
+    # process-default page placement — the interleaved regime measured BELOW
+    # the offload's bandwidth requirement. So accept it only when it actually
+    # looks like a BDF, and otherwise fall through to the CUDA runtime, which
+    # returns a real one.
     try:
         props = torch.cuda.get_device_properties(device_index)
         bdf = getattr(props, "pci_bus_id", None)
-        if bdf:
+        if bdf and ":" in str(bdf):
             return str(bdf).lower()
+        # Reconstruct from the integer triple when torch gives us numbers.
+        bus = getattr(props, "pci_bus_id", None)
+        domain = getattr(props, "pci_domain_id", None)
+        dev = getattr(props, "pci_device_id", None)
+        if isinstance(bus, int) and isinstance(domain, int) and isinstance(dev, int):
+            return f"{domain:04x}:{bus:02x}:{dev:02x}.0"
     except Exception:
         pass
     # Fallback: CUDA runtime's cudaDeviceGetPCIBusId via ctypes (no extra deps).
@@ -720,13 +734,6 @@ class PipelineOffloadManager:
         # Sometimes we need to delay the offloading and launch it later.
         # The delayed offload groups are stored in a queue.
         self._delayed_offload_groups = []
-        self.reset()
-
-        # Keep the hook context object around so each offload scope can enter/exit
-        # the same autograd saved-tensor hooks without touching private torch APIs.
-        self._saved_tensors_hooks = saved_tensors_hooks(
-            self.on_save_for_backward, self.on_get_saved_tensor
-        )
         # ------------------------------------------------------------------
         # LPS-1062 change (valve telemetry), manager level:
         # iteration counter + aggregated dump cadence. The per-chunk counters
@@ -740,6 +747,17 @@ class PipelineOffloadManager:
             _os.environ.get("BT_OFFLOAD_VALVE_TELEMETRY_EVERY", "100")
         )
         self._valve_telemetry_iter = 0
+        # MUST be initialised BEFORE this reset(): reset() reads
+        # _valve_telemetry_enabled, so constructing the manager with the
+        # counters declared afterwards raises AttributeError on every offload
+        # boot, with or without the telemetry env vars set.
+        self.reset()
+
+        # Keep the hook context object around so each offload scope can enter/exit
+        # the same autograd saved-tensor hooks without touching private torch APIs.
+        self._saved_tensors_hooks = saved_tensors_hooks(
+            self.on_save_for_backward, self.on_get_saved_tensor
+        )
         # ------------------------------------------------------------------
         # LPS-1062 change (NVTE latch check). Transformer
         # Engine latches NVTE_CPU_OFFLOAD_V1 at IMPORT time (module-level
