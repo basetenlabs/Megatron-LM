@@ -107,7 +107,14 @@ dev = [
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.26.0",
+    # Floor, not an exact pin. 1.26.0's [cutedsl] extra requires
+    # nvidia-cutlass-dsl[cu13]==4.5.0 exactly, which cannot coexist with the
+    # flashinfer-python 0.6.8.post1 that megatron-bridge pins (it wants
+    # cutlass-dsl 4.5.2), so a consumer installing megatron-core[dev]
+    # alongside the bridge gets an unsolvable resolution. 1.27.0.dev and later
+    # state the same dependency as >=4.5.0, so a floor lets the consumer choose
+    # one cutlass-dsl for the whole graph. Nothing here needs 1.26.0 exactly.
+    "nvidia-cudnn-frontend[cutedsl]>=1.26.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
