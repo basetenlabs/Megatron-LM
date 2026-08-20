@@ -1515,16 +1515,25 @@ class ChunkOffloadHandler:
         # events; optional max-inflight enqueues each group's offload event and
         # has main wait on older events for this group name when its pending
         # count exceeds the cap (each name is tracked separately).
-        if self._max_inflight_offloads is not None:
-            gname = group_to_offload._name
-            self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
-            self._drain_offload_pending(gname)
-            # LPS-1062 (valve telemetry): count the commit and the
-            # post-drain pending depth for this group name.
-            if self._valve_telemetry_enabled:
-                _st = self._valve_stats[gname]
-                _st[0] += 1
-                _st[3] = max(_st[3], len(self._offload_pending_by_name[gname]))
+        # LPS-1062: enqueue and count on EVERY commit, capped or not.
+        # These three statements used to live inside
+        # ``if self._max_inflight_offloads is not None``, which made
+        # max_pending unobservable in the uncapped default configuration —
+        # the one configuration where the depth actually matters. With no cap
+        # the main stream never waits on a d2h event, and every offloaded
+        # tensor's device block stays un-reusable (record_stream, above) until
+        # d2h catches up, so the pending depth IS the memory overshoot. The
+        # arm that OOMed at 131k/d2 reported "(no offload commits recorded)"
+        # for this reason and not because the offload was idle.
+        # ``_drain_offload_pending`` returns immediately when uncapped, and
+        # the deque is cleared per iteration in ``reset()``.
+        gname = group_to_offload._name
+        self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
+        self._drain_offload_pending(gname)
+        if self._valve_telemetry_enabled:
+            _st = self._valve_stats[gname]
+            _st[0] += 1
+            _st[3] = max(_st[3], len(self._offload_pending_by_name[gname]))
 
     @staticmethod
     def _record_offload_transfer(tensor_on_device, state, storage_records):
