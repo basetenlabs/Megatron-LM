@@ -303,7 +303,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+<<<<<<< HEAD
             pg_collection=self.pg_collection,
+=======
+            demo_kwarg_for_nightly_conflict=True,
+>>>>>>> b7d1851f7 ([baseten] e2e-demo: synthetic patch that conflicts with upstream #6687)
             name=(name + f".in_proj") if name is not None else None,
         )
         setattr(self.in_proj.weight, "use_muon", False)
