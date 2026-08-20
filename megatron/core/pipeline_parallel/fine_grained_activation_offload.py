@@ -34,6 +34,166 @@ def debug_rank(message):
         print(message)
 
 
+# ======================================================================
+# LPS-1062 activation placement. This file
+# carries FIVE separately-revertable hunks, each marked inline:
+#   - pool fix: MoE offload groups use the shared pinned CPU
+#                             pool; pad-to-bucket keeps pool keys constant
+#                             under routing jitter.
+#   - NUMA binding: pinned buffers are allocated under a
+#                             thread-affinity window on the GPU's local
+#                             NUMA node with explicit first-touch.
+#   - placement verify: one-shot move_pages spot-check per pool
+#                             key, logged at WARNING at build time.
+#   - valve telemetry: env-gated counters for the backpressure
+#                             valve's drain behavior; aggregated dump.
+# The offload-module vocabulary and validation guards live in transformer_config.py.
+# ======================================================================
+
+
+def _env_flag(name, default):
+    """Parse a boolean-ish env var ('1'/true/yes/on vs '0'/false/no/off)."""
+    import os
+
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_cpulist(cpulist):
+    """Parse a Linux cpulist string ('0-63,128-191') into a set of ints."""
+    cpus = set()
+    for part in cpulist.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _current_gpu_pci_bus_id(device_index):
+    """Return the PCI bus ID ('0000:65:00.0') of the given CUDA device."""
+    # Preferred: recent torch exposes pci_bus_id on device properties.
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        bdf = getattr(props, "pci_bus_id", None)
+        if bdf:
+            return str(bdf).lower()
+    except Exception:
+        pass
+    # Fallback: CUDA runtime's cudaDeviceGetPCIBusId via ctypes (no extra deps).
+    import ctypes
+    import ctypes.util
+
+    libname = ctypes.util.find_library("cudart") or "libcudart.so"
+    libcudart = ctypes.CDLL(libname)
+    buf = ctypes.create_string_buffer(64)
+    # cudaDeviceGetPCIBusId(char *pciBusId, int len, int device)
+    rc = libcudart.cudaDeviceGetPCIBusId(buf, 64, device_index)
+    if rc != 0:
+        raise RuntimeError(f"cudaDeviceGetPCIBusId failed with rc={rc}")
+    return buf.value.decode().lower()
+
+
+def _resolve_local_numa_cpus():
+    """LPS-1062: resolve (cpu_set, node_id) of the NUMA node local to
+    this rank's GPU. Returns (None, None) when binding is disabled or
+    unresolvable. Every failure path logs a WARNING (loud, never silent):
+    interleaved placement is a structural bandwidth failure for offload
+    (~30-40% below requirement at all-8 bidirectional load).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    if not _env_flag("BT_OFFLOAD_NUMA_BIND", "1"):
+        logger.warning(
+            "BT_OFFLOAD_NUMA_BIND=off: pinned offload buffers use process-default "
+            "page placement (interleaved-class bandwidth). This is the A/B control arm."
+        )
+        return None, None
+    try:
+        device_index = torch.cuda.current_device()
+        bdf = _current_gpu_pci_bus_id(device_index)
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+        if node < 0:
+            raise RuntimeError(f"GPU {bdf} reports numa_node={node}")
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            cpus = _parse_cpulist(f.read())
+        if not cpus:
+            raise RuntimeError(f"empty cpulist for NUMA node {node}")
+        logger.warning(
+            "BT_OFFLOAD_NUMA_BIND: GPU %s (cuda:%d) -> NUMA node %d, %d local CPUs; "
+            "pinned offload buffers will be first-touched on this node",
+            bdf,
+            device_index,
+            node,
+            len(cpus),
+        )
+        return cpus, node
+    except Exception as e:  # fail loud, fall back to default placement
+        logger.warning(
+            "BT_OFFLOAD_NUMA_BIND: could not resolve the GPU's local NUMA node (%s); "
+            "pinned offload buffers fall back to process-default placement — expect "
+            "interleave-class bandwidth",
+            e,
+        )
+        return None, None
+
+
+def _verify_numa_placement(tensor, expected_node):
+    """LPS-1062: spot-check a pinned buffer's page placement with the
+    move_pages syscall and log the per-node page distribution at WARNING.
+    Never raises: a failed query logs and returns. Runs once per
+    (shape, dtype) pool at first allocation — never on the hot path.
+    """
+    import logging
+    import os
+
+    logger = logging.getLogger(__name__)
+    try:
+        import ctypes
+        from collections import Counter
+
+        page_size = int(os.sysconf("SC_PAGESIZE"))
+        base = tensor.data_ptr()
+        nbytes = tensor.numel() * tensor.element_size()
+        first_page = base - (base % page_size)
+        last_page = (base + nbytes - 1) - ((base + nbytes - 1) % page_size)
+        n_samples = 16
+        step = max(page_size, ((last_page - first_page) // n_samples) // page_size * page_size)
+        addrs = []
+        addr = first_page
+        while addr <= last_page and len(addrs) < n_samples:
+            addrs.append(addr)
+            addr += step
+        count = len(addrs)
+        if count == 0:
+            return
+        pages = (ctypes.c_void_p * count)(*addrs)
+        status = (ctypes.c_int * count)(*([-1] * count))
+        libc = ctypes.CDLL(None, use_errno=True)
+        # x86_64 SYS_move_pages = 279; nodes=NULL + flags=0 => query only.
+        rc = libc.syscall(279, 0, count, pages, None, status, 0)
+        if rc != 0:
+            logger.warning(
+                "BT_OFFLOAD_NUMA_VERIFY: move_pages query failed (rc=%d) — placement unverified",
+                rc,
+            )
+            return
+        dist = Counter(int(s) for s in status)
+        logger.warning(
+            "BT_OFFLOAD_NUMA_VERIFY: pinned buffer %d bytes, page nodes %s (expected node %d)",
+            nbytes,
+            dict(sorted(dist.items())),
+            expected_node,
+        )
+    except Exception as e:
+        logger.warning("BT_OFFLOAD_NUMA_VERIFY: verification failed: %s", e)
+
+
 def _te_do_not_offload(tensor):
     """Return whether TE marked a tensor-like object as non-offloadable."""
     if getattr(tensor, "_TE_do_not_offload", False):
@@ -176,6 +336,33 @@ class OffloadTensorPool:
         self.device = torch.device(device)
         self.pin_memory = pin_memory
 
+        # ------------------------------------------------------------------
+        # LPS-1062 change (NUMA-local pinned allocation).
+        # On the 8-GPU/2-socket training box an unbound process gets
+        # interleaved page placement, measured ~30-40% below the offload
+        # bandwidth requirement at all-8 bidirectional load
+        # (ALL8_BIDI_OFFLOAD_BW_BENCH.md). numactl is not installed on the
+        # box, so binding happens here, in-allocator: pinned buffers are
+        # allocated under a thread-affinity window on the GPU's local NUMA
+        # node with explicit first-touch. BT_OFFLOAD_NUMA_BIND=off opts out
+        # (A/B control arm).
+        # ------------------------------------------------------------------
+        self._numa_cpus = None
+        self._numa_node = None
+        if self.device.type == "cpu" and self.pin_memory:
+            self._numa_cpus, self._numa_node = _resolve_local_numa_cpus()
+        # ------------------------------------------------------------------
+        # LPS-1062 change (placement verification): one-shot
+        # move_pages spot-check per (shape, dtype) pool, logged at WARNING so
+        # a misplacement is loud at boot rather than discovered later as
+        # "offload underperforms". Default ON when binding is active;
+        # BT_OFFLOAD_NUMA_VERIFY=0 silences. Never on the hot path.
+        # ------------------------------------------------------------------
+        self._numa_verify_enabled = self._numa_cpus is not None and _env_flag(
+            "BT_OFFLOAD_NUMA_VERIFY", "1"
+        )
+        self._numa_verified_keys = set()
+
         # Maintain a separate pool for each (shape, dtype) combination
         # Structure: {(shape, dtype): {'free': deque, 'all': list, 'allocated_count': int}}
         self._pools: Dict[Tuple, Dict[str, Any]] = {}
@@ -241,10 +428,15 @@ class OffloadTensorPool:
             )
         else:
             # Allocate a new tensor
-            tensor = torch.empty(shape, dtype=dtype, device=self.device, pin_memory=self.pin_memory)
+            # LPS-1062: NUMA-local allocation when binding resolved.
+            tensor = self._allocate_host_tensor(shape, dtype)
             pool['all'].append(tensor)
             self._stats['total_allocated'] += 1
             self._stats['pool_misses'] += 1
+            # LPS-1062: one-shot placement verification per pool key.
+            if self._numa_verify_enabled and pool_key not in self._numa_verified_keys:
+                self._numa_verified_keys.add(pool_key)
+                _verify_numa_placement(tensor, self._numa_node)
 
             memory_mb = self._calculate_memory_size(shape, dtype) / (1024**2)
             debug_rank(
@@ -257,6 +449,28 @@ class OffloadTensorPool:
         pool['allocated_count'] += 1
         self._stats['current_in_use'] += 1
 
+        return tensor
+
+    def _allocate_host_tensor(self, shape, dtype):
+        """LPS-1062: allocate a (possibly pinned) host tensor, NUMA-local
+        when binding resolved. Mirrors the proven bench sequence
+        (all8_bidi_bw.cu): pin the calling thread to a local-NUMA CPU set,
+        allocate, then explicitly first-touch every page inside the affinity
+        window. Affinity is restored in finally; the window wraps only the
+        allocation, never compute. Pool misses only (steady state reuses).
+        """
+        if self.device.type != "cpu" or not self.pin_memory or not self._numa_cpus:
+            return torch.empty(shape, dtype=dtype, device=self.device, pin_memory=self.pin_memory)
+        import os
+
+        prev_affinity = os.sched_getaffinity(0)
+        try:
+            os.sched_setaffinity(0, self._numa_cpus)
+            tensor = torch.empty(shape, dtype=dtype, device=self.device, pin_memory=True)
+            # Explicit first-touch: place the pages on the local node now.
+            tensor.zero_()
+        finally:
+            os.sched_setaffinity(0, prev_affinity)
         return tensor
 
     def free(self, tensor: torch.Tensor):
@@ -398,13 +612,19 @@ class OffloadTensorGroup:
         # Warmup-only bookkeeping for redundant copies within this group.
         self.duplicate_storage_tensor_count = 0
         self.duplicate_storage_bytes = 0
-        # Using memory pool is for the compatibility with cuda graph.
-        # Shapes of tensors for MoE activation offload groups are not known in advance,
-        # so we do not use CPU pool for them.
-        if name in ("expert_fc1", "moe_act", "fused_group_mlp"):
-            self.use_cpu_pool = False
-        else:
-            self.use_cpu_pool = True
+        # ------------------------------------------------------------------
+        # LPS-1062 change (pool fix): upstream forced the
+        # MoE offload groups ("expert_fc1", "moe_act", "fused_group_mlp") off
+        # the shared CPU pool ("shapes not known in advance"), so every
+        # layer's offload paid a fresh pinned allocation (cudaHostAlloc) per
+        # tensor — measured at ~30% of the offload benefit in the 32k trial.
+        # All groups now use the pool; pool-key stability for
+        # routing-jittered MoE shapes comes from pad-to-bucket in
+        # ChunkOffloadHandler.offload (same hunk). We run no full-iteration
+        # CUDA graphs, so the upstream cuda-graph-compat rationale does not
+        # apply.
+        # ------------------------------------------------------------------
+        self.use_cpu_pool = True
 
     def push_tensor(self, tag, tensor):
         """Push a tensor to the group."""
@@ -507,6 +727,29 @@ class PipelineOffloadManager:
         self._saved_tensors_hooks = saved_tensors_hooks(
             self.on_save_for_backward, self.on_get_saved_tensor
         )
+        # ------------------------------------------------------------------
+        # LPS-1062 change (valve telemetry), manager level:
+        # iteration counter + aggregated dump cadence. The per-chunk counters
+        # live on ChunkOffloadHandler; this aggregates across microbatches so
+        # the dump is one line per N training iterations, not per chunk.
+        # ------------------------------------------------------------------
+        import os as _os
+
+        self._valve_telemetry_enabled = _env_flag("BT_OFFLOAD_VALVE_TELEMETRY", "0")
+        self._valve_telemetry_every = int(
+            _os.environ.get("BT_OFFLOAD_VALVE_TELEMETRY_EVERY", "100")
+        )
+        self._valve_telemetry_iter = 0
+        # ------------------------------------------------------------------
+        # LPS-1062 change (NVTE latch check). Transformer
+        # Engine latches NVTE_CPU_OFFLOAD_V1 at IMPORT time (module-level
+        # getenv in TE's cpu_offload.py); the trainer validator reads the env
+        # lazily. So "export in the launcher env" boots fine, but "set
+        # worker-side after TE import" passes the validator while TE silently
+        # keeps the V0 path. Checked once per process at the first offload
+        # engagement (the exact point the latch starts to matter).
+        # ------------------------------------------------------------------
+        self._nvte_latch_checked = False
 
     @property
     def d2h_stream(self):
@@ -567,6 +810,52 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.reset()
         self._delayed_offload_groups = []
+        # LPS-1062 (valve telemetry): aggregated dump every N
+        # iterations when enabled. reset() is driven per training iteration
+        # from schedules.py; the cadence gate keeps this quiet by default.
+        if self._valve_telemetry_enabled:
+            self._valve_telemetry_iter += 1
+            if self._valve_telemetry_iter % max(self._valve_telemetry_every, 1) == 0:
+                self._dump_valve_telemetry()
+
+    def get_valve_telemetry(self):
+        """LPS-1062: aggregate per-group-name valve counters across all
+        cached chunk handlers (microbatches). Returns
+        {name: [commits, drain_firings, events_drained, max_pending]}.
+        Callable any time (e.g. by the trainer at profile-stop)."""
+        agg = {}
+        for chunk in self._cached_chunks_forward:
+            stats = getattr(chunk, "_valve_stats", None)
+            if not stats:
+                continue
+            for name, counts in stats.items():
+                slot = agg.setdefault(name, [0, 0, 0, 0])
+                slot[0] += counts[0]
+                slot[1] += counts[1]
+                slot[2] += counts[2]
+                slot[3] = max(slot[3], counts[3])
+        return agg
+
+    def _dump_valve_telemetry(self):
+        """LPS-1062: emit the aggregated valve counters as one line."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        agg = self.get_valve_telemetry()
+        cap = None
+        for chunk in self._cached_chunks_forward:
+            cap = getattr(chunk, "_max_inflight_offloads", None)
+            break
+        parts = [
+            f"{name}: commits={v[0]} drain_firings={v[1]} events_drained={v[2]} max_pending={v[3]}"
+            for name, v in sorted(agg.items())
+        ]
+        logger.warning(
+            "BT_OFFLOAD_VALVE_TELEMETRY iter=%d max_inflight_offloads=%s | %s",
+            self._valve_telemetry_iter,
+            str(cap),
+            "; ".join(parts) if parts else "(no offload commits recorded)",
+        )
 
     @property
     def offload_summary_bytes(self) -> Dict[str, int]:
@@ -843,6 +1132,32 @@ class PipelineOffloadManager:
             cpu_offload.CPUOffloadEnabled = True
         else:
             raise RuntimeError("TE CPU offload is not available")
+        # LPS-1062 (NVTE latch check): once per process at first
+        # engagement, compare the process env against TE's import-latched
+        # value. Failure text is spelled out for a reader who has never heard
+        # of the trap (godel at the 32k bring-up reads this line).
+        if not self._nvte_latch_checked:
+            self._nvte_latch_checked = True
+            import logging as _logging
+            import os as _os
+
+            _env = _os.environ.get("NVTE_CPU_OFFLOAD_V1")
+            _latched = getattr(cpu_offload, "NVTE_CPU_OFFLOAD_V1", None)
+            if str(_env) == "1" and str(_latched) in ("1", "True"):
+                _logging.getLogger(__name__).warning(
+                    "activation-offload NVTE_CPU_OFFLOAD_V1: env=1 te_latched=1 (engaged)"
+                )
+            else:
+                _logging.getLogger(__name__).warning(
+                    "activation-offload NVTE_CPU_OFFLOAD_V1: env=%s te_latched=%s — "
+                    "env=1 + te_latched=0 means the variable was set AFTER "
+                    "Transformer Engine imported, so TE is silently on the V0 "
+                    "WEIGHTS-OFFLOADING path: offload will look engaged but run "
+                    "wrong. Set NVTE_CPU_OFFLOAD_V1=1 in the LAUNCHER environment "
+                    "and reboot.",
+                    _env,
+                    _latched,
+                )
         self.inside_context = True
         self._saved_tensors_hooks.__enter__()
 
@@ -922,28 +1237,57 @@ class ChunkOffloadHandler:
             else:
                 src_tensor = src_tensor.contiguous()
 
+        # LPS-1062: the state carries the real shape; a pooled buffer
+        # may be padded (see below), so reload must copy only the real region.
+        real_shape = tuple(src_tensor.shape)
         if use_cpu_pool:
-            cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
+            # LPS-1062: pad dim-0 up to the row bucket so
+            # routing-variable MoE shapes share pool keys and the pinned pool
+            # actually reuses buffers. Only the real region is copied — the
+            # padding never touches the wire.
+            pool_shape = real_shape
+            bucket = getattr(self, "_pool_row_bucket", 0)
+            if bucket and len(real_shape) >= 1:
+                rows = real_shape[0]
+                padded_rows = ((rows + bucket - 1) // bucket) * bucket
+                if padded_rows != rows:
+                    pool_shape = (padded_rows,) + real_shape[1:]
+            cpu_backup = self.cpu_tensor_pool.allocate(pool_shape, dtype=src_tensor.dtype)
+            copy_dst = (
+                cpu_backup[: real_shape[0]]
+                if tuple(cpu_backup.shape) != real_shape
+                else cpu_backup
+            )
         else:
             cpu_backup = torch.empty(
                 src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
             )
+            copy_dst = cpu_backup
 
-        cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
+        copy_dst.copy_(src_tensor, non_blocking=pin_memory)
+        # LPS-1062: state carries both real_shape (the pooled buffer may be
+        # bucket-padded, so reload must copy only the real region) and
+        # view_meta (upstream's non-contiguous storage-flatten path restores
+        # the original view with as_strided after the flat copy).
+        state = (src_tensor.device, cpu_backup, use_cpu_pool, real_shape, view_meta)
         return state
 
     @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool, view_meta = state
+        # LPS-1062: 5-tuple state (device, cpu_backup, use_cpu_pool,
+        # real_shape, view_meta); cpu_backup may be a padded pooled buffer.
+        dev, cpu_backup, use_cpu_pool, real_shape, view_meta = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor = torch.empty(
-            cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
+            real_shape, dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
-        gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+        copy_src = (
+            cpu_backup[: real_shape[0]] if tuple(cpu_backup.shape) != real_shape else cpu_backup
+        )
+        gpu_tensor.copy_(copy_src, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
         if view_meta is not None:
@@ -983,6 +1327,27 @@ class ChunkOffloadHandler:
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque] = defaultdict(deque)
+        # ------------------------------------------------------------------
+        # LPS-1062 change (pool fix): row-bucket for
+        # pad-to-max. MoE permuted-token counts vary with routing per
+        # layer/microbatch; rounding dim-0 up to a bucket keeps pool keys
+        # constant per group so the shared pinned pool actually reuses
+        # buffers. Env override for box experiments; 0 disables padding.
+        # ------------------------------------------------------------------
+        import os as _os
+
+        self._pool_row_bucket = int(_os.environ.get("BT_OFFLOAD_POOL_ROW_BUCKET", "8192"))
+        # ------------------------------------------------------------------
+        # LPS-1062 change (valve telemetry). The
+        # backpressure valve BLOCKS (the main stream waits on old D2H events),
+        # so an undersized cap costs throughput invisibly. These counters
+        # make drain behavior visible. Env-gated: when disabled, the hot path
+        # adds one predictable bool branch and nothing else (zero-cost-when-
+        # quiet condition). No per-copy logging anywhere.
+        # ------------------------------------------------------------------
+        self._valve_telemetry_enabled = _env_flag("BT_OFFLOAD_VALVE_TELEMETRY", "0")
+        # group name -> [commits, drain_firings, events_drained, max_pending]
+        self._valve_stats = defaultdict(lambda: [0, 0, 0, 0])
 
     def reset(self):
         """Reset the chunk offload handler."""
@@ -1136,6 +1501,12 @@ class ChunkOffloadHandler:
             gname = group_to_offload._name
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
+            # LPS-1062 (valve telemetry): count the commit and the
+            # post-drain pending depth for this group name.
+            if self._valve_telemetry_enabled:
+                _st = self._valve_stats[gname]
+                _st[0] += 1
+                _st[3] = max(_st[3], len(self._offload_pending_by_name[gname]))
 
     @staticmethod
     def _record_offload_transfer(tensor_on_device, state, storage_records):
@@ -1255,9 +1626,16 @@ class ChunkOffloadHandler:
             return
         cur = torch.cuda.current_stream()
         q = self._offload_pending_by_name[group_name]
+        _drained = 0
         while len(q) > self._max_inflight_offloads:
             old_evt = q.popleft()
             cur.wait_event(old_evt)
+            _drained += 1
+        # LPS-1062 (valve telemetry): count drain firings and events.
+        if _drained and self._valve_telemetry_enabled:
+            _st = self._valve_stats[group_name]
+            _st[1] += 1
+            _st[2] += _drained
 
     def on_group_commit_forward(self, name, forced_released_tensors):
         """Called at the end of a layer group's forward pass to trigger offloading."""
@@ -1588,6 +1966,11 @@ class FineGrainedActivationOffloadingInterface:
     def flush_delayed_groups():
         """Flush the delayed groups."""
         PipelineOffloadManager.get_instance().flush_delayed_groups()
+
+    @staticmethod
+    def get_valve_telemetry():
+        """LPS-1062: aggregated valve counters (for profile-stop dumps)."""
+        return PipelineOffloadManager.get_instance().get_valve_telemetry()
 
     @staticmethod
     def disable_offload():
