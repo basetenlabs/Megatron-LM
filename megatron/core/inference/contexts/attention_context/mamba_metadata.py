@@ -1,10 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-<<<<<<< HEAD
-from typing import Optional, Tuple
-=======
-from typing import Optional, Union
->>>>>>> 31a24de47 ([baseten] inference: Union typing for mamba metadata (sim2))
+from typing import Optional, Tuple, Union
 
 import torch
 
