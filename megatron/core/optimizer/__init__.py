@@ -1050,6 +1050,7 @@ def get_megatron_optimizer(
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
+    # resolution attempt touch (broken: conflict markers left below)
 
     if is_mfsdp_v2:
         if config.use_distributed_optimizer:
