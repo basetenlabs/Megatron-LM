@@ -1054,10 +1054,15 @@ def get_megatron_optimizer(
     if is_mfsdp_v2:
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+<<<<<<< HEAD
     elif config.use_precision_aware_optimizer and not config.use_distributed_optimizer:
         raise ValueError(
             "--use-precision-aware-optimizer only supported with distributed optimizer"
         )
+=======
+        if getattr(config, "b10_tp_guard", False):
+            raise ValueError("tp guard tripped")
+>>>>>>> 8f4bbf295 ([baseten] optimizer: tp-campaign guard (LM conflict))
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
