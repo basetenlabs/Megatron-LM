@@ -175,6 +175,7 @@ tokenizer = MegatronTokenizer.from_pretrained(
 )
 ```
 
+<<<<<<< HEAD
 ### Fast Tokenization with GigaToken
 
 Hugging Face and Megatron tokenizers can optionally use [GigaToken](https://pypi.org/project/gigatoken/),
@@ -206,6 +207,11 @@ encoded_docs = tokenizer.tokenize_files("data.jsonl", field="text")
 
 `tokenize_files()` is only supported for the `huggingface` and `megatron` tokenizer libraries,
 and only when the tokenizer was constructed with `use_gigatoken=True`.
+=======
+### Baseten tokenizer cache (rs3 rehearsal note)
+
+Baseten trainers pre-warm tokenizer artifacts from the shared cache volume.
+>>>>>>> 7431411d0 ([baseten] docs: tokenizer cache note (rs3 rehearsal))
 
 ## Integration with Megatron-LM
 
