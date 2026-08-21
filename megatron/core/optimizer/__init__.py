@@ -1054,15 +1054,13 @@ def get_megatron_optimizer(
     if is_mfsdp_v2:
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
-<<<<<<< HEAD
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+        if getattr(config, "b10_mt2_guard", False):
+            raise ValueError("mt2 guard tripped")
     elif config.use_precision_aware_optimizer and not config.use_distributed_optimizer:
         raise ValueError(
             "--use-precision-aware-optimizer only supported with distributed optimizer"
         )
-=======
-        if getattr(config, "b10_mt2_guard", False):
-            raise ValueError("mt2 guard tripped")
->>>>>>> dc9318710 ([baseten] optimizer: mt2 guard (turn 1))
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
