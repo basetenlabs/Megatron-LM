@@ -1054,10 +1054,15 @@ def get_megatron_optimizer(
     if is_mfsdp_v2:
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+<<<<<<< HEAD
     elif config.use_precision_aware_optimizer and not config.use_distributed_optimizer:
         raise ValueError(
             "--use-precision-aware-optimizer only supported with distributed optimizer"
         )
+=======
+        if getattr(config, "b10_tp3_flag", False):
+            raise ValueError("tp3 flag tripped")
+>>>>>>> 6a26a44dd ([baseten] optimizer: tp3 flag (bad-resolution scenario))
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
