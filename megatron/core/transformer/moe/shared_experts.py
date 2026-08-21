@@ -14,6 +14,9 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -131,6 +134,10 @@ class SharedExpertMLP(MLP):
             tp_group=pg_collection.tp,
             name=name,
             pg_collection=pg_collection,
+        )
+        self.offload_shared_experts = (
+            config.fine_grained_activation_offloading
+            and "shared_experts" in config.offload_modules
         )
 
         self.use_shared_expert_gate = gate
@@ -263,53 +270,66 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         with torch.cuda.stream(self.stream):
-            # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
-                self.cached_fc1_input
+            shared_fc1_manager = off_interface(
+                self.offload_shared_experts, self.cached_fc1_input, "shared_expert_fc1"
             )
+            # [s, b, 4 * h/p]
+            with shared_fc1_manager as fc1_input:
+                intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(fc1_input)
             self.cached_fc1_input = None
+            intermediate_parallel = shared_fc1_manager.group_offload(
+                intermediate_parallel, forced_released_tensors=[]
+            )
 
-            if self.config.use_te_activation_func:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-            elif self.config.bias_activation_fusion:
-                if self.activation_func == F.gelu:
-                    if self.config.gated_linear_unit:
-                        intermediate_parallel = bias_geglu_impl(
-                            intermediate_parallel, bias_parallel
+            shared_act_manager = off_interface(
+                self.offload_shared_experts, intermediate_parallel, "shared_expert_act"
+            )
+            with shared_act_manager as intermediate_parallel:
+                if self.config.use_te_activation_func:
+                    if bias_parallel is not None:
+                        intermediate_parallel = intermediate_parallel + bias_parallel
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+                elif self.config.bias_activation_fusion:
+                    if self.activation_func == F.gelu:
+                        if self.config.gated_linear_unit:
+                            intermediate_parallel = bias_geglu_impl(
+                                intermediate_parallel, bias_parallel
+                            )
+                        else:
+                            assert self.config.add_bias_linear is True
+                            intermediate_parallel = bias_gelu_impl(
+                                intermediate_parallel, bias_parallel
+                            )
+                    elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                        intermediate_parallel = bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            self.config.activation_func_fp8_input_store,
+                            clamp_value=self.config.activation_func_clamp_value,
                         )
                     else:
-                        assert self.config.add_bias_linear is True
-                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-                elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        self.config.activation_func_fp8_input_store,
-                        clamp_value=self.config.activation_func_clamp_value,
-                    )
+                        raise ValueError("Only support fusion of gelu and swiglu")
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
-            else:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                if self.config.gated_linear_unit:
+                    if bias_parallel is not None:
+                        intermediate_parallel = intermediate_parallel + bias_parallel
+                    if self.config.gated_linear_unit:
 
-                    def glu(x):
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (clamp_value := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=clamp_value)
-                            x_linear = x_linear.clamp(min=-clamp_value, max=clamp_value)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
-                        )
+                        def glu(x):
+                            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                            if (clamp_value := self.config.activation_func_clamp_value) is not None:
+                                x_glu = x_glu.clamp(min=None, max=clamp_value)
+                                x_linear = x_linear.clamp(min=-clamp_value, max=clamp_value)
+                            return self.config.activation_func(x_glu) * (
+                                x_linear + self.config.glu_linear_offset
+                            )
 
-                    intermediate_parallel = glu(intermediate_parallel)
-                else:
-                    intermediate_parallel = self.activation_func(intermediate_parallel)
+                        intermediate_parallel = glu(intermediate_parallel)
+                    else:
+                        intermediate_parallel = self.activation_func(intermediate_parallel)
 
-            self.cached_fc2_input = intermediate_parallel
+            self.cached_fc2_input = shared_act_manager.group_offload(
+                intermediate_parallel, forced_released_tensors=[]
+            )
         # Tensor sequence number is used to control the backward order.
         # Decrease the sequence number of the expert output to make the comm launched first
         # in the backward order.
@@ -317,7 +337,7 @@ class SharedExpertMLP(MLP):
             target_sequence_nr = overlapped_comm_output.grad_fn._sequence_nr() - 1
             set_tensor_grad_fn_sequence_sr(intermediate_parallel, target_sequence_nr)
             # Make sure the shared expert fc1 backward is launched after the routed fc1 backward
-            self.cached_fc2_input = _BackwardStreamWait.apply(intermediate_parallel, self.stream)
+            self.cached_fc2_input = _BackwardStreamWait.apply(self.cached_fc2_input, self.stream)
 
     @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
     def linear_fc2_forward(self, overlapped_comm_output=None):
@@ -330,9 +350,16 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         assert self.cached_fc2_input is not None
         with torch.cuda.stream(self.stream):
+            shared_fc2_manager = off_interface(
+                self.offload_shared_experts, self.cached_fc2_input, "shared_expert_fc2"
+            )
             # [s, b, h]
-            self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
+            with shared_fc2_manager as fc2_input:
+                self.cached_fc2_output, _ = apply_module(self.linear_fc2)(fc2_input)
             self.cached_fc2_input = None
+            self.cached_fc2_output = shared_fc2_manager.group_offload(
+                self.cached_fc2_output, forced_released_tensors=[]
+            )
 
     @overlap_state_check(
         SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE

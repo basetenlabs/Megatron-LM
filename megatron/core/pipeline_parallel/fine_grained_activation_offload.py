@@ -1792,6 +1792,30 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         return grad_output + (None, None, None, None)
 
 
+class FineGrainedOffloadingMultiGroupCommitFunction(torch.autograd.Function):
+    """Commit one offload group after all of its output branches finish backward."""
+
+    @staticmethod
+    def forward(ctx, cur_forward_chunk, name, forced_released_tensors, delay_offload, *tensors):
+        """Start the group offload and return each output unchanged."""
+        ctx.set_materialize_grads(False)
+        if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
+            PipelineOffloadManager.get_instance().push_offload_groups(
+                cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
+            )
+        else:
+            cur_forward_chunk.on_group_commit_forward(name, forced_released_tensors)
+        ctx.cpu_offload_handler = cur_forward_chunk
+        ctx.name = name
+        return tensors
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Synchronize reload once every output branch has reached this node."""
+        ctx.cpu_offload_handler.on_group_commit_backward(ctx.name)
+        return (None, None, None, None, *grad_outputs)
+
+
 def fine_grained_offloading_group_offload(
     tensor, name, forced_released_tensors=None, delay_offload=False
 ):
@@ -1801,31 +1825,30 @@ def fine_grained_offloading_group_offload(
     The tensors will be untyped_storage().resize_(0) after offloading.
     Note: specify the tensors only when they are not automatically released by torch gc.
     """
-    # Be permissive: callers may pass a tuple/list of outputs (e.g., (q, k, v)).
-    # We only need to insert a single identity op into the autograd graph; applying
-    # it to the first tensor output is sufficient and keeps callers' code minimal.
     if forced_released_tensors is None:
         forced_released_tensors = []
-    if isinstance(tensor, tuple):
+    if isinstance(tensor, (tuple, list)):
         if len(tensor) == 0:
             return tensor
-        offloaded0 = fine_grained_offloading_group_offload(
-            tensor[0],
-            name=name,
-            forced_released_tensors=forced_released_tensors,
-            delay_offload=delay_offload,
-        )
-        return (offloaded0,) + tensor[1:]
-    if isinstance(tensor, list):
-        if len(tensor) == 0:
+        tensor_indices = [index for index, item in enumerate(tensor) if isinstance(item, torch.Tensor)]
+        if not tensor_indices:
             return tensor
-        offloaded0 = fine_grained_offloading_group_offload(
-            tensor[0],
-            name=name,
-            forced_released_tensors=forced_released_tensors,
-            delay_offload=delay_offload,
+        cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        if cur_forward_chunk is None:
+            return tensor
+        offloaded_tensors = FineGrainedOffloadingMultiGroupCommitFunction.apply(
+            cur_forward_chunk,
+            name,
+            forced_released_tensors,
+            delay_offload,
+            *(tensor[index] for index in tensor_indices),
         )
-        return [offloaded0] + tensor[1:]
+        if len(tensor_indices) == 1:
+            offloaded_tensors = (offloaded_tensors,)
+        result = list(tensor)
+        for index, offloaded_tensor in zip(tensor_indices, offloaded_tensors):
+            result[index] = offloaded_tensor
+        return tuple(result) if isinstance(tensor, tuple) else result
 
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     if cur_forward_chunk is None:

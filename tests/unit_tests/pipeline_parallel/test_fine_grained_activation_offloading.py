@@ -12,9 +12,10 @@ import torch
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    ChunkOffloadHandler,
     FineGrainedActivationOffloadingInterface as off_interface,
+    FineGrainedOffloadingMultiGroupCommitFunction,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorGroup,
@@ -97,7 +98,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
     assert not view.is_contiguous()
 
     state = handler.offload(view)
-    _, cpu_backup, _, view_meta = state
+    _, cpu_backup, _, _, view_meta = state
     # The full flat storage is offloaded, not a gathered copy of the view.
     assert cpu_backup.shape == (base.numel(),)
     assert view_meta == (view.size(), view.stride(), view.storage_offset())
@@ -115,7 +116,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
     # resolution must still take the base path.
     detached = base[:, :80].detach()
     state_d = handler.offload(detached)
-    assert state_d[3] is not None
+    assert state_d[4] is not None
     reloaded_d = handler.reload(state_d)
     torch.cuda.synchronize()
     assert torch.equal(reloaded_d, detached)
@@ -130,7 +131,7 @@ def test_chunk_offload_handler_gathers_low_coverage_views():
     view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
 
     state = handler.offload(view)
-    _, cpu_backup, _, view_meta = state
+    _, cpu_backup, _, _, view_meta = state
     # Low-coverage views fall back to the contiguous gather.
     assert view_meta is None
     assert cpu_backup.shape == view.shape
@@ -255,7 +256,7 @@ def test_bulk_offload_group_flags_disjoint_views_taking_the_whole_storage_path()
     chunk.bulk_offload_group(group)
     torch.cuda.synchronize()
 
-    assert all(state[3] is not None for state in group._tensors.values())
+    assert all(state[4] is not None for state in group._tensors.values())
     assert group.total_offload_bytes == 2 * storage_bytes
     assert group.duplicate_storage_tensor_count == 1
     assert group.duplicate_storage_bytes == storage_bytes
@@ -312,7 +313,7 @@ def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, 
 
     assert group.total_offload_bytes == storage_bytes
     for offload_group in (group, other_group):
-        assert all(state[3] is None for state in offload_group._tensors.values())
+        assert all(state[4] is None for state in offload_group._tensors.values())
         assert offload_group.duplicate_storage_tensor_count == 0
         assert offload_group.duplicate_storage_bytes == 0
 
@@ -358,6 +359,52 @@ def test_duplicate_storage_accounting_is_scoped_to_one_group():
     for group in groups:
         assert group.duplicate_storage_tensor_count == 0
         assert group.duplicate_storage_bytes == 0
+
+
+def test_multi_output_group_commit_waits_for_all_output_branches():
+    events = []
+
+    class Handler:
+        def on_group_commit_forward(self, name, forced_released_tensors):
+            events.append(("forward", name, forced_released_tensors))
+
+        def on_group_commit_backward(self, name):
+            events.append(("backward", name))
+
+    first = torch.tensor(2.0, requires_grad=True)
+    second = torch.tensor(3.0, requires_grad=True)
+    outputs = FineGrainedOffloadingMultiGroupCommitFunction.apply(
+        Handler(), "qkv_linear", [], False, first, second
+    )
+
+    outputs[1].square().backward()
+
+    assert events == [("forward", "qkv_linear", []), ("backward", "qkv_linear")]
+    assert first.grad is None
+    assert second.grad == 6.0
+
+
+def test_multi_output_group_commit_propagates_all_output_gradients():
+    events = []
+
+    class Handler:
+        def on_group_commit_forward(self, name, forced_released_tensors):
+            events.append(("forward", name))
+
+        def on_group_commit_backward(self, name):
+            events.append(("backward", name))
+
+    first = torch.tensor(2.0, requires_grad=True)
+    second = torch.tensor(3.0, requires_grad=True)
+    outputs = FineGrainedOffloadingMultiGroupCommitFunction.apply(
+        Handler(), "qkv_linear", [], False, first, second
+    )
+
+    (outputs[0].square() + outputs[1].square()).backward()
+
+    assert events == [("forward", "qkv_linear"), ("backward", "qkv_linear")]
+    assert first.grad == 4.0
+    assert second.grad == 6.0
 
 
 def _build_gpt_model(

@@ -12,6 +12,9 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -252,6 +255,18 @@ class MoELayer(BaseMoELayer):
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
+        )
+        self.offload_shared_experts = (
+            config.fine_grained_activation_offloading
+            and "shared_experts" in config.offload_modules
+        )
+        self.offload_moe_router = (
+            config.fine_grained_activation_offloading
+            and "moe_router" in config.offload_modules
+        )
+        self.offload_moe_dispatcher = (
+            config.fine_grained_activation_offloading
+            and "moe_dispatcher" in config.offload_modules
         )
 
         self.tp_group = pg_collection.tp
@@ -528,7 +543,16 @@ class MoELayer(BaseMoELayer):
                         apply_module(self.shared_experts), False, hidden_states
                     )
             else:
-                shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+                shared_experts_manager = off_interface(
+                    self.offload_shared_experts, hidden_states, "shared_experts"
+                )
+                with shared_experts_manager as shared_expert_input:
+                    shared_expert_output = apply_module(self.shared_experts)(
+                        shared_expert_input
+                    )
+                shared_expert_output = shared_experts_manager.group_offload(
+                    shared_expert_output, forced_released_tensors=[]
+                )
 
         return shared_expert_output
 
@@ -544,8 +568,15 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
-        dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+        dispatch_manager = off_interface(
+            self.offload_moe_dispatcher, hidden_states, "moe_dispatch"
+        )
+        with dispatch_manager as hidden_states:
+            dispatched_input, tokens_per_expert, permuted_probs = (
+                self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+            )
+        dispatched_input = dispatch_manager.group_offload(
+            dispatched_input, forced_released_tensors=[]
         )
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
@@ -566,7 +597,12 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        combine_manager = off_interface(
+            self.offload_moe_dispatcher, expert_output, "moe_combine"
+        )
+        with combine_manager as expert_output:
+            output = self.token_dispatcher.combine_preprocess(expert_output)
+        output = combine_manager.group_offload(output, forced_released_tensors=[])
 
         return output, mlp_bias
 
@@ -587,7 +623,12 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        unpermute_manager = off_interface(
+            self.offload_moe_dispatcher, output, "moe_unpermute"
+        )
+        with unpermute_manager as output:
+            output = self.token_dispatcher.combine_postprocess(output)
+        output = unpermute_manager.group_offload(output, forced_released_tensors=[])
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
@@ -659,8 +700,34 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    moe_router_manager = off_interface(
+                        self.offload_moe_router, hidden_states, "moe_router"
+                    )
+                    with moe_router_manager as hidden_states:
+                        probs, routing_map = self.route(hidden_states, padding_mask)
+                        hidden_states, probs = self.preprocess(
+                            hidden_states, probs, routing_map
+                        )
+                    router_outputs = [hidden_states, probs]
+                    shared_fc1_input_index = None
+                    shared_gate_score_index = None
+                    if self.shared_expert_overlap and self.shared_experts is not None:
+                        if self.shared_experts.cached_fc1_input is not None:
+                            shared_fc1_input_index = len(router_outputs)
+                            router_outputs.append(self.shared_experts.cached_fc1_input)
+                        if self.shared_experts.gate_score is not None:
+                            shared_gate_score_index = len(router_outputs)
+                            router_outputs.append(self.shared_experts.gate_score)
+                    router_outputs = moe_router_manager.group_offload(
+                        router_outputs, forced_released_tensors=[]
+                    )
+                    hidden_states, probs = router_outputs[:2]
+                    if shared_fc1_input_index is not None:
+                        self.shared_experts.cached_fc1_input = router_outputs[
+                            shared_fc1_input_index
+                        ]
+                    if shared_gate_score_index is not None:
+                        self.shared_experts.gate_score = router_outputs[shared_gate_score_index]
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output

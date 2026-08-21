@@ -1299,14 +1299,18 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv".
+             "mlp_norm", "moe_router", "moe_dispatcher", "expert_fc1", "moe_act",
+             "shared_experts", "fused_group_mlp", "gdp_qkv".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
     "attn_proj": offload the input of the attn linear projection part.
     "mlp_norm": offload the input of the normalization in the mlp part.
+    "moe_router": offload activations retained by MoE routing and preprocessing.
+    "moe_dispatcher": offload metadata retained by MoE dispatch and combine operations.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "shared_experts": offload activations retained by the shared-expert MLP.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
@@ -2083,6 +2087,9 @@ class TransformerConfig(ModelParallelConfig):
                 "expert_fc1",
                 "fused_group_mlp",
                 "moe_act",
+                "moe_router",
+                "moe_dispatcher",
+                "shared_experts",
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
@@ -2093,6 +2100,32 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            moe_only_offload_modules = {
+                "moe_router",
+                "moe_dispatcher",
+                "expert_fc1",
+                "moe_act",
+                "shared_experts",
+                "fused_group_mlp",
+            }
+            selected_moe_modules = moe_only_offload_modules & set(self.offload_modules)
+            if selected_moe_modules and self.num_moe_experts is None:
+                raise ValueError(
+                    f"MoE-only offload modules require num_moe_experts: {selected_moe_modules}"
+                )
+            if "shared_experts" in self.offload_modules:
+                if self.moe_shared_expert_intermediate_size is None:
+                    raise ValueError(
+                        "shared_experts offload requires moe_shared_expert_intermediate_size"
+                    )
+                if (
+                    self.use_grouped_gemm_for_shared_expert
+                    and self.moe_shared_expert_overlap
+                ):
+                    raise ValueError(
+                        "shared_experts offload does not yet support overlapped fused grouped "
+                        "shared experts"
+                    )
             # ------------------------------------------------------------------
             # LPS-1062 (CONDITIONAL relaxation — do not
             # broaden): the guard below protects the EAGER core-attention case,
@@ -2137,9 +2170,14 @@ class TransformerConfig(ModelParallelConfig):
                     "nothing for the gdp_qkv offload group to keep on the host."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
-                    self.offload_modules
-                )
+                offload_inside_moe = {
+                    "moe_act",
+                    "moe_router",
+                    "moe_dispatcher",
+                    "expert_fc1",
+                    "shared_experts",
+                    "fused_group_mlp",
+                } & set(self.offload_modules)
                 assert not offload_inside_moe, (
                     f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
                     f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
@@ -2902,6 +2940,15 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
+                unsupported_graph_offload = {
+                    "moe_router",
+                    "moe_dispatcher",
+                    "shared_experts",
+                } & offload_modules
+                assert not unsupported_graph_offload, (
+                    "CUDA graphs do not yet support these fine-grained offload modules: "
+                    f"{sorted(unsupported_graph_offload)}"
+                )
                 if self.cuda_graph_impl == "local":
                     local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
                     unsupported_offload_modules = offload_modules - local_supported_offload_modules

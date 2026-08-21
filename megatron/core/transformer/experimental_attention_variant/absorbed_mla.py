@@ -845,8 +845,18 @@ class AbsorbedMLASelfAttention(Attention):
         # =====================
         # Query, Key, and Value
         # =====================
-        q_absorbed, kv_compressed, q_compressed = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, packed_seq_params, inference_context=inference_context
+        qkv_linear_manager = off_interface(
+            self.offload_qkv_linear, hidden_states, "qkv_linear"
+        )
+        with qkv_linear_manager as hidden_states:
+            qkv_tensors = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+        q_absorbed, kv_compressed, q_compressed = qkv_linear_manager.group_offload(
+            qkv_tensors, forced_released_tensors=[]
         )
 
         assert q_absorbed.is_contiguous()
@@ -857,6 +867,9 @@ class AbsorbedMLASelfAttention(Attention):
         # ==================================
         # Core attention computation
         # ==================================
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, q_absorbed, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 q_absorbed,
@@ -869,17 +882,21 @@ class AbsorbedMLASelfAttention(Attention):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            core_attn_out = self.core_attention(
-                q_absorbed,
-                kv_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                attn_mask_type=self.attn_mask_type,
+            with core_attn_manager as q_absorbed:
+                core_attn_out = self.core_attention(
+                    q_absorbed,
+                    kv_compressed,
+                    value=None,
+                    attention_mask=attention_mask,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    up_v_weight=v_up_weight,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    attn_mask_type=self.attn_mask_type,
+                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[q_absorbed, kv_compressed]
             )
 
         # ==================================
