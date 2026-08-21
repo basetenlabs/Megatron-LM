@@ -43,10 +43,15 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+<<<<<<< HEAD
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+=======
+    b10_mt2_field: int = 0
+    """mt2 demo field."""
+>>>>>>> 4c4680521 ([baseten] inference: mt2 field (turn 2))
 
     @classmethod
     def from_model(
