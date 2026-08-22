@@ -715,6 +715,10 @@ class TorchDistSaveShardedStrategy:
                 ):
                     async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
                 else:
+                    # Non-shm staging hands GPU tensors to the async worker
+                    # over CUDA IPC, which pods with yama ptrace_scope cannot
+                    # do (pidfd_getfd EPERM kills the worker and the save op
+                    # never resolves) — fail loudly instead.
                     raise AssertionError(
                         "Installed nvidia-resiliency-ext does not support "
                         "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
@@ -851,9 +855,10 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, checkpoint_name: str = None):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.checkpoint_name = checkpoint_name
 
     def load(
         self,

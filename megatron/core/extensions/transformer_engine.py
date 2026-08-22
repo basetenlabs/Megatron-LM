@@ -22,6 +22,9 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.transformer_engine_int4_fake_qat import (
+    maybe_fake_quantize_int4_weight_tensors,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -1749,8 +1752,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         # These fields are MCore-only and should not be forwarded to TE attention.
+        # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
+        # MoE sequence-level aux loss reshaping; cp_partition_mode is MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
 
         if config.qk_clip or config.log_max_attention_logit:
@@ -2294,6 +2300,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if self.te_return_bias:
                 return out
             return out, None
+
+        def _get_weight_tensors(self):
+            """Get the weight tensors of the module."""
+            weight_tensors = super()._get_weight_tensors()
+            return maybe_fake_quantize_int4_weight_tensors(
+                self.config, self.delay_wgrad_compute, weight_tensors
+            )
 
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor

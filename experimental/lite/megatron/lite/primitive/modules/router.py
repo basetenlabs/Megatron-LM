@@ -10,6 +10,13 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+from megatron.lite.primitive.modules.router_replay import (
+    RouterReplay,
+    RouterReplayAction,
+    attach_router_replay,
+    detach_router_replay,
+    gather_replayed_router_scores,
+)
 from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
@@ -63,6 +70,7 @@ class TopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
@@ -96,10 +104,29 @@ class TopKRouter(nn.Module):
             topk_scores, topk_indices = _ordered_topk_from_routing_map(
                 probs_dense, routing_map, self.topk
             )
+        if self.router_replay is not None:
+            selected_indices = self.router_replay.select_indices(topk_indices)
+            if selected_indices is not topk_indices:
+                topk_indices = selected_indices
+                topk_scores = gather_replayed_router_scores(
+                    logits,
+                    topk_indices,
+                    score_function="softmax",
+                    use_pre_softmax=self.use_pre_softmax,
+                )
         if self.router_dtype is None:
             topk_scores = topk_scores.to(x.dtype)
 
-        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
+        # A zero/None coefficient means no load-balancing objective (the RL
+        # reference backend runs moe_router_load_balancing_type='none'); do not
+        # attach an aux-loss gradient in that case.
+        apply_aux_loss = (
+            self.compute_aux_loss
+            and bool(self.aux_loss_coeff)
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if apply_aux_loss:
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
             )
@@ -150,6 +177,7 @@ class SigmoidTopKRouter(nn.Module):
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
@@ -175,9 +203,25 @@ class SigmoidTopKRouter(nn.Module):
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
             probs_dense, routing_map, self.topk
         )
+        if self.router_replay is not None:
+            selected_indices = self.router_replay.select_indices(topk_indices)
+            if selected_indices is not topk_indices:
+                topk_indices = selected_indices
+                topk_scores = gather_replayed_router_scores(
+                    logits,
+                    topk_indices,
+                    score_function=self.score_function,
+                    scaling_factor=self.scaling_factor,
+                )
         topk_scores = topk_scores.to(logits.dtype)
 
-        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
+        apply_aux_loss = (
+            self.compute_aux_loss
+            and bool(self.aux_loss_coeff)
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if apply_aux_loss:
             _, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )
@@ -200,4 +244,11 @@ class SigmoidTopKRouter(nn.Module):
         return topk_scores, topk_indices
 
 
-__all__ = ["SigmoidTopKRouter", "TopKRouter"]
+__all__ = [
+    "RouterReplay",
+    "RouterReplayAction",
+    "SigmoidTopKRouter",
+    "TopKRouter",
+    "attach_router_replay",
+    "detach_router_replay",
+]

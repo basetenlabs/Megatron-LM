@@ -21,6 +21,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
@@ -33,6 +34,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -515,7 +517,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -647,8 +649,15 @@ class TestMultiTokenPrediction:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        gpt_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        gpt_model = unwrap_model(gpt_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = gpt_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        gpt_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = gpt_model[0].sharded_state_dict()
         for i in range(args.mtp_num_layers):
             assert f"mtp.layers.{i}.enorm.weight" in sharded_state_dict.keys()
@@ -676,7 +685,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -685,8 +694,8 @@ class TestMultiTokenPrediction:
             labels=labels,
             loss_mask=loss_mask,
         )
-        # forward only fills raw loss_sums / num_tokens. Trigger the reduction
-        # so tracker["values"] (per-token loss across DP+CP) becomes available.
+        # Forward accumulates normalized losses. Trigger the DP+CP
+        # reduction so tracker["values"] becomes available.
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker
@@ -725,7 +734,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder, self.model_provider
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -741,9 +750,7 @@ class TestMultiTokenPrediction:
                 labels=labels,
                 loss_mask=loss_mask,
             )
-            # reduce_loss_in_tracker performs sum-reduce of loss_sums and
-            # num_tokens across DP+CP, then computes sum/sum -- already the
-            # correct global per-token loss, no extra CP averaging needed.
+            # Combine normalized loss contributions across DP+CP.
             MTPLossLoggingHelper.reduce_loss_in_tracker()
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
@@ -784,7 +791,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
 
         output = gpt_model[0].forward(
@@ -827,8 +834,14 @@ class TestMultiTokenPrediction:
         packed_seq_params = batch['packed_seq_params']
 
         # Create model
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         # Forward pass with packed sequences
@@ -845,8 +858,7 @@ class TestMultiTokenPrediction:
         assert output.shape[0] == 1  # batch size
         assert output.shape[1] == total_seq_length
 
-        # Verify MTP loss was computed; reduce raw loss_sums/num_tokens into
-        # tracker["values"] (per-token loss) first.
+        # Verify MTP loss was computed; reduce local contributions first.
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker
@@ -890,8 +902,15 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
 
         batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output = gpt_model[0].forward(
@@ -1099,6 +1118,77 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_with_packed_sequences_contiguous_cp(self):
+        """Contiguous THD CP rolls across rank boundaries without crossing sequence boundaries."""
+        cp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        # Full padded layout:
+        #   seq1: [1,2,3,4,5,6,7,0]
+        #   seq2: [11,12,13,14,15,16,17,18,19,20,21,0]
+        # Contiguous CP rank 0 owns global rows [0, 10), rank 1 owns [10, 20).
+        if cp_rank == 0:
+            tensor = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0, 11, 12]], dtype=torch.float32).cuda()
+            expected = torch.tensor([[2, 3, 4, 5, 6, 7, 0, 0, 12, 13]], dtype=torch.float32).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, True, False, False]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, True, True, False, False]]
+            ).cuda()
+        else:
+            tensor = torch.tensor(
+                [[13, 14, 15, 16, 17, 18, 19, 20, 21, 0]], dtype=torch.float32
+            ).cuda()
+            expected = torch.tensor(
+                [[14, 15, 16, 17, 18, 19, 20, 21, 0, 0]], dtype=torch.float32
+            ).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, False, True]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, True, True]]
+            ).cuda()
+
+        cu_seqlens = torch.tensor([0, 7, 18], dtype=torch.int32).cuda()
+        cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=11,
+            max_seqlen_kv=11,
+            qkv_format='thd',
+            cp_partition_mode='contiguous',
+        )
+
+        rolled, sum_val = roll_tensor(
+            tensor, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        rolled_padding_mask, _ = roll_tensor(
+            padding_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            fill_value=True,
+        )
+
+        assert torch.equal(rolled, expected), (
+            f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n"
+            f"{rolled - expected}"
+        )
+        assert torch.equal(rolled_padding_mask, expected_padding_mask), (
+            f"CP Rank {cp_rank}: Expected padding mask\n{expected_padding_mask}\nbut got\n"
+            f"{rolled_padding_mask}"
+        )
+        assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences_odd_seqlen(self, cp):
         """Test roll_tensor with ODD packed seqlens.
@@ -1234,7 +1324,7 @@ class TestMTPLossLoggingHelper:
         assert tracker["avg_group"] is None
 
     def test_save_loss_to_tracker(self):
-        """Test saving loss sum and token count to tracker."""
+        """Test saving a normalized loss to the tracker."""
         loss_sum = torch.tensor(1.3)
         num_tokens = torch.tensor(5.0)
         layer_number = 2
@@ -1247,14 +1337,11 @@ class TestMTPLossLoggingHelper:
             num_layers=num_layers,
         )
 
-        # Tracker now stores raw loss sums and token counts; per-token loss
-        # is computed in reduce_loss_in_tracker.
         assert "loss_sums" in MTPLossLoggingHelper.tracker
-        assert "num_tokens" in MTPLossLoggingHelper.tracker
         assert MTPLossLoggingHelper.tracker["loss_sums"].shape == (num_layers,)
-        assert MTPLossLoggingHelper.tracker["num_tokens"].shape == (num_layers,)
-        assert MTPLossLoggingHelper.tracker["loss_sums"][layer_number] == loss_sum
-        assert MTPLossLoggingHelper.tracker["num_tokens"][layer_number] == num_tokens
+        assert torch.isclose(
+            MTPLossLoggingHelper.tracker["loss_sums"][layer_number], loss_sum / num_tokens
+        )
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
@@ -1271,7 +1358,7 @@ class TestMTPLossLoggingHelper:
         assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=True), False) is True
 
     def test_track_mtp_metrics(self):
-        """Test tracking MTP metrics including token-weighted loss and acceptance rate."""
+        """Test tracking normalized MTP loss and acceptance rate."""
         loss_sum = torch.tensor(2.3)
         num_tokens = torch.tensor(1.0)
         num_layers = self.num_layers
@@ -1371,9 +1458,35 @@ class TestMTPLossLoggingHelper:
 
         # Verify tracker is cleaned
         assert torch.all(MTPLossLoggingHelper.tracker["loss_sums"] == 0)
-        assert torch.all(MTPLossLoggingHelper.tracker["num_tokens"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
+
+    def test_microbatch_means_are_not_globally_token_weighted(self):
+        """MTP logging preserves the pre-#4226 microbatch-normalized semantics."""
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(8.0), num_tokens=torch.tensor(2.0), layer_number=0, num_layers=1
+        )
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(4.0), num_tokens=torch.tensor(4.0), layer_number=0, num_layers=1
+        )
+
+        class DummyWriter:
+            def __init__(self):
+                self.scalars = {}
+
+            def add_scalar(self, name, value, iteration):
+                self.scalars[name] = value
+
+        writer = DummyWriter()
+        MTPLossLoggingHelper.track_mtp_metrics(
+            loss_scale=0.5, iteration=1, writer=writer, total_loss_dict={}
+        )
+
+        logged_loss = torch.as_tensor(writer.scalars["mtp_1 loss"])
+        microbatch_mean_average = torch.tensor(((8.0 / 2.0) + (4.0 / 4.0)) / 2.0)
+        global_token_weighted = torch.tensor((8.0 + 4.0) / (2.0 + 4.0))
+        assert torch.isclose(logged_loss, microbatch_mean_average)
+        assert not torch.isclose(logged_loss, global_token_weighted)
 
     def test_track_mtp_loss_preserves_legacy_normalized_loss_semantics(self):
         """MTP loss logging should not become token-weighted when acceptance counters are added."""
@@ -1463,7 +1576,7 @@ class TestMultiTokenPredictionHybrid:
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
@@ -1487,7 +1600,6 @@ class TestMultiTokenPredictionHybrid:
         args.bf16 = True
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
-        args.spec = "megatron.core.models.hybrid.hybrid_layer_specs.hybrid_stack_spec"
 
         if fp8 is not None:
             args.fp8 = 'e4m3'
@@ -1530,8 +1642,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        mamba_model = unwrap_model(mamba_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        mamba_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = mamba_model[0].sharded_state_dict()
 
         # Verify MTP layers are in the state dict
@@ -1555,8 +1674,14 @@ class TestMultiTokenPredictionHybrid:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1566,8 +1691,8 @@ class TestMultiTokenPredictionHybrid:
             labels=labels,
             loss_mask=loss_mask,
         )
-        # forward only fills raw loss_sums / num_tokens. Reduce them first so
-        # tracker["values"] (per-token loss across DP+CP) becomes available.
+        # Forward accumulates normalized losses. Reduce them first so
+        # tracker["values"] becomes available.
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker
@@ -1600,8 +1725,15 @@ class TestMultiTokenPredictionHybrid:
             set_ckpt_path(ckpt_dir)
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+
+            model_parallel_cuda_manual_seed(_SEED)
+            cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
@@ -1617,8 +1749,7 @@ class TestMultiTokenPredictionHybrid:
                 labels=labels,
                 loss_mask=loss_mask,
             )
-            # reduce_loss_in_tracker already computes the cross-DP+CP per-token
-            # loss (sum/sum), no extra CP averaging needed.
+            # Combine normalized loss contributions across DP+CP.
             MTPLossLoggingHelper.reduce_loss_in_tracker()
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
@@ -1644,8 +1775,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
         try:
-            mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
+            model_parallel_cuda_manual_seed(_SEED)
+            mamba_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
             mamba_model = unwrap_model(mamba_model)
             assert isinstance(mamba_model[0], HybridModel)
             assert mamba_model[0].mtp is not None
@@ -1902,7 +2040,7 @@ class TestMHCMTPIntegration:
                 vp_stage=vp_stage,
             )
 
-        gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+        gpt_model, _, _ = setup_model_and_optimizer(ModelType.encoder_or_decoder, model_provider)
 
         data = list(range(seq_length))
         tokens = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
@@ -1922,8 +2060,7 @@ class TestMHCMTPIntegration:
         )
         assert torch.isfinite(output).all(), f"Non-finite output (TP={tp})"
 
-        # Reduce raw loss_sums/num_tokens into tracker["values"] (per-token
-        # loss across DP+CP) before reading.
+        # Reduce normalized loss contributions before reading.
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker, f"MTP loss not logged (TP={tp})"

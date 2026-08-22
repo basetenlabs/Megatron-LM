@@ -482,7 +482,7 @@ if _CUTE_AVAILABLE:
                                     rank_major_id = seq_to_rank_row[seq_major_id]
                                     if rank_major_id >= 0:
                                         topk_value = compressed_base + rank_major_id
-                    elif total_width > 0 and cutlass.const_expr(index_mode != 2):
+                    elif total_width > 0:
                         length = 1
                         if col == 0:
                             topk_value = 0

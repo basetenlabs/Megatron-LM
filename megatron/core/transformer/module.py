@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
 from functools import partial
@@ -106,11 +106,13 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
         if (
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or getattr(self.config, 'quant_recipe', None) is not None
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
@@ -353,6 +355,9 @@ class GraphableMegatronModule(MegatronModule):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
             cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
             cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
@@ -446,6 +451,44 @@ def float16_to_fp32(val):
     return conversion_helper(val, float_conversion)
 
 
+def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
+
+    Some parameters must stay in FP32 even when the rest of the model is converted to
+    FP16/BF16 (e.g. the ``ape`` and ``attn_sink`` parameters of DeepSeek V4 sparse
+    attention, which are FP32 in the reference checkpoint).
+
+    Args:
+        tensor: The parameter or buffer to mark.
+
+    Returns:
+        The same tensor, for call-site convenience.
+    """
+    tensor.keep_in_fp32 = True
+    return tensor
+
+
+def convert_module_to_dtype_except_fp32_marked(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Cast floating-point parameters and buffers of ``module`` to ``dtype``.
+
+    Tensors marked with :func:`mark_keep_in_fp32` are left untouched.
+
+    Args:
+        module: The module to convert in place.
+        dtype: The target floating-point dtype (``torch.half`` or ``torch.bfloat16``).
+
+    Returns:
+        The converted module.
+    """
+    return module._apply(
+        lambda t: (
+            t.to(dtype) if t.is_floating_point() and not getattr(t, 'keep_in_fp32', False) else t
+        )
+    )
+
+
 class Float16Module(MegatronModule):
     """Float 16 Module.
 
@@ -468,13 +511,17 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.half)
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()

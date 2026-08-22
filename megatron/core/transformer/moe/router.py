@@ -150,6 +150,8 @@ class Router(ABC, MegatronModule):
     def set_layer_number(self, layer_number: int):
         """Set the layer number for the router."""
         self.layer_number = layer_number
+        if getattr(self, "router_replay", None) is not None:
+            self.router_replay.layer_number = layer_number
 
 
 class TopKRouter(Router):
@@ -275,6 +277,16 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if getattr(self, 'local_tokens_per_expert', None) is not None:
+            if self.local_tokens_per_expert.dtype != torch.float32:
+                # The token-count sensor must also stay float32. A bf16/fp16 module cast
+                # (e.g. Float16Module) silently converts this buffer, making the
+                # `+=` accumulation in _apply_expert_bias lossy: increments below the
+                # ulp vanish as counts grow, corrupting the counts that drive the
+                # aux-loss-free expert-bias update.
+                self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.to(
+                    torch.float32
+                )
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -826,6 +838,20 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+
+        # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
+        # rows before dispatch. Other dispatchers retain their existing fixed-route
+        # assumptions until they support sparse routing maps end to end.
+        use_dropless_hybridep = (
+            self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+            and self.config.moe_expert_capacity_factor is None
+            and self.config.moe_expert_rank_capacity_factor is None
+        )
+        if padding_mask is not None and use_dropless_hybridep:
+            valid_tokens = (~padding_mask).unsqueeze(-1)
+            probs = probs * valid_tokens
+            routing_map = routing_map & valid_tokens
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

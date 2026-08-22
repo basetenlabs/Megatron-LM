@@ -3119,6 +3119,13 @@ def _torch_proj_rms_compute_h(
     eps: float,
     compute_h_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    # mapping_proj.weight is mark_keep_in_fp32 (see HyperConnection.__init__), so
+    # under bf16 training x arrives bf16 while weight is fp32 -> the matmul below
+    # raises a dtype mismatch. The native (non-fused) proj_rms path upcasts x to
+    # fp32 for exactly this reason; mirror it here so the fused torch fallback
+    # (taken when cuTile is unavailable) computes in fp32. compute_mappings casts
+    # the outputs back to the activation dtype.
+    x = x.to(weight.dtype)
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
