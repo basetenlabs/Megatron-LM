@@ -715,15 +715,14 @@ class TorchDistSaveShardedStrategy:
                 ):
                     async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
                 else:
-                    # Graceful fallback (2026-07-30): the pinned
-                    # nvidia-resiliency-ext predates use_cpu_shm_for_gpu_tensors.
-                    # Degrade to non-shm staging instead of failing save_state —
-                    # checkpoints still land, staging is just slower. Remove once
-                    # the NVRx pin is bumped past the feature.
-                    logger.warning(
+                    # Non-shm staging hands GPU tensors to the async worker
+                    # over CUDA IPC, which pods with yama ptrace_scope cannot
+                    # do (pidfd_getfd EPERM kills the worker and the save op
+                    # never resolves) — fail loudly instead.
+                    raise AssertionError(
                         "Installed nvidia-resiliency-ext does not support "
-                        "use_cpu_shm_for_gpu_tensors; saving WITHOUT cpu_shm "
-                        "staging (slower checkpoint, same result)."
+                        "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                        "to enable cpu_shm_mode."
                     )
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache

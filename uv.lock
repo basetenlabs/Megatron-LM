@@ -3332,7 +3332,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=15a851565a4ce846c04431ecb0cf09903ab4837e" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
     { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -4819,22 +4819,29 @@ wheels = [
 
 [[package]]
 name = "nvidia-resiliency-ext"
-version = "0.6.0.dev33+15a8515"
-source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=15a851565a4ce846c04431ecb0cf09903ab4837e#15a851565a4ce846c04431ecb0cf09903ab4837e" }
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "defusedxml" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
-    { name = "langchain-nvidia-ai-endpoints" },
-    { name = "logsage" },
-    { name = "mcp" },
+    { name = "httpx" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or extra == 'extra-13-megatron-core-dev'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-ml-py" },
     { name = "packaging" },
     { name = "protobuf" },
     { name = "psutil" },
     { name = "pyyaml" },
-    { name = "setproctitle" },
     { name = "torch", marker = "sys_platform == 'never'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/72/3d1f92f0c3cd26d32707a393e539b3f6d2b59733e1de4442d4289766d07c/nvidia_resiliency_ext-0.6.0-cp310-cp310-manylinux_2_39_aarch64.whl", hash = "sha256:da7086be06b8359f27ac0e68fca08981d9cadfb937b4543e2164d371b59202ad", size = 769534, upload-time = "2026-05-14T21:48:38.766177Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/16/253803fd02fe4265c7ae84b776be3bf445a3fed3c39830dcf4913ad8fd29/nvidia_resiliency_ext-0.6.0-cp310-cp310-manylinux_2_39_x86_64.whl", hash = "sha256:a3f251d6c189593946463def0d8649d3566c6ab2a4be02aacc75bf25017cdde3", size = 771456, upload-time = "2026-05-14T21:49:28.862815Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/bb/212965e51e3b2b6648f9b964c8ddd6aae8fc7805f2f240dc9edcf4761e04/nvidia_resiliency_ext-0.6.0-cp311-cp311-manylinux_2_39_aarch64.whl", hash = "sha256:d54cdcdbc3e64552910c8ff5f65c5943c6041a15772dbe5b7c3e5938cfe7079e", size = 770311, upload-time = "2026-05-14T21:50:15.746957Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/5f/b0eccb1a8248f299c9e31203361da7861e254439ec6de93dc7fec34dcd36/nvidia_resiliency_ext-0.6.0-cp311-cp311-manylinux_2_39_x86_64.whl", hash = "sha256:ced5ac042f8fc1ba05b7986f47216429a8e7c63296998e5711bda208217281fb", size = 772181, upload-time = "2026-05-14T21:53:06.162575Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/e1/8d3be847258068862df502123f92cc76dabe869fccde893ecf9ba07168d1/nvidia_resiliency_ext-0.6.0-cp312-cp312-manylinux_2_39_aarch64.whl", hash = "sha256:a71c1a1650b32c72f7fdf7d6f73b4d275961ce5d68bd68efaff9e0d7099031cb", size = 770623, upload-time = "2026-05-14T21:51:16.523409Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/0b/957a223c71959497e96ed868acb2ec869170caa95a60a0edbab8909aa98b/nvidia_resiliency_ext-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:7d5ac6567841aef0173af3bcc0c2044971d2b225918028b99af6e4eb7e6e2f5d", size = 773595, upload-time = "2026-05-14T21:52:06.460773Z" },
 ]
 
 [[package]]
