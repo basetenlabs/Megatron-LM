@@ -23,10 +23,7 @@ When enabled, Megatron applies the env vars and config overrides below via `mega
 
 ## Environment variables
 
-<<<<<<< HEAD
 Each variable may be set by the launcher or left unset. Baseten CI pins every variable (rs4 rehearsal note). If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which their kernels auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
-=======
->>>>>>> 788748e72 ([baseten] docs: CI determinism pinning note (rs4 rehearsal))
 
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
