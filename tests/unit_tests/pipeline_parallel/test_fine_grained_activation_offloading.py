@@ -12,10 +12,15 @@ import torch
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    ChunkOffloadHandler,
     FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedOffloadingMultiGroupCommitFunction,
+    OffloadTensorGroup,
+    OffloadTensorPool,
+    PipelineOffloadManager,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorGroup,
@@ -405,6 +410,90 @@ def test_multi_output_group_commit_propagates_all_output_gradients():
     assert events == [("forward", "qkv_linear"), ("backward", "qkv_linear")]
     assert first.grad == 4.0
     assert second.grad == 6.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for stream ordering.")
+def test_tensor_pop_waits_for_prefetched_tensor():
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler._valve_telemetry_enabled = True
+    handler._reload_stats = {"test": [0, 0]}
+    group = OffloadTensorGroup("test")
+    handler.offload_groups = [group]
+    tensor_tag = (1, 0)
+    recovered = torch.zeros(1024, device="cuda")
+    source = torch.ones_like(recovered)
+    reload_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(reload_stream):
+        torch.cuda._sleep(10_000_000)
+        recovered.copy_(source)
+        group.push_tensor(tensor_tag, recovered)
+        group._reloaded_tensor_tags.add(tensor_tag)
+        group.record_reload_event(reload_stream)
+
+    result = handler.tensor_pop(tensor_tag)
+
+    assert result.sum().item() == 1024
+    assert handler._reload_stats["test"] == [1, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for stream ordering.")
+def test_tensor_pop_rejects_demand_reload_during_cuda_graph_capture(monkeypatch):
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.offload_groups = [OffloadTensorGroup("test")]
+    tensor_tag = (1, 0)
+    handler.offload_groups[0].push_tensor(
+        tensor_tag, (torch.device("cuda"), torch.empty(1, pin_memory=True), True, (1,))
+    )
+    monkeypatch.setitem(
+        ChunkOffloadHandler.tensor_pop.__globals__, "is_graph_capturing", lambda: True
+    )
+
+    with pytest.raises(RuntimeError, match="not prefetched before CUDA graph capture"):
+        handler.tensor_pop(tensor_tag)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for stream ordering.")
+def test_bulk_reload_uses_recorded_backward_group_order():
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.is_warmup = False
+    handler.h2d_stream = torch.cuda.Stream()
+    handler._reloading_group = []
+    first_backward = OffloadTensorGroup("first_backward")
+    forward_lifo = OffloadTensorGroup("forward_lifo")
+    handler._backward_group_order = [first_backward, forward_lifo]
+    handler._groups_to_reload = [first_backward, forward_lifo]
+
+    handler.bulk_reload_group()
+
+    assert handler._groups_to_reload == [forward_lifo]
+    assert handler._reloading_group == [first_backward]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for stream ordering.")
+def test_pinned_pool_waits_for_h2d_before_reuse(monkeypatch):
+    monkeypatch.setenv("BT_OFFLOAD_NUMA_BIND", "off")
+    pool = OffloadTensorPool(device="cpu", pin_memory=True)
+    pinned = pool.allocate((1024 * 1024,), dtype=torch.float32)
+    pinned.fill_(1)
+    recovered = torch.empty_like(pinned, device="cuda")
+    replacement = torch.full_like(recovered, 2)
+    h2d_stream = torch.cuda.Stream()
+    d2h_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(h2d_stream):
+        torch.cuda._sleep(10_000_000)
+        recovered.copy_(pinned, non_blocking=True)
+        pool.free(pinned, stream=h2d_stream)
+
+    with torch.cuda.stream(d2h_stream):
+        reused = pool.allocate(tuple(pinned.shape), dtype=pinned.dtype)
+        reused.copy_(replacement, non_blocking=True)
+
+    torch.cuda.synchronize()
+
+    assert reused is pinned
+    assert recovered.eq(1).all()
 
 
 def _build_gpt_model(

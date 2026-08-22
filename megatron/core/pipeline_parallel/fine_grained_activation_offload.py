@@ -193,8 +193,7 @@ def _verify_numa_placement(tensor, expected_node):
         rc = libc.syscall(279, 0, count, pages, None, status, 0)
         if rc != 0:
             logger.warning(
-                "BT_OFFLOAD_NUMA_VERIFY: move_pages query failed (rc=%d) — placement unverified",
-                rc,
+                "BT_OFFLOAD_NUMA_VERIFY: move_pages query failed (rc=%d) — placement unverified", rc
             )
             return
         dist = Counter(int(s) for s in status)
@@ -380,6 +379,9 @@ class OffloadTensorPool:
         # Maintain a separate pool for each (shape, dtype) combination
         # Structure: {(shape, dtype): {'free': deque, 'all': list, 'allocated_count': int}}
         self._pools: Dict[Tuple, Dict[str, Any]] = {}
+        # A freed pinned tensor can still be the source of an asynchronous H2D.
+        # Keep its completion event so the next D2H reuse can wait on-device.
+        self._reuse_events: Dict[int, torch.cuda.Event] = {}
 
         # Statistics
         self._stats = {
@@ -434,6 +436,9 @@ class OffloadTensorPool:
         # Try to reuse a tensor from the pool
         if len(pool['free']) > 0:
             tensor = pool['free'].popleft()
+            reuse_event = self._reuse_events.pop(id(tensor), None)
+            if reuse_event is not None:
+                torch.cuda.current_stream().wait_event(reuse_event)
             self._stats['pool_hits'] += 1
             debug_rank(
                 f"OffloadTensorPool.allocate: Reused tensor from pool, "
@@ -487,12 +492,13 @@ class OffloadTensorPool:
             os.sched_setaffinity(0, prev_affinity)
         return tensor
 
-    def free(self, tensor: torch.Tensor):
+    def free(self, tensor: torch.Tensor, stream: Optional[torch.cuda.Stream] = None):
         """
         Return a tensor to the pool for reuse.
 
         Args:
             tensor: Tensor to free
+            stream: Stream that most recently read the tensor asynchronously.
 
         Raises:
             ValueError: If tensor doesn't belong to this pool
@@ -519,6 +525,11 @@ class OffloadTensorPool:
                 f"Attempting to free a tensor that doesn't belong to this pool "
                 f"(shape={shape}, dtype={dtype})"
             )
+
+        if stream is not None:
+            reuse_event = torch.cuda.Event()
+            reuse_event.record(stream)
+            self._reuse_events[id(tensor)] = reuse_event
 
         # Return tensor to the free queue
         pool['free'].append(tensor)
@@ -591,12 +602,17 @@ class OffloadTensorPool:
         """Clear the pool and release all GPU memory."""
         debug_rank("OffloadTensorPool: Clearing pool...")
 
+        # Pinned buffers must outlive every asynchronous H2D that reads them.
+        for reuse_event in self._reuse_events.values():
+            reuse_event.synchronize()
+
         for pool_key, pool in self._pools.items():
             # Clear all references, allowing PyTorch GC to reclaim memory
             pool['free'].clear()
             pool['all'].clear()
 
         self._pools.clear()
+        self._reuse_events.clear()
         self._stats['current_in_use'] = 0
 
         # Trigger GPU cache cleanup
@@ -620,6 +636,7 @@ class OffloadTensorGroup:
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
+        self._reloaded_tensor_tags = set()
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
@@ -854,6 +871,16 @@ class PipelineOffloadManager:
                 slot[3] = max(slot[3], counts[3])
         return agg
 
+    def get_reload_telemetry(self):
+        """Aggregate prefetched tensor hits and demand-reload misses by group name."""
+        agg = {}
+        for chunk in self._cached_chunks_forward:
+            for name, counts in chunk._reload_stats.items():
+                slot = agg.setdefault(name, [0, 0])
+                slot[0] += counts[0]
+                slot[1] += counts[1]
+        return agg
+
     def _dump_valve_telemetry(self):
         """LPS-1062: emit the aggregated valve counters as one line."""
         import logging
@@ -868,11 +895,16 @@ class PipelineOffloadManager:
             f"{name}: commits={v[0]} drain_firings={v[1]} events_drained={v[2]} max_pending={v[3]}"
             for name, v in sorted(agg.items())
         ]
+        reload_parts = [
+            f"{name}: prefetch_hits={v[0]} demand_misses={v[1]}"
+            for name, v in sorted(self.get_reload_telemetry().items())
+        ]
         logger.warning(
-            "BT_OFFLOAD_VALVE_TELEMETRY iter=%d max_inflight_offloads=%s | %s",
+            "BT_OFFLOAD_VALVE_TELEMETRY iter=%d max_inflight_offloads=%s | d2h: %s | h2d: %s",
             self._valve_telemetry_iter,
             str(cap),
             "; ".join(parts) if parts else "(no offload commits recorded)",
+            "; ".join(reload_parts) if reload_parts else "(no reloads recorded)",
         )
 
     @property
@@ -1272,9 +1304,7 @@ class ChunkOffloadHandler:
                     pool_shape = (padded_rows,) + real_shape[1:]
             cpu_backup = self.cpu_tensor_pool.allocate(pool_shape, dtype=src_tensor.dtype)
             copy_dst = (
-                cpu_backup[: real_shape[0]]
-                if tuple(cpu_backup.shape) != real_shape
-                else cpu_backup
+                cpu_backup[: real_shape[0]] if tuple(cpu_backup.shape) != real_shape else cpu_backup
             )
         else:
             cpu_backup = torch.empty(
@@ -1307,7 +1337,11 @@ class ChunkOffloadHandler:
         )
         gpu_tensor.copy_(copy_src, non_blocking=non_blocking)
         if use_cpu_pool:
-            self.cpu_tensor_pool.free(cpu_backup)
+            # CUDA graphs rely on deterministic pool reuse to replay captured
+            # D2H/H2D nodes against the same host addresses. An ordinary event
+            # recorded during capture cannot represent later graph replays.
+            stream = None if is_graph_capturing() else torch.cuda.current_stream()
+            self.cpu_tensor_pool.free(cpu_backup, stream=stream)
         if view_meta is not None:
             size, stride, storage_offset = view_meta
             gpu_tensor = gpu_tensor.as_strided(size, stride, storage_offset)
@@ -1328,12 +1362,16 @@ class ChunkOffloadHandler:
         self._groups_to_offload = []
         # Groups to be reloaded.
         self._groups_to_reload = []
+        # Exact commit-node order observed during warmup. Forward commit order
+        # is not a valid proxy for backward order when groups are nested or branched.
+        self._backward_group_order = []
+        # Groups with H2D work enqueued but not yet joined by their exact
+        # backward commit node.
+        self._reloading_group = []
         # Tensor count for the current group.
         self._tensor_count_current_group = 0
         # Maximum number of groups to offload or reload.
         self._max_group_size = 0
-        # Groups being reloaded.
-        self._reloading_group = []
         # Counter for special torch tensor types (FakeTensor, FunctionalTensor)
         self.torch_tensor_count = 0
         self.d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
@@ -1366,6 +1404,8 @@ class ChunkOffloadHandler:
         self._valve_telemetry_enabled = _env_flag("BT_OFFLOAD_VALVE_TELEMETRY", "0")
         # group name -> [commits, drain_firings, events_drained, max_pending]
         self._valve_stats = defaultdict(lambda: [0, 0, 0, 0])
+        # group name -> [prefetched tensor hits, demand-reload tensor misses]
+        self._reload_stats = defaultdict(lambda: [0, 0])
 
     def reset(self):
         """Reset the chunk offload handler."""
@@ -1450,10 +1490,31 @@ class ChunkOffloadHandler:
             return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
-        tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
+        group = self.offload_groups[group_id - 1]
+        tensor = group.pop_tensor(tensor_tag)
         # If tensor is offloaded (stored as tuple), reload it
         if isinstance(tensor, tuple):
+            if is_graph_capturing():
+                raise RuntimeError(
+                    f"Activation group {group._name!r} was not prefetched before CUDA graph "
+                    "capture. Run eager warmup with the same autograd graph before capture."
+                )
+            current_stream = torch.cuda.current_stream()
+            group.wait_offload_event(current_stream)
+            if self._valve_telemetry_enabled:
+                self._reload_stats[group._name][1] += 1
             tensor = self.reload(tensor)
+            # A demand miss has no earlier commit-node edge to propagate H2D
+            # readiness to auxiliary consumer streams. It is already a
+            # performance miss, so fail safe and complete it synchronously.
+            current_stream.synchronize()
+        elif tensor_tag in group._reloaded_tensor_tags:
+            if not is_graph_capturing():
+                group.wait_reload_event(torch.cuda.current_stream())
+            group._reloaded_tensor_tags.remove(tensor_tag)
+            if self._valve_telemetry_enabled:
+                self._reload_stats[group._name][0] += 1
+        tensor.record_stream(torch.cuda.current_stream())
         debug_rank(f"--------tensor_pop {tensor.shape}")
         return tensor
 
@@ -1575,6 +1636,11 @@ class ChunkOffloadHandler:
         """Bulk reload group."""
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
+        if not self.is_warmup and self._backward_group_order:
+            group_to_reload = next(
+                (group for group in self._backward_group_order if group in self._groups_to_reload),
+                group_to_reload,
+            )
         nvtx_msg = "activation reloading " + group_to_reload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.h2d_stream):
@@ -1587,9 +1653,9 @@ class ChunkOffloadHandler:
                     recovered_tensor = self.reload(state)
                     debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
+                    group_to_reload._reloaded_tensor_tags.add(tensor_tag)
             group_to_reload.record_reload_event(self.h2d_stream)
-        self._groups_to_reload.pop()
-        # Add the group to the reloading group to wait for the reload event.
+        self._groups_to_reload.remove(group_to_reload)
         self._reloading_group.append(group_to_reload)
         nvtx_range_pop(nvtx_msg)
 
@@ -1690,27 +1756,34 @@ class ChunkOffloadHandler:
             ):
                 next_backward_chunk.pre_reload_last_layer()
 
-    def on_group_commit_backward(self, name):
+    def on_group_commit_backward(self, group):
         """
         Called at the end of a layer group's backward pass.
-        Ensures correct chunk is active and synchronizes reloads.
+        Ensures the correct chunk is active. Tensor unpack waits for the exact
+        prefetched group's reload event, avoiding same-name cross-layer waits.
         """
         if not self.do_offload:
             return
         debug_rank("--on_group_commit_backward")
+        if isinstance(group, OffloadTensorGroup):
+            name = group._name
+            if self.is_warmup and group not in self._backward_group_order:
+                self._backward_group_order.append(group)
+        else:
+            name = group
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         # Switch to this chunk if it's not already current
         if cur_backward_chunk is not self:
             PipelineOffloadManager.get_instance().pop_backward_chunk(name)
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         assert cur_backward_chunk is self, f"Chunk mismatch {cur_backward_chunk} {self}"
-        # Wait for reload to complete before using tensors
-        if not is_graph_capturing() and len(self._reloading_group) > 0:
-            for reloading_group in self._reloading_group:
-                if reloading_group._name == name:
-                    reloading_group.wait_reload_event(torch.cuda.current_stream())
-                    self._reloading_group.remove(reloading_group)
-                    break
+        if (
+            isinstance(group, OffloadTensorGroup)
+            and group in self._reloading_group
+            and not is_graph_capturing()
+        ):
+            group.wait_reload_event(torch.cuda.current_stream())
+            self._reloading_group.remove(group)
 
     def on_group_start_forward(self, name):
         """
@@ -1731,7 +1804,9 @@ class ChunkOffloadHandler:
                     break
                 self._offloaded_group_index = self._offloaded_group_index + 1
         self._tensor_count_current_group = 0
-        self._groups_to_offload.append(self.offload_groups[self._offloaded_group_index - 1])
+        group = self.offload_groups[self._offloaded_group_index - 1]
+        group._reloaded_tensor_tags.clear()
+        self._groups_to_offload.append(group)
         debug_rank(f"groups to offload {self._groups_to_offload}")
 
     def on_group_start_backward(self):
@@ -1770,6 +1845,11 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
+        ctx.group = (
+            cur_forward_chunk.find_group_with_name(cur_forward_chunk._groups_to_offload, name)
+            if hasattr(cur_forward_chunk, "_groups_to_offload")
+            else name
+        )
         if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
             # During TE CUDA graph replay, queue D2H work and launch it after
             # replay returns, where CPU scheduling can overlap with graph/comm gaps.
@@ -1788,7 +1868,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         debug_rank("FineGrainedOffloadingGroupCommitFunction backward")
 
         cpu_offload_handler = ctx.cpu_offload_handler
-        cpu_offload_handler.on_group_commit_backward(ctx.name)
+        cpu_offload_handler.on_group_commit_backward(ctx.group)
         return grad_output + (None, None, None, None)
 
 
@@ -1799,6 +1879,11 @@ class FineGrainedOffloadingMultiGroupCommitFunction(torch.autograd.Function):
     def forward(ctx, cur_forward_chunk, name, forced_released_tensors, delay_offload, *tensors):
         """Start the group offload and return each output unchanged."""
         ctx.set_materialize_grads(False)
+        ctx.group = (
+            cur_forward_chunk.find_group_with_name(cur_forward_chunk._groups_to_offload, name)
+            if hasattr(cur_forward_chunk, "_groups_to_offload")
+            else name
+        )
         if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
             PipelineOffloadManager.get_instance().push_offload_groups(
                 cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
@@ -1812,7 +1897,7 @@ class FineGrainedOffloadingMultiGroupCommitFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         """Synchronize reload once every output branch has reached this node."""
-        ctx.cpu_offload_handler.on_group_commit_backward(ctx.name)
+        ctx.cpu_offload_handler.on_group_commit_backward(ctx.group)
         return (None, None, None, None, *grad_outputs)
 
 
@@ -1830,7 +1915,9 @@ def fine_grained_offloading_group_offload(
     if isinstance(tensor, (tuple, list)):
         if len(tensor) == 0:
             return tensor
-        tensor_indices = [index for index, item in enumerate(tensor) if isinstance(item, torch.Tensor)]
+        tensor_indices = [
+            index for index, item in enumerate(tensor) if isinstance(item, torch.Tensor)
+        ]
         if not tensor_indices:
             return tensor
         cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
