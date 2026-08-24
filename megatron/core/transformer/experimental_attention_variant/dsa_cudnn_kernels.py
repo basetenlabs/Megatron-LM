@@ -772,7 +772,7 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
-    segment_q_causal_offsets = (segment_k_lengths - segment_q_lengths).to(
+    segment_q_causal_offsets = (layout.segment_k_lengths - layout.segment_q_lengths).to(
         dtype=torch.int32, device=device
     )
     scores = _cudnn_dsa.indexer_forward_wrapper(
