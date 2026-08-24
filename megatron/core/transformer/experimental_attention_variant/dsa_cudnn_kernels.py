@@ -50,6 +50,7 @@ class CudnnDsaInterface(Protocol):
         cu_seqlens_k: Optional[Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        q_causal_offsets: Optional[Tensor] = None,
     ) -> dict:
         """Compute the head-summed indexer logits over the key axis (``"scores"``)."""
 
