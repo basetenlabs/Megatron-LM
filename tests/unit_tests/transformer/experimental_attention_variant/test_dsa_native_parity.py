@@ -612,7 +612,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
         torch.ones((1, 12, 1, 1)),
         torch.ones((1, 24, 1)),
         torch.ones((1, 12, 1)),
-        topk=3,
+        topk=4,
         varlen_starts=starts,
         varlen_ends=ends,
         return_scores=False,
@@ -640,13 +640,13 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
     expected_lengths = []
     for position, start in zip(query_positions.tolist(), starts.tolist()):
         valid_count = position - start + 1
-        row = list(range(position, max(start - 1, position - 3), -1))
-        expected_indices.append(row + [-1] * (3 - len(row)))
+        row = list(range(position, max(start - 1, position - 4), -1))
+        expected_indices.append(row + [-1] * (4 - len(row)))
         local_scores = [value - start for value in row]
         expected_scores.append(
-            local_scores + [torch.finfo(torch.float32).min] * (3 - len(local_scores))
+            local_scores + [torch.finfo(torch.float32).min] * (4 - len(local_scores))
         )
-        expected_lengths.append(min(valid_count, 3))
+        expected_lengths.append(min(valid_count, 4))
     expected_indices = torch.tensor([expected_indices], dtype=torch.int32)
     torch.testing.assert_close(topk_indices, expected_indices, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -830,7 +830,7 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
 
 
 def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
-    seen = {"forward_shapes": [], "q_causal_offsets": [], "topk_seq_lens": []}
+    seen = {"forward_shapes": [], "q_causal_offsets": []}
 
     class FakeDSA:
         @staticmethod
@@ -847,7 +847,6 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
-            seen["topk_seq_lens"].append(seq_lens.detach().clone())
             scores = scores_flat.clone()
             key_ids = torch.arange(scores.size(1), device=scores.device).view(1, -1)
             scores.masked_fill_(key_ids >= seq_lens.view(-1, 1), float("-inf"))
@@ -863,7 +862,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
         torch.ones((1, 4, 1, 1)),
         torch.arange(8, dtype=torch.float32).view(1, 8, 1),
         torch.ones((1, 4, 1)),
-        topk=3,
+        topk=2,
         varlen_starts=torch.zeros(4, dtype=torch.int64),
         varlen_ends=torch.tensor([3, 4, 5, 6], dtype=torch.int64),
         key_positions=None,
@@ -876,15 +875,14 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
     assert seen["forward_shapes"] == [(2, 4), (2, 6)]
     assert [offset.tolist() for offset in seen["q_causal_offsets"]] == [[2], [4]]
-    assert [seq_lens.tolist() for seq_lens in seen["topk_seq_lens"]] == [[3, 4], [5, 6]]
     torch.testing.assert_close(
         topk_indices,
-        torch.tensor([[[2, 1, 0], [3, 2, 1], [4, 3, 2], [5, 4, 3]]], dtype=torch.int32),
+        torch.tensor([[[2, 1], [3, 2], [4, 3], [5, 4]]], dtype=torch.int32),
     )
-    torch.testing.assert_close(topk_length, torch.tensor([[3, 3, 3, 3]], dtype=torch.int32))
+    torch.testing.assert_close(topk_length, torch.tensor([[2, 2, 2, 2]], dtype=torch.int32))
     torch.testing.assert_close(
         topk_scores,
-        torch.tensor([[[2.0, 1.0, 0.0], [3.0, 2.0, 1.0], [4.0, 3.0, 2.0], [5.0, 4.0, 3.0]]]),
+        torch.tensor([[[2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [5.0, 4.0]]]),
     )
 
 
