@@ -23,7 +23,11 @@ When enabled, Megatron applies the env vars and config overrides below via `mega
 
 ## Environment variables
 
+<<<<<<< HEAD
 Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which their kernels auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
+=======
+Each variable may be set by the launcher or left unset. Baseten records these in the run manifest (rs6 rehearsal, round 2). If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC`, which the Mamba SSM helper auto-detects from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
+>>>>>>> 9dcd5feed ([baseten] docs: run manifest note (rs6 rehearsal r2))
 
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
