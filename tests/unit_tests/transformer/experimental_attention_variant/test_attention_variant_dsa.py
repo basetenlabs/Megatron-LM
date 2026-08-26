@@ -2292,6 +2292,37 @@ class TestDSAIndexer:
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
 
+    def test_candidate_transform_hooks_default_to_token_indices(self, seqlen):
+        """The base indexer must preserve the existing token-level DSA contract."""
+        q = torch.randn(seqlen, 1, 2, 4)
+        k = torch.randn(seqlen, 1, 4)
+        weights = torch.randn(seqlen, 1, 2)
+        starts = torch.zeros(seqlen, dtype=torch.int32)
+        ends = torch.arange(1, seqlen + 1, dtype=torch.int32)
+
+        prepared = self.indexer.prepare_topk_inputs(
+            q,
+            k,
+            weights,
+            self.index_topk,
+            (starts, ends),
+            None,
+        )
+
+        assert prepared[0] is q
+        assert prepared[1] is k
+        assert prepared[2] is weights
+        assert prepared[3] == self.index_topk
+        assert prepared[4][0] is starts
+        assert prepared[4][1] is ends
+
+        indices = torch.arange(seqlen).view(1, seqlen, 1)
+        lengths = torch.ones(1, seqlen, dtype=torch.int32)
+        final_indices, final_lengths = self.indexer.finalize_topk_indices(indices, lengths, None)
+        assert final_indices is indices
+        assert final_lengths is lengths
+        assert self.indexer.supports_full_fused_attention is True
+
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
         """Ensure indexer RoPE uses the model-configured interleave convention."""

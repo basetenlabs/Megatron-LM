@@ -627,6 +627,40 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad is not None, "Gradients should be computed for hidden_states"
         assert hidden_states.grad.shape == hidden_states.shape
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hyper_connection_wraps_moe_forward_and_backward(self):
+        """mHC must compose around a complete MoE sublayer."""
+        hidden_size = 64
+        num_streams = 4
+        config = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_grouped_gemm=False,
+            moe_token_dispatcher_type="alltoall",
+            ffn_hidden_size=128,
+        )
+        layer_spec = _make_mhc_layer_spec(num_experts=4, moe_grouped_gemm=False)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules).cuda()
+        assert layer.is_moe_layer
+
+        hidden_states = torch.randn(
+            8,
+            2,
+            num_streams * hidden_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        attention_mask = torch.ones((1, 1, 8, 8), dtype=bool, device="cuda")
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        assert output.shape == hidden_states.shape
+        output.square().mean().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+        assert hidden_states.grad.shape == hidden_states.shape
+
     def test_intermediate_layer_with_recompute(self):
         """
         Test TransformerLayer as an intermediate layer (not last in block).

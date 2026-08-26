@@ -1098,6 +1098,47 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
+    supports_full_fused_attention: bool = True
+
+    def prepare_topk_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        index_topk: int,
+        fused_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        """Prepare indexer tensors and bounds for top-k selection.
+
+        Model-specific indexers can override this hook to transform the key
+        candidate space before the fused top-k kernel runs. The default keeps
+        the ordinary token-level DSA candidate space unchanged.
+        """
+        del packed_seq_params
+        return q, k, weights, index_topk, fused_bounds
+
+    def finalize_topk_indices(
+        self,
+        topk_indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Map selected candidate indices into sparse-attention key indices.
+
+        The default token-level DSA indexer already selects key indices, so no
+        conversion is required. Candidate-compressing indexers can override
+        this hook to expand their selected candidates into raw token indices.
+        """
+        del packed_seq_params
+        return topk_indices, topk_length
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2020,7 +2061,7 @@ class DSAttention(MegatronModule):
                 query.detach(),
                 key_for_loss,
                 self.softmax_scale,
-                self.index_topk,
+                effective_index_topk,
                 indexer_loss_coeff,
                 float_mask,
                 sparse_indexer_loss,
@@ -2034,7 +2075,11 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if (
+            use_fused_kernels
+            and not self.index_share
+            and (self.indexer is None or self.indexer.supports_full_fused_attention)
+        ):
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2095,6 +2140,18 @@ class DSAttention(MegatronModule):
                 key_positions=key_positions,
             )
 
+        effective_index_topk = self.index_topk
+        if computes_topk:
+            assert self.indexer is not None and q is not None and k is not None and weights is not None
+            q, k, weights, effective_index_topk, fused_bounds = self.indexer.prepare_topk_inputs(
+                q,
+                k,
+                weights,
+                self.index_topk,
+                fused_bounds,
+                packed_seq_params,
+            )
+
         indexer_loss = None
 
         def slice_topk_to_local_sequence_parallel_rows():
@@ -2129,7 +2186,7 @@ class DSAttention(MegatronModule):
                     q,
                     k,
                     weights,
-                    self.index_topk,
+                    effective_index_topk,
                     starts_i32,
                     ends_i32,
                     block_size=max(1, block_size),
@@ -2179,7 +2236,7 @@ class DSAttention(MegatronModule):
                     q,
                     k,
                     weights,
-                    self.index_topk,
+                    effective_index_topk,
                     starts_i32,
                     ends_i32,
                     block_size=max(1, block_size),
@@ -2201,7 +2258,7 @@ class DSAttention(MegatronModule):
                         q,
                         k,
                         weights,
-                        self.index_topk,
+                        effective_index_topk,
                         mask=float_mask,
                         varlen_starts=varlen_starts,
                         varlen_ends=varlen_ends,
@@ -2210,6 +2267,14 @@ class DSAttention(MegatronModule):
                     )
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
+
+        if computes_topk:
+            assert self.indexer is not None and topk_indices is not None
+            topk_indices, topk_length = self.indexer.finalize_topk_indices(
+                topk_indices,
+                topk_length,
+                packed_seq_params,
+            )
 
         if self.index_share and computes_topk:
             assert topk_holder is not None and topk_indices is not None
