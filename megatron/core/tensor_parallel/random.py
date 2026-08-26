@@ -793,7 +793,22 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         # This is to avoid double-reloading the inputs in CPU offloading scenario.
         inputs = ctx.inputs
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        # A checkpointed function may return auxiliary tensors that are not
+        # connected to its inputs (for example a bias/metadata output). The
+        # custom Function's outward-facing tensors participate in autograd, but
+        # their recomputed counterparts correctly have requires_grad=False.
+        # Passing those counterparts to torch.autograd.backward raises instead
+        # of treating them as zero-gradient outputs, so filter them here.
+        differentiable = [
+            (output, grad)
+            for output, grad in zip(outputs, args)
+            if isinstance(output, torch.Tensor) and output.requires_grad
+        ]
+        if differentiable:
+            torch.autograd.backward(
+                tuple(output for output, _ in differentiable),
+                tuple(grad for _, grad in differentiable),
+            )
         ctx.outputs = None
         ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
