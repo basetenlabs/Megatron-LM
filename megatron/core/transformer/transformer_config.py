@@ -91,6 +91,18 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    mtp_source_layer_number: Optional[int] = None
+    """Which decoder layer's spec the MTP layer copies, as a 1-indexed global layer
+    number. None keeps the historical behaviour of copying the *last* decoder layer.
+
+    Only matters for a heterogeneous stack whose final layer is not the same kind as its
+    MTP layer. GLM-5.3-Flash is exactly that: its 45 decoder layers end on a KDA layer
+    (index 44, since KDA is every layer with ``idx % 4 != 3``), while its MTP layer is
+    MLA+DSA -- the checkpoint gives layer 45 ``q_a_proj``, ``kv_b_proj`` and the full
+    indexer, and no KDA tensors. Copying the last layer there builds the MTP layer with
+    the wrong attention entirely.
+    """
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
