@@ -1099,6 +1099,7 @@ class DSAIndexer(MegatronModule):
     """
 
     supports_full_fused_attention: bool = True
+    supports_local_indexer_varlen: bool = True
 
     def prepare_topk_inputs(
         self,
@@ -1972,6 +1973,7 @@ class DSAttention(MegatronModule):
             and varlen_starts is not None
             and varlen_ends is not None
             and key_positions is None
+            and (self.indexer is None or self.indexer.supports_local_indexer_varlen)
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -2254,14 +2256,18 @@ class DSAttention(MegatronModule):
 
             if topk_indices is None:
                 with torch.no_grad():
+                    fallback_starts = varlen_starts
+                    fallback_ends = varlen_ends
+                    if fused_bounds is not None:
+                        fallback_starts, fallback_ends = fused_bounds
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,
                         k,
                         weights,
                         effective_index_topk,
                         mask=float_mask,
-                        varlen_starts=varlen_starts,
-                        varlen_ends=varlen_ends,
+                        varlen_starts=fallback_starts,
+                        varlen_ends=fallback_ends,
                         key_positions=key_positions,
                         use_relu=self.config.dsa_indexer_scoring_relu,
                     )
