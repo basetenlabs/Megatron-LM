@@ -397,7 +397,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-            if self.config.enable_hyper_connections:
+            if self.config.enable_hyper_connections and self.config.mhc_learned_output_contract:
                 hc_mult = self.config.num_residual_streams
                 hc_dim = self.config.hidden_size * hc_mult
                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -520,16 +520,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
+            # DSv4 introduced the learned output contraction for mHC; GLM-5.3 keeps the
+            # original unweighted mean and ships no hc_head_* weights for a learned one.
             # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                hidden_states = HyperConnectionModule.output_contract(
+                    hidden_states, self.config.num_residual_streams
+                )
 
         # Final layer norm.
         if self.final_layernorm is not None:

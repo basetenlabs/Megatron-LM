@@ -1243,6 +1243,22 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    mhc_learned_output_contract: bool = True
+    """Whether the mHC residual streams are contracted by a learned gated sum at the
+    block exit.
+
+    True reproduces DeepSeek-V4, which introduced the learned contraction and ships
+    ``hc_head_fn`` / ``hc_head_base`` / ``hc_head_scale`` for it.
+
+    False contracts by an unweighted mean instead, and skips creating those parameters.
+    GLM-5.3-Flash needs this: its ``Glm5NextTextHyperHead`` is a plain
+    ``hidden_streams.mean(dim=2)`` ("unlike DeepSeek-V4", per its own comment) and the
+    checkpoint ships no ``hc_head_*`` tensors. Left True for such a model, the learned
+    weights are xavier-initialized, never loaded and never trained into anything
+    meaningful, so the block applies a random contraction to the final hidden states --
+    wrong logits with nothing raised.
+    """
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
