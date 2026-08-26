@@ -9,7 +9,7 @@
 
 # Deterministic Training
 
-Deterministic training guarantees that two runs with identical inputs produce identical outputs at every step. Useful for debugging regressions and for reproducibility studies.
+Deterministic training guarantees that two runs with identical inputs produce identical outputs at every step. Useful for debugging regressions and for reproducibility studies. (rs7 rehearsal r3 marker check)
 
 Pass `--deterministic-mode` to any Megatron training entry point (e.g. `pretrain_gpt.py`):
 
