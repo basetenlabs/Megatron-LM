@@ -17,7 +17,11 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import (
+    ScheduleNode,
+    is_pp_first_stage,
+    is_pp_last_stage,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
@@ -379,6 +383,30 @@ def test_forward_step_calc_loss_accepts_leaf_loss_tensors(
     torch.testing.assert_close(scaled_loss, torch.tensor(expected_loss))
     scaled_loss.backward()
     torch.testing.assert_close(leaf_loss.grad, torch.tensor(expected_grad))
+
+
+def test_schedule_node_backward_skips_frozen_outputs():
+    frozen = torch.tensor(2.0)
+    grad = torch.tensor(3.0)
+
+    returned = ScheduleNode.default_backward_func(None, (frozen,), (grad,))
+
+    assert returned == (grad,)
+
+
+def test_schedule_node_backward_filters_mixed_outputs():
+    x = torch.tensor(2.0, requires_grad=True)
+    differentiable = x * 2
+    frozen = torch.tensor(5.0)
+
+    returned = ScheduleNode.default_backward_func(
+        None,
+        (differentiable, frozen),
+        (torch.tensor(3.0), torch.tensor(7.0)),
+    )
+
+    torch.testing.assert_close(x.grad, torch.tensor(6.0))
+    assert len(returned) == 2
 
 
 def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
