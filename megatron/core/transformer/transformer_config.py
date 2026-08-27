@@ -2014,13 +2014,6 @@ class TransformerConfig(ModelParallelConfig):
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
 
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
-
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
                 "enable_mhc_connections is not compatible with inference_fuse_tp_communication. "
