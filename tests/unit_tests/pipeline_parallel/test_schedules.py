@@ -340,6 +340,47 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     )
 
 
+@pytest.mark.parametrize(
+    ("calculate_per_token_loss", "expected_loss", "expected_grad"),
+    [(False, 16.0, 2.0), (True, 1.0, 0.125)],
+)
+def test_forward_step_calc_loss_accepts_leaf_loss_tensors(
+    calculate_per_token_loss, expected_loss, expected_grad
+):
+    config = SimpleNamespace(
+        calculate_per_token_loss=calculate_per_token_loss,
+        experimental_attention_variant_loss_scale_func=None,
+        experimental_attention_variant=None,
+        grad_scale_func=None,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+    leaf_loss = torch.tensor(8.0, requires_grad=True)
+
+    def loss_func(_output_tensor):
+        if calculate_per_token_loss:
+            return leaf_loss, torch.tensor(4), {"loss": leaf_loss.detach()}
+        return leaf_loss, {"loss": leaf_loss.detach()}
+
+    scaled_loss, _ = schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(0.0),
+        loss_func=loss_func,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=[],
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    torch.testing.assert_close(scaled_loss, torch.tensor(expected_loss))
+    scaled_loss.backward()
+    torch.testing.assert_close(leaf_loss.grad, torch.tensor(expected_grad))
+
+
 def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
