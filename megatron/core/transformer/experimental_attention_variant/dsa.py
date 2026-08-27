@@ -1418,6 +1418,35 @@ class DSAIndexer(MegatronModule):
         x = torch.cat([x_pe, x_nope], dim=-1)
         return x
 
+    # ---------------------------------------------------------------- hooks
+    # DSAttention owns the top-k: it calls forward_before_topk() and then selects
+    # itself. A subclass that scores something other than one candidate per token --
+    # GLM-5.3 scores pools of index_kpool keys -- has to vary three steps the base
+    # class would otherwise hardcode. All three default to the plain behaviour.
+
+    @property
+    def topk_budget(self) -> int:
+        """How many candidates the top-k selects. One per token by default."""
+        return self.index_topk
+
+    def indexer_key_positions(self, seqlen: int, key_positions):
+        """Positions used to decide which candidates a query may see.
+
+        Returned unchanged by default, since a candidate *is* a token. A pooling
+        indexer must return the position of each candidate's last token, so that
+        causality is judged in candidate space.
+        """
+        return key_positions
+
+    def postprocess_topk(self, topk_indices, seqlen: int):
+        """Map selected candidate indices to token indices. Identity by default."""
+        return topk_indices
+
+    @property
+    def selects_pooled_candidates(self) -> bool:
+        """Whether candidates are anything other than single tokens."""
+        return self.topk_budget != self.index_topk
+
     def forward_before_topk(
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2241,6 +2270,16 @@ class DSAttention(MegatronModule):
                 self.config.dsa_indexer_scoring_relu,
             )
 
+        if use_fused_kernels and getattr(self.indexer, "selects_pooled_candidates", False):
+            raise NotImplementedError(
+                "The fused DSA kernels assume one indexer candidate per token, but this "
+                "indexer scores pooled candidates. run_fused_dsa_attention and "
+                "run_fused_qk_topk take indexer_topk=self.index_topk and treat the "
+                "selected indices as token indices, so they would silently attend to the "
+                "wrong positions. Use dsa_kernel_backend other than the fused ones until "
+                "the hooks are plumbed through both."
+            )
+
         fused_output = None
         if use_fused_kernels and not self.index_share:
             assert q is not None and k is not None and weights is not None
@@ -2415,14 +2454,19 @@ class DSAttention(MegatronModule):
                         q,
                         k,
                         weights,
-                        self.index_topk,
+                        self.indexer.topk_budget,
                         mask=float_mask,
                         varlen_starts=varlen_starts,
                         varlen_ends=varlen_ends,
-                        key_positions=key_positions,
+                        key_positions=self.indexer.indexer_key_positions(
+                            k.size(0), key_positions
+                        ),
                         use_relu=self.config.dsa_indexer_scoring_relu,
                     )
                     del index_scores
+                # Candidate indices -> token indices. Identity unless the indexer
+                # pools; the attention below always works in token space.
+                topk_indices = self.indexer.postprocess_topk(topk_indices, sq)
             slice_topk_to_local_sequence_parallel_rows()
 
         if self.index_share and computes_topk:
