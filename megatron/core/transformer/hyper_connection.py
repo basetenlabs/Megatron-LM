@@ -146,11 +146,20 @@ def native_h_post_bda(
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """Native fused projection + RMS normalization.
+
+    ``eps_inside_sqrt`` selects the standard RMSNorm form, ``rsqrt(mean(x**2) + eps)``.
+    The default keeps the historical ``1 / (RMS + eps)``; the two diverge once eps is
+    not negligible against the RMS. See ``mhc_rms_norm_eps``.
+    """
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
+    if eps_inside_sqrt:
+        return proj, torch.rsqrt((norm * norm) / K + eps)
     v = norm / math.sqrt(K) + eps
     r = 1.0 / v
     return proj, r
@@ -264,7 +273,11 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        # None keeps the historical 1 / (RMS + 1e-6); a configured value selects the
+        # standard rsqrt(mean + eps) form. See TransformerConfig.mhc_rms_norm_eps.
+        configured = getattr(config, "mhc_rms_norm_eps", None)
+        self.rms_eps_inside_sqrt = configured is not None
+        self.norm_eps = 1e-6 if configured is None else configured
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -331,7 +344,9 @@ class HyperConnectionModule(MegatronModule):
         # the bounded mixing weights back to the activation dtype.
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        proj, r = self._proj_rms_op(
+            x_2d, weight, self.norm_eps, self.rms_eps_inside_sqrt
+        )
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)

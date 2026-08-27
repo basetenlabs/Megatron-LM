@@ -1255,6 +1255,22 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    mhc_rms_norm_eps: Optional[float] = None
+    """Epsilon for the mHC input RMS normalisation, and a switch on its form.
+
+    ``None`` keeps Megatron-Core's historical behaviour, which divides by
+    ``RMS + 1e-6``. Setting a value switches to the standard RMSNorm form,
+    ``rsqrt(mean(x**2) + eps)``, with eps *inside* the square root.
+
+    The two agree only while eps is negligible against the RMS, which is why the
+    historical form is fine for DeepSeek-V4 and wrong for GLM-5.3. GLM-5.3's mHC input
+    norm is ``Glm5NextTextUnweightedRMSNorm(eps=rms_norm_eps)`` with rms_norm_eps 1e-5,
+    and its layer-0 streams have RMS about 0.0079, so eps is a sixth of the mean square.
+    Measured on the real checkpoint: the historical form makes the mHC collapse 3.46%
+    too large in norm (cos 0.996616 against HF), and the standard form brings it to
+    cos 0.999999 -- which in turn takes GLM-5.3's first three layers from cos 0.9336 to
+    exact."""
+
     mhc_learned_output_contract: bool = True
     """Whether the mHC residual streams are contracted by a learned gated sum at the
     block exit.
