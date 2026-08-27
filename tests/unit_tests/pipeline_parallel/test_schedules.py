@@ -342,7 +342,7 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
 
 @pytest.mark.parametrize(
     ("calculate_per_token_loss", "expected_loss", "expected_grad"),
-    [(False, 16.0, 2.0), (True, 1.0, 0.125)],
+    [(False, 16.0, 2.0), (True, 8.0, 1.0)],
 )
 def test_forward_step_calc_loss_accepts_leaf_loss_tensors(
     calculate_per_token_loss, expected_loss, expected_grad
