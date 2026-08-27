@@ -1429,12 +1429,18 @@ class DSAIndexer(MegatronModule):
         """How many candidates the top-k selects. One per token by default."""
         return self.index_topk
 
-    def indexer_key_positions(self, seqlen: int, key_positions):
+    def indexer_key_positions(self, num_candidates: int, key_positions):
         """Positions used to decide which candidates a query may see.
 
-        Returned unchanged by default, since a candidate *is* a token. A pooling
-        indexer must return the position of each candidate's last token, so that
-        causality is judged in candidate space.
+        Args:
+            num_candidates: number of scoring candidates, i.e. ``k.size(0)`` as returned
+                by ``forward_before_topk`` -- one per token by default, one per pool for
+                a pooling indexer.
+            key_positions: the token-level positions the caller would otherwise use.
+
+        Returned unchanged by default, since a candidate *is* a token. A pooling indexer
+        must return the position of each candidate's last token, so that causality is
+        judged in candidate space.
         """
         return key_positions
 
