@@ -127,6 +127,7 @@ def get_gpt_layer_with_inference_submodules(
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
                     core_attention=backend.core_attention(),
+                    linear_gate=backend.column_parallel_linear(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
                     kv_layernorm=IdentityOp,
@@ -189,6 +190,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fallback_to_eager_attn: bool = False,
+    flex_attention: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     enable_hyper_connection: bool = False,
@@ -237,7 +239,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
-        backend = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
+        backend = TESpecProvider(
+            fallback_to_eager_attn=fallback_to_eager_attn, use_flex_attention=flex_attention
+        )
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -314,6 +318,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
                     core_attention=backend.core_attention(),
+                    linear_gate=backend.column_parallel_linear(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
                     kv_layernorm=IdentityOp,
@@ -445,6 +450,7 @@ def get_gpt_layer_local_submodules(
                     linear_kv_down_proj=backend.column_parallel_linear(),
                     linear_kv_up_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
+                    linear_gate=backend.column_parallel_linear(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
@@ -788,8 +794,25 @@ def get_gpt_mtp_block_spec_for_backend(
         return None
 
     if isinstance(spec, TransformerBlockSubmodules):
-        # get the spec for the last layer of decoder block
-        transformer_layer_spec = copy.copy(spec.layer_specs[-1])
+        source_layer_number = getattr(config, "mtp_source_layer_number", None)
+        if source_layer_number is None:
+            # get the spec for the last layer of decoder block
+            transformer_layer_spec = copy.copy(spec.layer_specs[-1])
+        else:
+            # A heterogeneous stack may end on a layer of a different kind than its MTP
+            # layer, so let the model name the layer to copy instead of assuming the
+            # last one. Convert the 1-indexed global number to this stage's local index.
+            offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+            local_index = source_layer_number - 1 - offset
+            if not 0 <= local_index < len(spec.layer_specs):
+                raise ValueError(
+                    f"mtp_source_layer_number={source_layer_number} resolves to local "
+                    f"index {local_index}, outside this stage's {len(spec.layer_specs)} "
+                    "decoder layer specs. The layer whose spec the MTP layer copies must "
+                    "live on the same pipeline stage as the MTP block; pick a layer of "
+                    "the right kind on the last stage."
+                )
+            transformer_layer_spec = copy.copy(spec.layer_specs[local_index])
     elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
         transformer_layer_spec = copy.copy(spec)
     else:

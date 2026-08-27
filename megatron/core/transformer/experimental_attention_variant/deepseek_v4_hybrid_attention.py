@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -911,6 +911,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        # core_attention is always CompressedSparseAttention for the dsv4_hybrid
+        # variant; its compressor/indexer linears defer their wgrads under
+        # delay_wgrad_compute and must be flushed here as well.
+        self.core_attention.backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
