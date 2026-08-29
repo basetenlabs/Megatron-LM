@@ -11,6 +11,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -2396,6 +2397,60 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
         "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
     )
+    _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE = 128
+
+    try:
+        from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled as _te_cpu_offload
+        from transformer_engine.pytorch.module.grouped_linear import (
+            _GroupedLinear as _TEGroupedLinearAutograd,
+        )
+        from transformer_engine.pytorch.tensor import Float8BlockwiseQTensor
+
+        _te_grouped_linear_forward_signature = inspect.signature(
+            _TEGroupedLinearAutograd.forward
+        ).parameters
+        _TE_GROUPED_LINEAR_EXTERNAL_WEIGHT_V216_SUPPORTED = (
+            get_te_version() == PkgVersion("2.16.0")
+            and tuple(_te_grouped_linear_forward_signature)
+            == ("ctx", "inp", "non_tensor_args", "weights_and_biases")
+            and _te_grouped_linear_forward_signature["weights_and_biases"].kind
+            == inspect.Parameter.VAR_POSITIONAL
+        )
+    except ImportError:
+        Float8BlockwiseQTensor = None
+        _TEGroupedLinearAutograd = None
+        _te_cpu_offload = None
+        _TE_GROUPED_LINEAR_EXTERNAL_WEIGHT_V216_SUPPORTED = False
+
+    def _materialize_frozen_blockwise_weights_bf16(
+        payloads: tuple[Tensor, ...], scales: tuple[Tensor, ...]
+    ) -> Tensor:
+        """Materialize grouped E4M3 blockwise weights into one BF16 tensor."""
+        weights = []
+        for payload, scale in zip(payloads, scales, strict=True):
+            block_rows, block_columns = scale.shape
+            blocked = payload.float().view(
+                block_rows,
+                _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE,
+                block_columns,
+                _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE,
+            )
+            weights.append(
+                (blocked * scale[:, None, :, None])
+                .reshape(
+                    block_rows * _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE,
+                    block_columns * _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE,
+                )
+                .to(torch.bfloat16)
+            )
+        return torch.stack(weights)
+
+    @cache
+    def _get_compiled_frozen_blockwise_weight_materializer() -> Callable:
+        """Share compiled FC1/FC2 specializations across all expert layers."""
+        return torch.compile(
+            _materialize_frozen_blockwise_weights_bf16, fullgraph=True, dynamic=False
+        )
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
@@ -2473,6 +2528,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
             gtp_remat_group = pg_collection.expt_gtp_remat
+            self._frozen_blockwise_bf16_fast_path_enabled = get_pg_size(gtp_remat_group) == 1
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -2528,8 +2584,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             frozen_quantized_init_context = nullcontext()
             if (
                 self.te_quant_params is not None
-                and self.te_quant_params.training_recipe.preserve_high_precision_init_val
-                is False
+                and self.te_quant_params.training_recipe.preserve_high_precision_init_val is False
             ):
                 # TE uses grad mode to decide whether to allocate a columnwise
                 # training copy. Frozen native weights need rowwise storage only.
@@ -2746,6 +2801,151 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 self.te_quant_params, self.training, is_context_quantized
             )
 
+        def _get_frozen_blockwise_bf16_materialization_inputs(
+            self, x: Tensor
+        ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]] | None:
+            """Return native rowwise payloads and scales when the BF16 fast path is safe."""
+            if (
+                not _TE_GROUPED_LINEAR_EXTERNAL_WEIGHT_V216_SUPPORTED
+                or not self._frozen_blockwise_bf16_fast_path_enabled
+                or not self.training
+                or x.dtype != torch.bfloat16
+                or self.use_bias
+                or self.te_return_bias
+                or self.delay_wgrad_compute
+                or getattr(self, "single_grouped_weight", False)
+                or FP8GlobalStateManager.is_fp8_enabled()
+                or FP8GlobalStateManager.is_fp8_calibration()
+                or self.is_debug_iter()
+                or self.te_quant_params is None
+            ):
+                return None
+
+            recipe = self.te_quant_params.training_recipe
+            if (
+                recipe.fp8_quantization_recipe != Fp8Recipe.blockwise
+                or recipe.fp8_format != "e4m3"
+                or not recipe.fp8_param
+                or recipe.preserve_high_precision_init_val is not False
+                or not recipe.fp8_block_scaling_fp32_scales
+                or recipe.override_nonquantized_autocast
+            ):
+                return None
+
+            payloads = []
+            scales = []
+            for gemm_idx in range(self.num_gemms):
+                weight = getattr(self, f"weight{gemm_idx}")
+                rowwise_data = getattr(weight, "_rowwise_data", None)
+                rowwise_scale = getattr(weight, "_rowwise_scale_inv", None)
+                if (
+                    Float8BlockwiseQTensor is None
+                    or not isinstance(weight, Float8BlockwiseQTensor)
+                    or weight.requires_grad
+                    or weight.dtype != torch.bfloat16
+                    or rowwise_data is None
+                    or rowwise_data.dtype != torch.uint8
+                    or rowwise_data.numel() != weight.numel()
+                    or rowwise_scale is None
+                    or rowwise_scale.dtype != torch.float32
+                    or getattr(weight, "_columnwise_data", None) is not None
+                    or getattr(weight, "_columnwise_scale_inv", None) is not None
+                    or weight.shape[0] % _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE != 0
+                    or weight.shape[1] % _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE != 0
+                    or rowwise_data.device != x.device
+                    or rowwise_scale.device != x.device
+                    or hasattr(weight, "materialize_group_for_forward")
+                ):
+                    return None
+                block_rows = weight.shape[0] // _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE
+                block_columns = weight.shape[1] // _FROZEN_BLOCKWISE_WEIGHT_BLOCK_SIZE
+                if rowwise_scale.shape[0] < block_rows or rowwise_scale.shape[1] < block_columns:
+                    return None
+                payloads.append(rowwise_data.view(torch.float8_e4m3fn))
+                scales.append(rowwise_scale[:block_rows, :block_columns])
+            return tuple(payloads), tuple(scales)
+
+        def _forward_with_external_bf16_weights(
+            self,
+            x: Tensor,
+            m_splits: List[int],
+            grouped_weights: Tensor,
+            is_first_microbatch: bool | None,
+        ) -> Tensor:
+            """Run TE's grouped BF16 GEMM with ephemeral externally materialized weights."""
+            assert _TEGroupedLinearAutograd is not None
+            assert _te_cpu_offload is not None
+            if len(m_splits) != self.num_gemms:
+                raise ValueError(
+                    f"Number of splits ({len(m_splits)}) should match number of "
+                    f"GEMMs ({self.num_gemms})."
+                )
+
+            is_grad_enabled = torch.is_grad_enabled()
+            x = self.prepare_forward(x, num_gemms=self.num_gemms)
+            try:
+                if self.fp8 or self.fp8_calibration:
+                    raise RuntimeError(
+                        "Frozen blockwise BF16 materialization selected during FP8 execution."
+                    )
+                (
+                    input_quantizers,
+                    weight_quantizers,
+                    output_quantizers,
+                    grad_input_quantizers,
+                    grad_weight_quantizers,
+                    grad_output_quantizers,
+                ) = self._get_quantizers()
+                cache_weight = is_first_microbatch is not None
+                weight_workspaces = (
+                    [self._fp8_workspaces.get(f"weight{i}") for i in range(self.num_gemms)]
+                    if cache_weight
+                    else [None] * self.num_gemms
+                )
+                non_tensor_args = (
+                    m_splits,
+                    False,
+                    is_first_microbatch,
+                    False,
+                    False,
+                    self.wgrad_store,
+                    input_quantizers,
+                    weight_quantizers,
+                    output_quantizers,
+                    grad_input_quantizers,
+                    grad_weight_quantizers,
+                    grad_output_quantizers,
+                    self.fuse_wgrad_accumulation,
+                    _te_cpu_offload(),
+                    self.sequence_parallel,
+                    self.activation_dtype,
+                    is_grad_enabled,
+                    weight_workspaces,
+                    cache_weight,
+                    None,
+                    self.save_original_input,
+                    False,
+                )
+                weights = list(grouped_weights.unbind(dim=0))
+                biases = [x.new_empty(0) for _ in weights]
+                if is_grad_enabled:
+                    out, new_workspaces = _TEGroupedLinearAutograd.apply(
+                        x, non_tensor_args, *weights, *biases
+                    )
+                else:
+                    out, new_workspaces = _TEGroupedLinearAutograd.forward(
+                        None, x, non_tensor_args, *weights, *biases
+                    )
+                if cache_weight:
+                    for gemm_idx, workspace in enumerate(new_workspaces):
+                        if workspace is not None:
+                            if isinstance(workspace, Tensor):
+                                workspace = workspace.detach()
+                            self._fp8_workspaces[f"weight{gemm_idx}"] = workspace
+                return out
+            finally:
+                self.end_forward()
+
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
@@ -2754,7 +2954,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                materialization_inputs = self._get_frozen_blockwise_bf16_materialization_inputs(x)
+                if materialization_inputs is None:
+                    out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                else:
+                    grouped_weights = _get_compiled_frozen_blockwise_weight_materializer()(
+                        *materialization_inputs
+                    )
+                    out = self._forward_with_external_bf16_weights(
+                        x, m_splits, grouped_weights, _is_first_microbatch
+                    )
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
