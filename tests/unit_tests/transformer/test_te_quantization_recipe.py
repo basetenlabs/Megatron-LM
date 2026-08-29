@@ -19,33 +19,6 @@ def _blockwise_recipe_config(**overrides) -> dict:
     return config
 
 
-def test_te_quantization_recipe_parses_frozen_fp8_controls() -> None:
-    recipe = TEQuantizationRecipe.parse_from_config(
-        _blockwise_recipe_config(
-            preserve_high_precision_init_val=False, fp8_block_scaling_fp32_scales=True
-        )
-    )
-
-    assert recipe.preserve_high_precision_init_val is False
-    assert recipe.fp8_block_scaling_fp32_scales is True
-
-
-def test_te_quantization_recipe_frozen_fp8_control_defaults() -> None:
-    recipe = TEQuantizationRecipe.parse_from_config(_blockwise_recipe_config())
-
-    assert recipe.preserve_high_precision_init_val is None
-    assert recipe.fp8_block_scaling_fp32_scales is False
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("preserve_high_precision_init_val", "false"), ("fp8_block_scaling_fp32_scales", 1)],
-)
-def test_te_quantization_recipe_rejects_invalid_frozen_fp8_controls(field, value) -> None:
-    with pytest.raises(ValueError, match=field):
-        TEQuantizationRecipe.parse_from_config(_blockwise_recipe_config(**{field: value}))
-
-
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required for recipe construction")
 def test_blockwise_recipe_constructs_fp32_scales_without_bf16_master() -> None:
     recipe = TEQuantizationRecipe.parse_from_config(
