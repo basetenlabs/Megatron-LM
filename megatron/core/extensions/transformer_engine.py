@@ -2525,6 +2525,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             init_quant_context = _get_fp8_model_init_for_quant_params(
                 self.te_quant_params, torch.is_grad_enabled()
             )
+            frozen_quantized_init_context = nullcontext()
+            if (
+                self.te_quant_params is not None
+                and self.te_quant_params.training_recipe.preserve_high_precision_init_val
+                is False
+            ):
+                # TE uses grad mode to decide whether to allocate a columnwise
+                # training copy. Frozen native weights need rowwise storage only.
+                frozen_quantized_init_context = torch.no_grad()
             init_gtp_remat_context = _init_gtp_remat_context(
                 self,
                 output_size,
@@ -2535,7 +2544,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 out_split_size=tp_size if parallel_mode == "column" else 1,
             )
 
-            with init_quant_context, init_gtp_remat_context as output_size:
+            with (
+                frozen_quantized_init_context,
+                init_quant_context,
+                init_gtp_remat_context as output_size,
+            ):
                 super().__init__(
                     num_gemms=num_gemms,
                     in_features=input_size,
