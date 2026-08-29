@@ -368,6 +368,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    name=f"decoder.layers.{global_layer_number - 1}",
                 )
             return module
 

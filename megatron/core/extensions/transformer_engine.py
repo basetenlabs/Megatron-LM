@@ -168,6 +168,13 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
     """
+    preserve_high_precision_init_val: Optional[bool] = None
+    """
+    Whether TE should retain a high-precision copy of initialized quantized parameters.
+    If None, preserve the existing behavior based on whether gradients are enabled.
+    """
+    fp8_block_scaling_fp32_scales: bool = False
+    """Whether blockwise FP8 should use unconstrained FP32 rather than power-of-two scales."""
     fp4_param: bool = False
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
@@ -189,6 +196,20 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
+        if instance.preserve_high_precision_init_val is not None and not isinstance(
+            instance.preserve_high_precision_init_val, bool
+        ):
+            raise ValueError("preserve_high_precision_init_val must be a bool or None.")
+        if not isinstance(instance.fp8_block_scaling_fp32_scales, bool):
+            raise ValueError("fp8_block_scaling_fp32_scales must be a bool.")
+        if (
+            instance.fp8_block_scaling_fp32_scales
+            and instance.fp8_quantization_recipe != Fp8Recipe.blockwise
+        ):
+            raise ValueError(
+                "fp8_block_scaling_fp32_scales is only supported with blockwise FP8 "
+                "quantization."
+            )
         if (
             instance.fp8_quantization_recipe is not None
             and instance.fp4_quantization_recipe is not None
@@ -254,6 +275,17 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _get_float8_block_scaling_recipe(qrecipe: TEQuantizationRecipe, fp8_format):
+    recipe_kwargs = {"fp8_format": fp8_format}
+    if qrecipe.fp8_block_scaling_fp32_scales:
+        recipe_kwargs.update(
+            fp8_quant_fwd_inp=te.common.recipe.QParams(power_2_scale=False),
+            fp8_quant_fwd_weight=te.common.recipe.QParams(power_2_scale=False),
+            fp8_quant_bwd_grad=te.common.recipe.QParams(power_2_scale=False),
+        )
+    return te.common.recipe.Float8BlockScaling(**recipe_kwargs)
+
+
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         enabled = False
@@ -275,7 +307,7 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
             quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
-            quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+            quant_recipe = _get_float8_block_scaling_recipe(qrecipe, fp8_format)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
             quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
         else:
@@ -293,10 +325,13 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
+    preserve_high_precision_init_val = qrecipe.preserve_high_precision_init_val
+    if preserve_high_precision_init_val is None:
+        preserve_high_precision_init_val = torch.is_grad_enabled()
     return fp8_model_init(
         enabled=enabled,
         recipe=quant_recipe,
-        preserve_high_precision_init_val=torch.is_grad_enabled(),
+        preserve_high_precision_init_val=preserve_high_precision_init_val,
     )
 
 
@@ -345,7 +380,7 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             if qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
                 quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
-                quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+                quant_recipe = _get_float8_block_scaling_recipe(qrecipe, fp8_format)
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
                 quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
             else:
@@ -2490,6 +2525,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             init_quant_context = _get_fp8_model_init_for_quant_params(
                 self.te_quant_params, torch.is_grad_enabled()
             )
+            frozen_quantized_init_context = nullcontext()
+            if (
+                self.te_quant_params is not None
+                and self.te_quant_params.training_recipe.preserve_high_precision_init_val
+                is False
+            ):
+                # TE uses grad mode to decide whether to allocate a columnwise
+                # training copy. Frozen native weights need rowwise storage only.
+                frozen_quantized_init_context = torch.no_grad()
             init_gtp_remat_context = _init_gtp_remat_context(
                 self,
                 output_size,
@@ -2500,7 +2544,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 out_split_size=tp_size if parallel_mode == "column" else 1,
             )
 
-            with init_quant_context, init_gtp_remat_context as output_size:
+            with (
+                frozen_quantized_init_context,
+                init_quant_context,
+                init_gtp_remat_context as output_size,
+            ):
                 super().__init__(
                     num_gemms=num_gemms,
                     in_features=input_size,
