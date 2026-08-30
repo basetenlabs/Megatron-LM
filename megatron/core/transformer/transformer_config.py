@@ -2014,23 +2014,15 @@ class TransformerConfig(ModelParallelConfig):
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
 
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
-
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
                 "enable_mhc_connections is not compatible with inference_fuse_tp_communication. "
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
-        # raises for a MoE MLP submodule at build time, which is the precise check; a
-        # config-level `num_moe_experts` guard would also block the documented composition
-        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+        # mHC composes around both dense and MoE MLP submodules. Keep validation
+        # independent of num_moe_experts so heterogeneous dense/MoE stacks can use
+        # the same HyperConnectionTransformerLayer implementation.
 
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at

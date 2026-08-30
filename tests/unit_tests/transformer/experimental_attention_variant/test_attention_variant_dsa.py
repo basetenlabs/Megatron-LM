@@ -2292,6 +2292,38 @@ class TestDSAIndexer:
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
 
+    def test_candidate_transform_hooks_default_to_token_indices(self, seqlen):
+        """The base indexer must preserve the existing token-level DSA contract."""
+        q = torch.randn(seqlen, 1, 2, 4)
+        k = torch.randn(seqlen, 1, 4)
+        weights = torch.randn(seqlen, 1, 2)
+        starts = torch.zeros(seqlen, dtype=torch.int32)
+        ends = torch.arange(1, seqlen + 1, dtype=torch.int32)
+
+        prepared = self.indexer.prepare_topk_inputs(
+            q,
+            k,
+            weights,
+            self.index_topk,
+            (starts, ends),
+            None,
+        )
+
+        assert prepared[0] is q
+        assert prepared[1] is k
+        assert prepared[2] is weights
+        assert prepared[3] == self.index_topk
+        assert prepared[4][0] is starts
+        assert prepared[4][1] is ends
+
+        indices = torch.arange(seqlen).view(1, seqlen, 1)
+        lengths = torch.ones(1, seqlen, dtype=torch.int32)
+        final_indices, final_lengths = self.indexer.finalize_topk_indices(indices, lengths, None)
+        assert final_indices is indices
+        assert final_lengths is lengths
+        assert self.indexer.supports_full_fused_attention is True
+        assert self.indexer.supports_local_indexer_varlen is True
+
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
         """Ensure indexer RoPE uses the model-configured interleave convention."""
@@ -2567,6 +2599,83 @@ class TestDSAttention:
 
         assert output is expected_output
 
+    def test_candidate_transform_bounds_reach_naive_topk_fallback(self, monkeypatch):
+        """A transformed candidate space must not fall back to raw-token bounds."""
+        seq_len = 4
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        transformed_starts = torch.zeros(seq_len, dtype=torch.int32)
+        transformed_ends = torch.tensor([0, 1, 1, 2], dtype=torch.int32)
+        seen = {}
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.randn(seq_len, batch_size, 2, 4),
+                torch.randn(seq_len, batch_size, 4),
+                torch.ones(seq_len, batch_size, 2),
+            )
+
+        def _fake_prepare(q, k, weights, _index_topk, _fused_bounds, _packed_seq_params):
+            return q, k[:2], weights, 1, (transformed_starts, transformed_ends)
+
+        def _fake_naive(q, k, weights, index_topk, **kwargs):
+            del weights
+            seen["starts"] = kwargs["varlen_starts"]
+            seen["ends"] = kwargs["varlen_ends"]
+            return (
+                torch.zeros(batch_size, q.size(0), k.size(0)),
+                torch.zeros(batch_size, q.size(0), index_topk, dtype=torch.int64),
+            )
+
+        expected_output = torch.randn(seq_len, batch_size, self.config.hidden_size)
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.sparse_attention.indexer, "supports_full_fused_attention", False)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(self.sparse_attention.indexer, "prepare_topk_inputs", _fake_prepare)
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.use_fused_dsa_kernels",
+            lambda _config: True,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_qk_topk",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_naive",
+            _fake_naive,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa._run_sparse_attention",
+            lambda **_kwargs: expected_output,
+        )
+
+        was_training = self.sparse_attention.training
+        self.sparse_attention.eval()
+        try:
+            output = self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                value=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+            )
+        finally:
+            self.sparse_attention.train(was_training)
+
+        assert output is expected_output
+        assert seen["starts"] is transformed_starts
+        assert seen["ends"] is transformed_ends
+
     @pytest.mark.parametrize(
         ("training", "configured_loss_coeff"),
         [(True, 0.0), (False, 1.0)],
@@ -2624,8 +2733,15 @@ class TestDSAttention:
         assert output is expected_output
         assert seen["loss_coeff"] == 0.0
 
-    def test_packed_dense_indexer_loss_uses_local_varlen_on_fused_path(self, monkeypatch):
-        """Packed dense indexer loss should keep local varlen and be owned by the backend."""
+    @pytest.mark.parametrize(
+        ("supports_local_varlen", "expected_local_varlen"),
+        [(True, True), (False, False)],
+        ids=["token-candidates", "transformed-candidates"],
+    )
+    def test_indexer_controls_packed_cp_local_varlen_fused_path(
+        self, monkeypatch, supports_local_varlen, expected_local_varlen
+    ):
+        """Candidate-transforming indexers can reject raw-token CP varlen metadata."""
         seq_len = 4
         key_seq_len = seq_len * 2
         batch_size = 1
@@ -2654,6 +2770,11 @@ class TestDSAttention:
         monkeypatch.setattr(self.config, "dsa_indexer_use_sparse_loss", False)
         monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
         monkeypatch.setattr(self.sparse_attention.indexer.pg_collection, "cp", _FakeCPGroup(2, 1))
+        monkeypatch.setattr(
+            self.sparse_attention.indexer,
+            "supports_local_indexer_varlen",
+            supports_local_varlen,
+        )
         monkeypatch.setattr(
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
@@ -2692,7 +2813,7 @@ class TestDSAttention:
         torch.testing.assert_close(output, expected_output)
         assert seen["fused_loss_coeff"] == self.config.dsa_indexer_loss_coeff
         assert seen["fused_sparse_loss"] is False
-        assert seen["use_local_indexer_varlen"] is True
+        assert seen["use_local_indexer_varlen"] is expected_local_varlen
         assert seen["single_packed_thd_sequence"] is True
         assert seen["local_packed_cp_rank"] == 1
 

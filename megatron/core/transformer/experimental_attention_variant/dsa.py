@@ -1098,6 +1098,59 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
+    supports_full_fused_attention: bool = True
+    supports_local_indexer_varlen: bool = True
+    # The indexer-loss paths (FusedDSAIndexerLoss and run_fused_qk_topk_with_loss)
+    # score the raw token candidate space: they pair the indexer tensors with
+    # token-space float_mask/varlen bounds/key_positions and the attention
+    # query/key. An indexer whose prepare_topk_inputs transforms the candidate
+    # space must opt out, so the combination fails at startup instead of
+    # producing a shape error or a silently wrong loss.
+    supports_indexer_loss: bool = True
+
+    def prepare_topk_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        index_topk: int,
+        fused_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        """Prepare indexer tensors and bounds for top-k selection.
+
+        Model-specific indexers can override this hook to transform the key
+        candidate space before the fused top-k kernel runs. The default keeps
+        the ordinary token-level DSA candidate space unchanged.
+
+        Overrides that change the candidate space must also set
+        ``supports_indexer_loss = False``: the indexer-loss paths score the raw
+        token candidate space and cannot see this transform.
+        """
+        del packed_seq_params
+        return q, k, weights, index_topk, fused_bounds
+
+    def finalize_topk_indices(
+        self,
+        topk_indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Map selected candidate indices into sparse-attention key indices.
+
+        The default token-level DSA indexer already selects key indices, so no
+        conversion is required. Candidate-compressing indexers can override
+        this hook to expand their selected candidates into raw token indices.
+        """
+        del packed_seq_params
+        return topk_indices, topk_length
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1897,6 +1950,18 @@ class DSAttention(MegatronModule):
                 "DSA indexer loss requires TP ranks to own the same query rows; "
                 "sequence-local TP query shards cannot form a global-head target."
             )
+        if (
+            use_indexer_loss
+            and self.indexer is not None
+            and not self.indexer.supports_indexer_loss
+        ):
+            raise RuntimeError(
+                f"DSA indexer loss is not supported by {type(self.indexer).__name__}: "
+                "its top-k candidate transform is invisible to the indexer-loss "
+                "paths, which score the raw token candidate space. Set "
+                "dsa_indexer_loss_coeff=0 (e.g. train with a frozen indexer) or use "
+                "an indexer with supports_indexer_loss=True."
+            )
         float_mask, varlen_params, varlen_is_plain_causal = (
             dsa_masking.build_dsattention_forward_mask(
                 sq=sq,
@@ -1931,6 +1996,7 @@ class DSAttention(MegatronModule):
             and varlen_starts is not None
             and varlen_ends is not None
             and key_positions is None
+            and (self.indexer is None or self.indexer.supports_local_indexer_varlen)
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -2020,7 +2086,7 @@ class DSAttention(MegatronModule):
                 query.detach(),
                 key_for_loss,
                 self.softmax_scale,
-                self.index_topk,
+                effective_index_topk,
                 indexer_loss_coeff,
                 float_mask,
                 sparse_indexer_loss,
@@ -2034,7 +2100,11 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if (
+            use_fused_kernels
+            and not self.index_share
+            and (self.indexer is None or self.indexer.supports_full_fused_attention)
+        ):
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2095,6 +2165,18 @@ class DSAttention(MegatronModule):
                 key_positions=key_positions,
             )
 
+        effective_index_topk = self.index_topk
+        if computes_topk:
+            assert self.indexer is not None and q is not None and k is not None and weights is not None
+            q, k, weights, effective_index_topk, fused_bounds = self.indexer.prepare_topk_inputs(
+                q,
+                k,
+                weights,
+                self.index_topk,
+                fused_bounds,
+                packed_seq_params,
+            )
+
         indexer_loss = None
 
         def slice_topk_to_local_sequence_parallel_rows():
@@ -2118,6 +2200,17 @@ class DSAttention(MegatronModule):
 
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
+            # Belt to the supports_indexer_loss braces: an indexer that compresses
+            # the candidate space without opting out would otherwise reach the
+            # loss kernels and fail there with an opaque shape error (or pass
+            # silently when lengths coincide).
+            if k.size(0) != skv:
+                raise RuntimeError(
+                    "DSA indexer loss: the indexer transformed the key candidate "
+                    f"space ({k.size(0)} candidate rows vs {skv} token rows), but "
+                    "the loss paths score the raw token candidate space. Set "
+                    f"supports_indexer_loss=False on {type(self.indexer).__name__}."
+                )
             # ===================================
             # Attach indexer topk and loss
             # ===================================
@@ -2129,7 +2222,7 @@ class DSAttention(MegatronModule):
                     q,
                     k,
                     weights,
-                    self.index_topk,
+                    effective_index_topk,
                     starts_i32,
                     ends_i32,
                     block_size=max(1, block_size),
@@ -2179,7 +2272,7 @@ class DSAttention(MegatronModule):
                     q,
                     k,
                     weights,
-                    self.index_topk,
+                    effective_index_topk,
                     starts_i32,
                     ends_i32,
                     block_size=max(1, block_size),
@@ -2196,20 +2289,40 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                if k.size(0) != skv and (float_mask is not None or key_positions is not None):
+                    raise RuntimeError(
+                        "DSA naive top-k fallback: the indexer transformed the key "
+                        f"candidate space ({k.size(0)} candidate rows vs {skv} token "
+                        "rows), but float_mask/key_positions are token-space and "
+                        "cannot be applied to it. Candidate-transforming indexers "
+                        "must carry masking through their fused bounds."
+                    )
                 with torch.no_grad():
+                    fallback_starts = varlen_starts
+                    fallback_ends = varlen_ends
+                    if fused_bounds is not None:
+                        fallback_starts, fallback_ends = fused_bounds
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,
                         k,
                         weights,
-                        self.index_topk,
+                        effective_index_topk,
                         mask=float_mask,
-                        varlen_starts=varlen_starts,
-                        varlen_ends=varlen_ends,
+                        varlen_starts=fallback_starts,
+                        varlen_ends=fallback_ends,
                         key_positions=key_positions,
                         use_relu=self.config.dsa_indexer_scoring_relu,
                     )
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
+
+        if computes_topk:
+            assert self.indexer is not None and topk_indices is not None
+            topk_indices, topk_length = self.indexer.finalize_topk_indices(
+                topk_indices,
+                topk_length,
+                packed_seq_params,
+            )
 
         if self.index_share and computes_topk:
             assert topk_holder is not None and topk_indices is not None
