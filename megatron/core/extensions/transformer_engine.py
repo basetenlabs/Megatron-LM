@@ -23,9 +23,6 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine_frozen_blockwise import (
-    try_frozen_blockwise_bf16_forward,
-)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -2396,6 +2393,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
+    from megatron.core.extensions.transformer_engine_frozen_blockwise import (
+        try_frozen_fp8_to_bf16_forward,
+    )
+
     _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
         "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
     )
@@ -2755,7 +2756,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = try_frozen_blockwise_bf16_forward(
+                out = try_frozen_fp8_to_bf16_forward(
                     self, x, m_splits, is_first_microbatch=_is_first_microbatch
                 )
                 if out is None:
