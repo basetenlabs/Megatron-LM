@@ -2393,6 +2393,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
+    from megatron.core.extensions.transformer_engine_frozen_blockwise import (
+        try_frozen_fp8_to_bf16_forward,
+    )
+
     _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
         "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
     )
@@ -2473,7 +2477,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
             gtp_remat_group = pg_collection.expt_gtp_remat
-
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
             # Save original parallel_mode before clearing it for explicit_expert_comm.
@@ -2528,8 +2531,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             frozen_quantized_init_context = nullcontext()
             if (
                 self.te_quant_params is not None
-                and self.te_quant_params.training_recipe.preserve_high_precision_init_val
-                is False
+                and self.te_quant_params.training_recipe.preserve_high_precision_init_val is False
             ):
                 # TE uses grad mode to decide whether to allocate a columnwise
                 # training copy. Frozen native weights need rowwise storage only.
@@ -2754,7 +2756,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                out = try_frozen_fp8_to_bf16_forward(
+                    self, x, m_splits, is_first_microbatch=_is_first_microbatch
+                )
+                if out is None:
+                    out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
