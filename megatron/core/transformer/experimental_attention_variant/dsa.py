@@ -2200,6 +2200,17 @@ class DSAttention(MegatronModule):
 
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
+            # Belt to the supports_indexer_loss braces: an indexer that compresses
+            # the candidate space without opting out would otherwise reach the
+            # loss kernels and fail there with an opaque shape error (or pass
+            # silently when lengths coincide).
+            if k.size(0) != skv:
+                raise RuntimeError(
+                    "DSA indexer loss: the indexer transformed the key candidate "
+                    f"space ({k.size(0)} candidate rows vs {skv} token rows), but "
+                    "the loss paths score the raw token candidate space. Set "
+                    f"supports_indexer_loss=False on {type(self.indexer).__name__}."
+                )
             # ===================================
             # Attach indexer topk and loss
             # ===================================
