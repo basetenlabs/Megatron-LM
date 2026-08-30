@@ -61,8 +61,10 @@ def get_pos_emb_on_this_cp_rank(
     # zero-width rotary embedding. There is nothing to distribute across CP
     # ranks, and the 2*cp_size reshape below would raise on the 0-element
     # tensor ("cannot reshape tensor of 0 elements ... -1 is ambiguous").
+    # Still return the per-rank slice length: consumers pair the returned
+    # length with the local (CP-sharded) sequence.
     if pos_emb.numel() == 0:
-        return pos_emb
+        return pos_emb.narrow(seq_dim, 0, pos_emb.shape[seq_dim] // cp_group.size())
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     cp_idx = torch.tensor(
