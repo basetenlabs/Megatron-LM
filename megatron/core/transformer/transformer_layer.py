@@ -1645,6 +1645,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: Optional[str] = None,
     ):
         super().__init__(
             config=config,
@@ -1653,6 +1654,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name=name,
         )
 
         if submodules.cross_attention_hyper_connection is not IdentityOp:
@@ -1669,17 +1671,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "HyperConnectionTransformerLayer requires mlp_hyper_connection. "
             "Use TransformerLayer instead if hyper connections are not needed."
         )
-
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
-        if self.is_moe_layer:
-            raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
-            )
 
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
