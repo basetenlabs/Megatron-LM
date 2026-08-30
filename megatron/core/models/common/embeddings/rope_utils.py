@@ -57,6 +57,14 @@ def get_pos_emb_on_this_cp_rank(
     """
     if cp_group is None:
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
+    # NoPE attention (e.g. GLM-5.3-Flash, qk_rope_head_dim=0) produces a
+    # zero-width rotary embedding. There is nothing to distribute across CP
+    # ranks, and the 2*cp_size reshape below would raise on the 0-element
+    # tensor ("cannot reshape tensor of 0 elements ... -1 is ambiguous").
+    # Still return the per-rank slice length: consumers pair the returned
+    # length with the local (CP-sharded) sequence.
+    if pos_emb.numel() == 0:
+        return pos_emb.narrow(seq_dim, 0, pos_emb.shape[seq_dim] // cp_group.size())
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     cp_idx = torch.tensor(
