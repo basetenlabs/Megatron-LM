@@ -1100,6 +1100,13 @@ class DSAIndexer(MegatronModule):
 
     supports_full_fused_attention: bool = True
     supports_local_indexer_varlen: bool = True
+    # The indexer-loss paths (FusedDSAIndexerLoss and run_fused_qk_topk_with_loss)
+    # score the raw token candidate space: they pair the indexer tensors with
+    # token-space float_mask/varlen bounds/key_positions and the attention
+    # query/key. An indexer whose prepare_topk_inputs transforms the candidate
+    # space must opt out, so the combination fails at startup instead of
+    # producing a shape error or a silently wrong loss.
+    supports_indexer_loss: bool = True
 
     def prepare_topk_inputs(
         self,
@@ -1121,6 +1128,10 @@ class DSAIndexer(MegatronModule):
         Model-specific indexers can override this hook to transform the key
         candidate space before the fused top-k kernel runs. The default keeps
         the ordinary token-level DSA candidate space unchanged.
+
+        Overrides that change the candidate space must also set
+        ``supports_indexer_loss = False``: the indexer-loss paths score the raw
+        token candidate space and cannot see this transform.
         """
         del packed_seq_params
         return q, k, weights, index_topk, fused_bounds
@@ -1939,6 +1950,18 @@ class DSAttention(MegatronModule):
                 "DSA indexer loss requires TP ranks to own the same query rows; "
                 "sequence-local TP query shards cannot form a global-head target."
             )
+        if (
+            use_indexer_loss
+            and self.indexer is not None
+            and not self.indexer.supports_indexer_loss
+        ):
+            raise RuntimeError(
+                f"DSA indexer loss is not supported by {type(self.indexer).__name__}: "
+                "its top-k candidate transform is invisible to the indexer-loss "
+                "paths, which score the raw token candidate space. Set "
+                "dsa_indexer_loss_coeff=0 (e.g. train with a frozen indexer) or use "
+                "an indexer with supports_indexer_loss=True."
+            )
         float_mask, varlen_params, varlen_is_plain_causal = (
             dsa_masking.build_dsattention_forward_mask(
                 sq=sq,
@@ -2255,6 +2278,14 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                if k.size(0) != skv and (float_mask is not None or key_positions is not None):
+                    raise RuntimeError(
+                        "DSA naive top-k fallback: the indexer transformed the key "
+                        f"candidate space ({k.size(0)} candidate rows vs {skv} token "
+                        "rows), but float_mask/key_positions are token-space and "
+                        "cannot be applied to it. Candidate-transforming indexers "
+                        "must carry masking through their fused bounds."
+                    )
                 with torch.no_grad():
                     fallback_starts = varlen_starts
                     fallback_ends = varlen_ends
