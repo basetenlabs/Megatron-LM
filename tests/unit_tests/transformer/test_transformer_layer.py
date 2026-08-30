@@ -628,6 +628,54 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad.shape == hidden_states.shape
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_full_recompute_block_with_hyper_connection_matches_no_recompute(self):
+        """enable_mhc_connections composes with recompute_granularity='full'.
+
+        Under full recompute the mHC selective hook is dormant and the block
+        wraps the layers in the generic checkpoint; output and grad parity
+        against the unchecked block is the invariant that allows the config
+        guard forbidding this combination to stay removed.
+        """
+        from megatron.core.transformer.transformer_block import TransformerBlock
+
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        config_full = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=1,
+        )
+        config_plain = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams)
+        block_full = TransformerBlock(config_full, _make_mhc_layer_spec()).cuda()
+        block_plain = TransformerBlock(config_plain, _make_mhc_layer_spec()).cuda()
+        block_plain.load_state_dict(block_full.state_dict())
+        block_full.train()
+        block_plain.train()
+
+        hidden_states = torch.randn(seq_len, batch_size, hidden_size, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+        hidden_full = hidden_states.clone().requires_grad_(True)
+        hidden_plain = hidden_states.clone().requires_grad_(True)
+
+        output_full = block_full(hidden_states=hidden_full, attention_mask=attention_mask)
+        output_plain = block_plain(hidden_states=hidden_plain, attention_mask=attention_mask)
+
+        assert output_full.shape == (seq_len, batch_size, hidden_size)
+        torch.testing.assert_close(output_full, output_plain, rtol=1e-4, atol=1e-4)
+
+        output_full.sum().backward()
+        output_plain.sum().backward()
+
+        assert hidden_full.grad is not None
+        assert torch.isfinite(hidden_full.grad).all()
+        torch.testing.assert_close(hidden_full.grad, hidden_plain.grad, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hyper_connection_wraps_moe_forward_and_backward(self):
         """mHC must compose around a complete MoE sublayer."""
         hidden_size = 64
