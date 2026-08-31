@@ -179,12 +179,12 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
-    nvfp4_2d_quantization: bool = False
+    nvfp4_disable_2d_quantization: bool = False
     """
-    Whether NVFP4 groups its scales over 2D 16x16 blocks rather than 16 elements along
-    a row. TE defaults to 2D. One-dimensional blocks are what nest inside a source
-    checkpoint whose own scales are per-row, so quantizing such a checkpoint with 2D
-    blocks spreads one scale across many source scales and loses precision.
+    Whether to group NVFP4 scales over 16 elements along a row instead of TE's default
+    2D 16x16 blocks. A 2D block straddles 16 rows, so when the source checkpoint carries
+    its own per-row scales one destination block spans many source scales and precision
+    is lost. Leave unset to keep TE's behaviour.
     """
 
     @classmethod
@@ -207,13 +207,15 @@ class TEQuantizationRecipe:
             instance.preserve_high_precision_init_val, bool
         ):
             raise ValueError("preserve_high_precision_init_val must be a bool or None.")
-        if not isinstance(instance.nvfp4_2d_quantization, bool):
-            raise ValueError("nvfp4_2d_quantization must be a bool.")
+        if not isinstance(instance.nvfp4_disable_2d_quantization, bool):
+            raise ValueError("nvfp4_disable_2d_quantization must be a bool.")
         if (
-            instance.nvfp4_2d_quantization
+            instance.nvfp4_disable_2d_quantization
             and instance.fp4_quantization_recipe != Fp4Recipe.nvfp4
         ):
-            raise ValueError("nvfp4_2d_quantization is only supported with the nvfp4 recipe.")
+            raise ValueError(
+                "nvfp4_disable_2d_quantization is only supported with the nvfp4 recipe."
+            )
         if not isinstance(instance.fp8_block_scaling_fp32_scales, bool):
             raise ValueError("fp8_block_scaling_fp32_scales must be a bool.")
         if (
@@ -289,6 +291,13 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _get_nvfp4_block_scaling_recipe(qrecipe: TEQuantizationRecipe):
+    recipe_kwargs = {}
+    if qrecipe.nvfp4_disable_2d_quantization:
+        recipe_kwargs["disable_2d_quantization"] = True
+    return te.common.recipe.NVFP4BlockScaling(**recipe_kwargs)
+
+
 def _get_float8_block_scaling_recipe(qrecipe: TEQuantizationRecipe, fp8_format):
     recipe_kwargs = {"fp8_format": fp8_format}
     if qrecipe.fp8_block_scaling_fp32_scales:
@@ -335,9 +344,7 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             assert qrecipe.custom_recipe_factory is not None
             quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
         elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-            quant_recipe = te.common.recipe.NVFP4BlockScaling(
-                disable_2d_quantization=not qrecipe.nvfp4_2d_quantization
-            )
+            quant_recipe = _get_nvfp4_block_scaling_recipe(qrecipe)
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
@@ -404,11 +411,9 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             # Fp4 configured.
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-                quant_recipe = te.common.recipe.NVFP4BlockScaling(
-                disable_2d_quantization=not qrecipe.nvfp4_2d_quantization
-            )
+                quant_recipe = _get_nvfp4_block_scaling_recipe(qrecipe)
             else:
-                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
