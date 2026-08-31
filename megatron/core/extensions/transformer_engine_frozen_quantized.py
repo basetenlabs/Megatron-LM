@@ -66,14 +66,10 @@ def _dequantize_fp8_weights_to_bf16(
 
 
 def _dequantize_nvfp4_weights_to_bf16(
-    packed_data: tuple[Tensor, ...],
-    block_scales: tuple[Tensor, ...],
-    amaxes: tuple[Tensor, ...],
+    packed_data: tuple[Tensor, ...], block_scales: tuple[Tensor, ...], amaxes: tuple[Tensor, ...]
 ) -> Tensor:
     """Dequantize grouped NVFP4 weights into one BF16 tensor."""
-    magnitudes = torch.tensor(
-        _E2M1_MAGNITUDES, dtype=torch.float32, device=packed_data[0].device
-    )
+    magnitudes = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32, device=packed_data[0].device)
     bf16_weights = []
     for data, block_scale, amax in zip(packed_data, block_scales, amaxes, strict=True):
         rows, packed_columns = data.shape
@@ -84,7 +80,8 @@ def _dequantize_nvfp4_weights_to_bf16(
         magnitude = magnitudes[(nibbles & 0x07).long()]
         elements = torch.where(nibbles & 0x08 != 0, -magnitude, magnitude)
 
-        scale = block_scale.view(torch.float8_e4m3fn).float()[:, : columns // _NVFP4_BLOCK_SIZE]
+        scale = block_scale.view(torch.float8_e4m3fn).float()
+        scale = scale[:rows, : columns // _NVFP4_BLOCK_SIZE]
         scale = scale.repeat_interleave(_NVFP4_BLOCK_SIZE, dim=1)
 
         global_scale = amax.float() / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
@@ -129,6 +126,7 @@ def _uses_frozen_nvfp4(grouped_linear: Any) -> bool:
         recipe.fp4_quantization_recipe == Fp4Recipe.nvfp4
         and recipe.fp4_param
         and recipe.preserve_high_precision_init_val is False
+        and recipe.nvfp4_disable_2d_quantization
     )
 
 
@@ -239,6 +237,11 @@ def _run_grouped_linear_with_bf16_weights(
         grouped_linear.end_forward()
 
 
+def _uses_frozen_quantized_storage(grouped_linear: Any) -> bool:
+    """Return whether any frozen quantized storage policy applies to this layer."""
+    return _uses_frozen_blockwise_fp8(grouped_linear) or _uses_frozen_nvfp4(grouped_linear)
+
+
 def _materialize_bf16_weights(grouped_linear: Any) -> Tensor | None:
     """Materialize every local expert into one BF16 tensor, or ``None`` if not frozen."""
     if _uses_frozen_blockwise_fp8(grouped_linear):
@@ -258,8 +261,7 @@ def try_frozen_quantized_to_bf16_forward(
     is_first_microbatch: bool | None,
 ) -> Tensor | None:
     """Return the optimized output, or ``None`` to use TE's public forward path."""
-    grouped_bf16_weights = _materialize_bf16_weights(grouped_linear)
-    if grouped_bf16_weights is None:
+    if not _uses_frozen_quantized_storage(grouped_linear):
         return None
 
     assert grouped_linear.training
@@ -267,6 +269,9 @@ def try_frozen_quantized_to_bf16_forward(
     assert not grouped_linear.use_bias
     assert not getattr(grouped_linear, "single_grouped_weight", False)
     assert not grouped_linear.is_debug_iter()
+
+    grouped_bf16_weights = _materialize_bf16_weights(grouped_linear)
+    assert grouped_bf16_weights is not None
 
     return _run_grouped_linear_with_bf16_weights(
         grouped_linear, input_tensor, tokens_per_expert, grouped_bf16_weights, is_first_microbatch
