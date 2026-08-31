@@ -75,12 +75,17 @@ def _frozen_nvfp4_grouped_linear(num_gemms=2, features=128):
             fp4_quantization_recipe=Fp4Recipe.nvfp4,
             fp4_param=True,
             preserve_high_precision_init_val=False,
+            nvfp4_disable_2d_quantization=True,
         ),
         evaluation_recipe=None,
     )
     return grouped_linear
 
 
+@pytest.mark.skipif(
+    not te_ext.is_te_min_version("2.7.0.dev0"),
+    reason="NVFP4 tensors require Transformer Engine 2.7.0.dev0 or later.",
+)
 def test_dequantize_nvfp4_weights_to_bf16_matches_te_dequantize() -> None:
     """The kernel must reproduce TE's own dequantize() exactly, not merely closely.
 
@@ -105,6 +110,10 @@ def test_dequantize_nvfp4_weights_to_bf16_matches_te_dequantize() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    not te_ext.is_te_min_version("2.7.0.dev0"),
+    reason="NVFP4 tensors require Transformer Engine 2.7.0.dev0 or later.",
+)
 def test_frozen_nvfp4_to_bf16_forward_matches_reference() -> None:
     grouped_linear = _frozen_nvfp4_grouped_linear()
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
@@ -131,11 +140,84 @@ def test_frozen_nvfp4_to_bf16_forward_matches_reference() -> None:
     torch.testing.assert_close(actual, expected_output, rtol=1e-2, atol=1e-2)
 
 
-def test_nvfp4_2d_quantization_rejected_without_nvfp4_recipe() -> None:
+def test_nvfp4_disable_2d_quantization_rejected_without_nvfp4_recipe() -> None:
     with pytest.raises(ValueError, match="only supported with the nvfp4 recipe"):
         TEQuantizationRecipe.parse_from_config(
-            {"fp8_quantization_recipe": Fp8Recipe.blockwise, "nvfp4_2d_quantization": True}
+            {"fp8_quantization_recipe": Fp8Recipe.blockwise, "nvfp4_disable_2d_quantization": True}
         )
+
+
+def test_nvfp4_recipe_defaults_leave_te_behaviour_untouched() -> None:
+    """An existing NVFP4 recipe must not change because this field was added.
+
+    The flag names an override, so unless it is set the recipe has to come back
+    exactly as TE builds it by default -- otherwise every FP4 run that predates
+    this field silently switches its scale blocking.
+    """
+    default = TEQuantizationRecipe.parse_from_config({"fp4_quantization_recipe": Fp4Recipe.nvfp4})
+    built = te_ext._get_nvfp4_block_scaling_recipe(default)
+    reference = te_ext.te.common.recipe.NVFP4BlockScaling()
+
+    assert built.disable_2d_quantization == reference.disable_2d_quantization
+
+    overridden = TEQuantizationRecipe.parse_from_config(
+        {"fp4_quantization_recipe": Fp4Recipe.nvfp4, "nvfp4_disable_2d_quantization": True}
+    )
+    assert te_ext._get_nvfp4_block_scaling_recipe(overridden).disable_2d_quantization
+
+
+def test_frozen_nvfp4_gate_requires_the_one_dimensional_scale_marker() -> None:
+    """A trainable NVFP4 run must not be hijacked into the frozen path.
+
+    Without a marker the gate would match any NVFP4 run with fp4_param set and no
+    high-precision copy, and then die on the frozen-weight assertion.
+    """
+    grouped_linear = _frozen_nvfp4_grouped_linear()
+    grouped_linear.te_quant_params = TEQuantizationParams(
+        training_recipe=TEQuantizationRecipe(
+            fp4_quantization_recipe=Fp4Recipe.nvfp4,
+            fp4_param=True,
+            preserve_high_precision_init_val=False,
+            nvfp4_disable_2d_quantization=False,
+        ),
+        evaluation_recipe=None,
+    )
+
+    assert not frozen_quantized._uses_frozen_nvfp4(grouped_linear)
+
+
+def test_nvfp4_autocast_uses_the_configured_scale_layout(monkeypatch) -> None:
+    built_recipe = object()
+    recipe_kwargs = {}
+
+    def build_recipe(**kwargs):
+        recipe_kwargs.update(kwargs)
+        return built_recipe
+
+    monkeypatch.setattr(te_ext.FP8GlobalStateManager, "is_fp8_enabled", lambda: False)
+    monkeypatch.setattr(te_ext.te.common.recipe, "NVFP4BlockScaling", build_recipe)
+    monkeypatch.setattr(te_ext, "fp8_autocast", lambda **kwargs: kwargs)
+    qrecipe = TEQuantizationRecipe(
+        fp4_quantization_recipe=Fp4Recipe.nvfp4,
+        nvfp4_disable_2d_quantization=True,
+        override_nonquantized_autocast=True,
+    )
+
+    context = te_ext._get_fp8_autocast_for_quant_recipe(qrecipe)
+
+    assert recipe_kwargs == {"disable_2d_quantization": True}
+    assert context["enabled"] is True
+    assert context["fp8_recipe"] is built_recipe
+
+
+def test_fp4_autocast_error_names_the_unsupported_fp4_recipe(monkeypatch) -> None:
+    monkeypatch.setattr(te_ext.FP8GlobalStateManager, "is_fp8_enabled", lambda: False)
+    qrecipe = TEQuantizationRecipe(
+        fp4_quantization_recipe="unsupported", override_nonquantized_autocast=True
+    )
+
+    with pytest.raises(ValueError, match="Unhandled fp4 recipe: unsupported"):
+        te_ext._get_fp8_autocast_for_quant_recipe(qrecipe)
 
 
 def test_dequantize_fp8_weights_to_bf16_matches_reference() -> None:
