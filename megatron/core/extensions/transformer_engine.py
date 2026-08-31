@@ -179,6 +179,13 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
+    nvfp4_2d_quantization: bool = False
+    """
+    Whether NVFP4 groups its scales over 2D 16x16 blocks rather than 16 elements along
+    a row. TE defaults to 2D. One-dimensional blocks are what nest inside a source
+    checkpoint whose own scales are per-row, so quantizing such a checkpoint with 2D
+    blocks spreads one scale across many source scales and loses precision.
+    """
 
     @classmethod
     def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
@@ -200,6 +207,13 @@ class TEQuantizationRecipe:
             instance.preserve_high_precision_init_val, bool
         ):
             raise ValueError("preserve_high_precision_init_val must be a bool or None.")
+        if not isinstance(instance.nvfp4_2d_quantization, bool):
+            raise ValueError("nvfp4_2d_quantization must be a bool.")
+        if (
+            instance.nvfp4_2d_quantization
+            and instance.fp4_quantization_recipe != Fp4Recipe.nvfp4
+        ):
+            raise ValueError("nvfp4_2d_quantization is only supported with the nvfp4 recipe.")
         if not isinstance(instance.fp8_block_scaling_fp32_scales, bool):
             raise ValueError("fp8_block_scaling_fp32_scales must be a bool.")
         if (
@@ -321,7 +335,9 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             assert qrecipe.custom_recipe_factory is not None
             quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
         elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-            quant_recipe = te.common.recipe.NVFP4BlockScaling()
+            quant_recipe = te.common.recipe.NVFP4BlockScaling(
+                disable_2d_quantization=not qrecipe.nvfp4_2d_quantization
+            )
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
@@ -388,7 +404,9 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             # Fp4 configured.
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-                quant_recipe = te.common.recipe.NVFP4BlockScaling()
+                quant_recipe = te.common.recipe.NVFP4BlockScaling(
+                disable_2d_quantization=not qrecipe.nvfp4_2d_quantization
+            )
             else:
                 raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
 
@@ -2393,8 +2411,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
-    from megatron.core.extensions.transformer_engine_frozen_blockwise import (
-        try_frozen_fp8_to_bf16_forward,
+    from megatron.core.extensions.transformer_engine_frozen_quantized import (
+        try_frozen_quantized_to_bf16_forward,
     )
 
     _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
@@ -2756,7 +2774,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = try_frozen_fp8_to_bf16_forward(
+                out = try_frozen_quantized_to_bf16_forward(
                     self, x, m_splits, is_first_microbatch=_is_first_microbatch
                 )
                 if out is None:
