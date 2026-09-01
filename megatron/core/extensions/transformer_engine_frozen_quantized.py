@@ -24,6 +24,7 @@ trainers stack is expected to satisfy the runtime contract below.
 from __future__ import annotations
 
 from functools import cache
+from inspect import signature
 from typing import Any, Callable
 
 import torch
@@ -103,6 +104,12 @@ def _get_compiled_fp8_to_bf16() -> Callable:
 def _get_compiled_nvfp4_to_bf16() -> Callable:
     """Share compiled FC1/FC2 specializations across all expert layers."""
     return torch.compile(_dequantize_nvfp4_weights_to_bf16, fullgraph=True, dynamic=False)
+
+
+@cache
+def _te_grouped_linear_has_explicit_splits() -> bool:
+    """Return whether pinned TE passes grouped split sizes as a tensor argument."""
+    return "m_splits" in signature(_TEGroupedLinearAutograd.forward).parameters
 
 
 def _uses_frozen_blockwise_fp8(grouped_linear: Any) -> bool:
@@ -208,9 +215,8 @@ def _run_grouped_linear_with_bf16_weights(
             grad_output_quantizers,
         ) = grouped_linear._get_quantizers()
 
-        # Positional layout expected by TE 2.16's private _GroupedLinear function.
+        # Positional layout expected by TE's private _GroupedLinear function.
         non_tensor_args = (
-            tokens_per_expert,
             False,  # use_bias
             is_first_microbatch,
             False,  # fp8
@@ -235,14 +241,25 @@ def _run_grouped_linear_with_bf16_weights(
         )
         bf16_weights = list(grouped_bf16_weights.unbind(dim=0))
         biases = [input_tensor.new_empty(0) for _ in bf16_weights]
-        if is_grad_enabled:
-            output, _ = _TEGroupedLinearAutograd.apply(
-                input_tensor, non_tensor_args, *bf16_weights, *biases
+        if _te_grouped_linear_has_explicit_splits():
+            linear_args = (
+                input_tensor,
+                torch.tensor(tokens_per_expert, dtype=torch.int64, device="cpu"),
+                non_tensor_args,
+                *bf16_weights,
+                *biases,
             )
         else:
-            output, _ = _TEGroupedLinearAutograd.forward(
-                None, input_tensor, non_tensor_args, *bf16_weights, *biases
+            linear_args = (
+                input_tensor,
+                (tokens_per_expert, *non_tensor_args),
+                *bf16_weights,
+                *biases,
             )
+        if is_grad_enabled:
+            output, _ = _TEGroupedLinearAutograd.apply(*linear_args)
+        else:
+            output, _ = _TEGroupedLinearAutograd.forward(None, *linear_args)
         return output
     finally:
         grouped_linear.end_forward()
