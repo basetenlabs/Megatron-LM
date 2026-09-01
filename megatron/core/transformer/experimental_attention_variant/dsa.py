@@ -34,6 +34,17 @@ except ImportError:
     hadamard_transform = None
 
 
+from megatron.core.tensor_parallel.random import is_in_recompute_phase as _dsa_is_in_recompute_phase
+
+# dsa-indexer-opt: per-layer cache of FINAL top-k (indices, length) from the
+# first forward, replayed on the checkpoint recompute-forward so the fp32
+# per-head indexer scoring runs once per step instead of twice. Keyed by
+# layer_number; a single slot per layer (micro_batch_size==1). Populated only
+# under full recompute and only on the non-loss top-k path; cleared on replay
+# read so it cannot leak across forward_backward steps.
+_DSA_TOPK_REPLAY_CACHE = {}
+
+
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
     if layer_number < 1:
@@ -2198,6 +2209,22 @@ class DSAttention(MegatronModule):
             if topk_length is not None:
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
+        # dsa-indexer-opt: on the recompute-forward, replay the cached final
+        # top-k for this layer and skip the (non-differentiable) scoring. Gated
+        # to full recompute + the no-loss top-k path (the loss path needs grad
+        # through the scores). index_share holder is still populated below.
+        _dsa_replay_ok = (
+            computes_topk
+            and not use_indexer_loss
+            and getattr(self.config, "recompute_granularity", None) == "full"
+        )
+        _dsa_replayed = False
+        if _dsa_replay_ok and _dsa_is_in_recompute_phase():
+            _dsa_cached = _DSA_TOPK_REPLAY_CACHE.pop(self.layer_number, None)
+            if _dsa_cached is not None:
+                topk_indices, topk_length = _dsa_cached
+                _dsa_replayed = True
+
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
             # Belt to the supports_indexer_loss braces: an indexer that compresses
@@ -2316,7 +2343,7 @@ class DSAttention(MegatronModule):
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
 
-        if computes_topk:
+        if computes_topk and not _dsa_replayed:
             assert self.indexer is not None and topk_indices is not None
             topk_indices, topk_length = self.indexer.finalize_topk_indices(
                 topk_indices,
@@ -2329,6 +2356,11 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+
+        # dsa-indexer-opt: cache the final top-k on the first (non-recompute)
+        # forward so the recompute pass can replay it.
+        if _dsa_replay_ok and not _dsa_replayed and not _dsa_is_in_recompute_phase():
+            _DSA_TOPK_REPLAY_CACHE[self.layer_number] = (topk_indices, topk_length)
 
         # ===================================
         # Run sparse attention kernel
