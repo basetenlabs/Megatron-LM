@@ -140,6 +140,13 @@ def test_frozen_nvfp4_to_bf16_forward_matches_reference() -> None:
     torch.testing.assert_close(actual, expected_output, rtol=1e-2, atol=1e-2)
 
 
+def test_nonstandard_nvfp4_e4m3_maximum_defers_to_te() -> None:
+    grouped_linear = _frozen_nvfp4_grouped_linear(num_gemms=1)
+    grouped_linear.weight0._nvfp4_e4m3_max = 256.0
+
+    assert not frozen_quantized._uses_frozen_nvfp4(grouped_linear)
+
+
 def test_nvfp4_disable_2d_quantization_rejected_without_nvfp4_recipe() -> None:
     with pytest.raises(ValueError, match="only supported with the nvfp4 recipe"):
         TEQuantizationRecipe.parse_from_config(
@@ -253,6 +260,18 @@ def test_without_frozen_fp8_recipe_defers_to_normal_te() -> None:
     grouped_linear = _frozen_fp8_grouped_linear()
     grouped_linear.te_quant_params = None
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
+
+    output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
+        grouped_linear, input_tensor, [128, 128], is_first_microbatch=None
+    )
+
+    assert output is None
+
+
+def test_enabled_quantized_autocast_defers_to_normal_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    grouped_linear = _frozen_fp8_grouped_linear()
+    input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(frozen_quantized.FP8GlobalStateManager, "is_fp8_enabled", lambda: True)
 
     output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
         grouped_linear, input_tensor, [128, 128], is_first_microbatch=None
@@ -423,6 +442,45 @@ def test_frozen_fp8_forward_does_not_nest_checkpointing(
     gc.collect()
     assert len(materialized_weight_refs) == 1
     assert materialized_weight_refs[0]() is None
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+def test_frozen_fp8_forward_under_te_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, use_reentrant: bool
+) -> None:
+    grouped_linear = _frozen_fp8_grouped_linear()
+    input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    real_materialize_bf16_weights = frozen_quantized._materialize_bf16_weights
+    materialized_weight_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def record_materialization(grouped_linear) -> torch.Tensor | None:
+        weights = real_materialize_bf16_weights(grouped_linear)
+        assert weights is not None
+        materialized_weight_refs.append(weakref.ref(weights))
+        return weights
+
+    class CheckpointedFrozenGroupedLinear(torch.nn.Module):
+        def __init__(self, grouped_linear):
+            super().__init__()
+            self.grouped_linear = grouped_linear
+
+        def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+            output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
+                self.grouped_linear, input_tensor, [128, 128], is_first_microbatch=None
+            )
+            assert output is not None
+            return output
+
+    monkeypatch.setattr(frozen_quantized, "_materialize_bf16_weights", record_materialization)
+
+    module = CheckpointedFrozenGroupedLinear(grouped_linear)
+    output = te_ext.te.pytorch.distributed.checkpoint(module, input_tensor, use_reentrant=use_reentrant)
+    output.sum().backward()
+    gc.collect()
+
+    assert len(materialized_weight_refs) == 2
+    assert all(weight_ref() is None for weight_ref in materialized_weight_refs)
+    assert input_tensor.grad is not None
 
 
 def test_frozen_fp8_forward_supports_autograd_grad() -> None:

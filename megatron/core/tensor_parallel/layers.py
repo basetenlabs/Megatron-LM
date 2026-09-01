@@ -36,8 +36,9 @@ from megatron.core.utils import (
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
+    _gather_along_first_dim,
+    _reduce_scatter_along_first_dim,
     copy_to_tensor_model_parallel_region,
-    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
@@ -411,13 +412,16 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, input, weight, bias, allreduce_dgrad, tp_group, output_dtype):
+    def forward(ctx, input, weight, bias, allreduce_dgrad, sequence_parallel, tp_group, output_dtype):
         """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.sequence_parallel = sequence_parallel
         ctx.tp_group = tp_group
         ctx.input_dtype = input.dtype
         ctx.output_dtype = output_dtype
+        if sequence_parallel:
+            input = _gather_along_first_dim(input, tp_group)
         return _linear_forward(input, weight, bias, output_dtype)
 
     @staticmethod
@@ -490,10 +494,12 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+        elif ctx.sequence_parallel:
+            grad_input = _reduce_scatter_along_first_dim(grad_input, ctx.tp_group)
         if mixed_precision_dgrad:
             grad_input = grad_input.to(ctx.input_dtype)
 
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 def _linear_forward(
@@ -591,17 +597,10 @@ def linear_with_frozen_weight(
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
-    if sequence_parallel:
-        input = gather_from_sequence_parallel_region(
-            input, tensor_parallel_output_grad=True, group=tp_group
-        )
-    else:
-        input = input
-
     if gtp_remat_size > 1:
         weight = weight.all_gather_and_prefetch(fwd=True)
 
-    args = [input, weight, bias, allreduce_dgrad, tp_group, output_dtype]
+    args = [input, weight, bias, allreduce_dgrad, sequence_parallel, tp_group, output_dtype]
 
     return LinearWithFrozenWeight.apply(*args)
 

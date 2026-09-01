@@ -225,6 +225,45 @@ def test_frozen_linear_fp32_output_preserves_fp32_dgrad_before_bf16_cast():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_frozen_linear_sequence_parallel_defers_dgrad_cast_until_reduce_scatter(monkeypatch):
+    from megatron.core.tensor_parallel import layers
+
+    Utils.initialize_model_parallel(1, 1)
+    reduce_scatter_input_dtypes = []
+    real_reduce_scatter = layers._reduce_scatter_along_first_dim
+
+    def record_reduce_scatter(input_data, group):
+        reduce_scatter_input_dtypes.append(input_data.dtype)
+        return real_reduce_scatter(input_data, group)
+
+    monkeypatch.setattr(layers, "_reduce_scatter_along_first_dim", record_reduce_scatter)
+
+    input_data = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(4, 3, 96, device="cuda", dtype=torch.float32)
+
+    output = linear_with_frozen_weight(
+        input_data,
+        weight,
+        None,
+        False,
+        False,
+        True,
+        tp_group=None,
+        output_dtype=torch.float32,
+    )
+    output.backward(grad_output)
+
+    assert reduce_scatter_input_dtypes == [torch.float32]
+    assert input_data.grad is not None
+    assert input_data.grad.dtype == torch.bfloat16
+
+    Utils.destroy_model_parallel()
+
+
 def test_LinearWithFrozenWeight_3d_non_contiguous_grad_output():
     """Backward must handle a 3D non-contiguous grad_output without
     crashing in the batched-GEMM dispatch."""

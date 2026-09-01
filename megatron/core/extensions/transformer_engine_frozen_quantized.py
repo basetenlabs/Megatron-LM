@@ -31,6 +31,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
 from transformer_engine.pytorch.distributed import in_fp8_activation_recompute_phase
+from transformer_engine.pytorch.module.base import FP8GlobalStateManager
 from transformer_engine.pytorch.module.grouped_linear import (
     _GroupedLinear as _TEGroupedLinearAutograd,
 )
@@ -125,11 +126,18 @@ def _uses_frozen_nvfp4(grouped_linear: Any) -> bool:
         return False
 
     recipe = grouped_linear.te_quant_params.training_recipe
-    return (
+    matches_recipe = (
         recipe.fp4_quantization_recipe == Fp4Recipe.nvfp4
         and recipe.fp4_param
         and recipe.preserve_high_precision_init_val is False
         and recipe.nvfp4_disable_2d_quantization
+    )
+    if not matches_recipe:
+        return False
+    return all(
+        float(getattr(getattr(grouped_linear, f"weight{gemm_idx}"), "_nvfp4_e4m3_max", _NVFP4_E4M3_MAX))
+        == _NVFP4_E4M3_MAX
+        for gemm_idx in range(grouped_linear.num_gemms)
     )
 
 
@@ -245,6 +253,12 @@ def _uses_frozen_quantized_storage(grouped_linear: Any) -> bool:
     return _uses_frozen_blockwise_fp8(grouped_linear) or _uses_frozen_nvfp4(grouped_linear)
 
 
+def _saved_tensor_hooks_active() -> bool:
+    """Return whether an outer non-reentrant checkpoint owns saved tensors."""
+    get_hooks = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    return get_hooks is not None and get_hooks(False) is not None
+
+
 def _materialize_bf16_weights(grouped_linear: Any) -> Tensor | None:
     """Materialize every local expert into one BF16 tensor, or ``None`` if not frozen."""
     if _uses_frozen_blockwise_fp8(grouped_linear):
@@ -266,6 +280,8 @@ def try_frozen_quantized_to_bf16_forward(
     """Return the optimized output, or ``None`` to use TE's public forward path."""
     if not _uses_frozen_quantized_storage(grouped_linear):
         return None
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return None
 
     assert grouped_linear.training
     assert input_tensor.dtype == torch.bfloat16
@@ -284,7 +300,8 @@ def try_frozen_quantized_to_bf16_forward(
             is_first_microbatch,
         )
 
-    parent_checkpoint_active = is_checkpointing() or in_fp8_activation_recompute_phase()
+    te_checkpoint_active = in_fp8_activation_recompute_phase() or _saved_tensor_hooks_active()
+    parent_checkpoint_active = is_checkpointing() or te_checkpoint_active
     if torch.is_grad_enabled() and input_tensor.requires_grad and not parent_checkpoint_active:
         return checkpoint(materialize_and_run, input_tensor, use_reentrant=False)
     return materialize_and_run(input_tensor)
