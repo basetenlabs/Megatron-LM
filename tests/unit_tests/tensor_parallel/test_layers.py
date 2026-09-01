@@ -198,6 +198,33 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
         wrapped_output.contiguous().view(torch.int32),
         plain_te_output.contiguous().view(torch.int32),
     )
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_frozen_linear_fp32_output_preserves_fp32_dgrad_before_bf16_cast():
+    Utils.initialize_model_parallel(1, 1)
+
+    input_data = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(4, 3, 96, device="cuda", dtype=torch.float32)
+    reference_input = input_data.detach().float().requires_grad_(True)
+
+    output = linear_with_frozen_weight(
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
+    )
+    output.backward(grad_output)
+    torch.nn.functional.linear(reference_input, weight.float()).backward(grad_output)
+
+    assert input_data.grad is not None
+    torch.testing.assert_close(
+        input_data.grad, reference_input.grad.to(torch.bfloat16), rtol=0, atol=0
+    )
+
+    Utils.destroy_model_parallel()
+
+
 def test_LinearWithFrozenWeight_3d_non_contiguous_grad_output():
     """Backward must handle a 3D non-contiguous grad_output without
     crashing in the batched-GEMM dispatch."""

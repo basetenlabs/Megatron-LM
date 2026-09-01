@@ -417,6 +417,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
         ctx.input_dtype = input.dtype
+        ctx.output_dtype = output_dtype
         return _linear_forward(input, weight, bias, output_dtype)
 
     @staticmethod
@@ -424,14 +425,41 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_output = grad_output.to(ctx.input_dtype)
+        if ctx.output_dtype != ctx.input_dtype and grad_output.dtype != ctx.input_dtype:
+            from megatron.core.extensions.transformer_engine import te_general_gemm
+
+            if te_general_gemm is None:
+                raise RuntimeError(
+                    "A mixed-precision frozen linear backward requires Transformer Engine "
+                    "general_gemm."
+                )
+            grad_shape = grad_output.shape
+            grad_output_2d = grad_output.reshape(-1, grad_shape[-1])
+            grad_output_hi = grad_output_2d.to(ctx.input_dtype)
+            grad_output_residual = grad_output_2d - grad_output_hi.float()
+            grad_output_lo = grad_output_residual.to(ctx.input_dtype)
+            grad_output_tail = (grad_output_residual - grad_output_lo.float()).to(ctx.input_dtype)
+            grad_input_hi = te_general_gemm(
+                weight, grad_output_hi, out_dtype=torch.float32, layout="NN", grad=True
+            )[0]
+            grad_input_lo = te_general_gemm(
+                weight, grad_output_lo, out_dtype=torch.float32, layout="NN", grad=True
+            )[0]
+            grad_input_tail = te_general_gemm(
+                weight, grad_output_tail, out_dtype=torch.float32, layout="NN", grad=True
+            )[0]
+            grad_input = (grad_input_hi + grad_input_lo + grad_input_tail).to(ctx.input_dtype)
+            grad_input = grad_input.reshape(*grad_shape[:-1], weight.size(1))
+        else:
+            grad_output = grad_output.to(ctx.input_dtype)
+            grad_input = None
         # For Megatron's [s, b, h] layout, .transpose(0, 1) recovers the
         # contiguous [b, s, h] storage as a free view, so we can flatten
         # to 2D and route through a single regular GEMM (avoids a
         # batched-GEMM dispatch whose int32 strideA can overflow at long
         # sequence × large out-per-partition). Other 3D layouts fall back
         # to an explicit reshape (which copies if non-contiguous).
-        if grad_output.dim() == 3:
+        if grad_input is None and grad_output.dim() == 3:
             swapped = grad_output.transpose(0, 1)
             if swapped.is_contiguous():
                 seq_len, batch_size, in_features = grad_output.shape
@@ -448,13 +476,13 @@ class LinearWithFrozenWeight(torch.autograd.Function):
                     .matmul(weight)
                     .view(*grad_output.shape[:-1], -1)
                 )
-        elif grad_output.dim() > 2:
+        elif grad_input is None and grad_output.dim() > 2:
             # Work around PyTorch matmul not folding some size-1 leading dims to mm.
             # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
             grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
             grad_input = grad_output_2d.matmul(weight)
             grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
-        else:
+        elif grad_input is None:
             grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
