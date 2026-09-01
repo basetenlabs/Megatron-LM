@@ -207,8 +207,10 @@ class TEQuantizationRecipe:
             instance.preserve_high_precision_init_val, bool
         ):
             raise ValueError("preserve_high_precision_init_val must be a bool or None.")
-        if not isinstance(instance.nvfp4_disable_2d_quantization, bool):
-            raise ValueError("nvfp4_disable_2d_quantization must be a bool.")
+        boolean_options = ("fp8_block_scaling_fp32_scales", "nvfp4_disable_2d_quantization")
+        for option in boolean_options:
+            if not isinstance(getattr(instance, option), bool):
+                raise ValueError(f"{option} must be a bool.")
         if (
             instance.nvfp4_disable_2d_quantization
             and instance.fp4_quantization_recipe != Fp4Recipe.nvfp4
@@ -216,8 +218,6 @@ class TEQuantizationRecipe:
             raise ValueError(
                 "nvfp4_disable_2d_quantization is only supported with the nvfp4 recipe."
             )
-        if not isinstance(instance.fp8_block_scaling_fp32_scales, bool):
-            raise ValueError("fp8_block_scaling_fp32_scales must be a bool.")
         if (
             instance.fp8_block_scaling_fp32_scales
             and instance.fp8_quantization_recipe != Fp8Recipe.blockwise
