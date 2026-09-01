@@ -147,6 +147,13 @@ def test_nvfp4_disable_2d_quantization_rejected_without_nvfp4_recipe() -> None:
         )
 
 
+def test_nvfp4_disable_2d_quantization_rejects_a_string_value() -> None:
+    with pytest.raises(ValueError, match="nvfp4_disable_2d_quantization must be a bool"):
+        TEQuantizationRecipe.parse_from_config(
+            {"fp4_quantization_recipe": Fp4Recipe.nvfp4, "nvfp4_disable_2d_quantization": "true"}
+        )
+
+
 def test_nvfp4_recipe_defaults_leave_te_behaviour_untouched() -> None:
     """An existing NVFP4 recipe must not change because this field was added.
 
