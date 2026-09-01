@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
 from transformer_engine.pytorch.module.grouped_linear import (
     _GroupedLinear as _TEGroupedLinearAutograd,
@@ -270,9 +271,17 @@ def try_frozen_quantized_to_bf16_forward(
     assert not getattr(grouped_linear, "single_grouped_weight", False)
     assert not grouped_linear.is_debug_iter()
 
-    grouped_bf16_weights = _materialize_bf16_weights(grouped_linear)
-    assert grouped_bf16_weights is not None
+    def materialize_and_run(input_tensor: Tensor) -> Tensor:
+        grouped_bf16_weights = _materialize_bf16_weights(grouped_linear)
+        assert grouped_bf16_weights is not None
+        return _run_grouped_linear_with_bf16_weights(
+            grouped_linear,
+            input_tensor,
+            tokens_per_expert,
+            grouped_bf16_weights,
+            is_first_microbatch,
+        )
 
-    return _run_grouped_linear_with_bf16_weights(
-        grouped_linear, input_tensor, tokens_per_expert, grouped_bf16_weights, is_first_microbatch
-    )
+    if torch.is_grad_enabled() and input_tensor.requires_grad:
+        return checkpoint(materialize_and_run, input_tensor, use_reentrant=True)
+    return materialize_and_run(input_tensor)
