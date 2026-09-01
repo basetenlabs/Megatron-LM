@@ -448,11 +448,13 @@ class LinearWithFrozenWeight(torch.autograd.Function):
             grad_input_tail = te_general_gemm(
                 weight, grad_output_tail, out_dtype=torch.float32, layout="NN", grad=True
             )[0]
-            grad_input = (grad_input_hi + grad_input_lo + grad_input_tail).to(ctx.input_dtype)
+            grad_input = grad_input_hi + grad_input_lo + grad_input_tail
             grad_input = grad_input.reshape(*grad_shape[:-1], weight.size(1))
+            mixed_precision_dgrad = True
         else:
             grad_output = grad_output.to(ctx.input_dtype)
             grad_input = None
+            mixed_precision_dgrad = False
         # For Megatron's [s, b, h] layout, .transpose(0, 1) recovers the
         # contiguous [b, s, h] storage as a free view, so we can flatten
         # to 2D and route through a single regular GEMM (avoids a
@@ -488,6 +490,8 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+        if mixed_precision_dgrad:
+            grad_input = grad_input.to(ctx.input_dtype)
 
         return grad_input, None, None, None, None, None
 

@@ -385,7 +385,10 @@ def test_frozen_fp8_forward_rematerializes_weights_for_backward(
     torch.testing.assert_close(input_tensor.grad, reference_dgrad, rtol=1e-2, atol=1e-2)
 
 
-def test_frozen_fp8_forward_does_not_nest_checkpointing(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("parent_checkpoint", ["megatron", "transformer_engine"])
+def test_frozen_fp8_forward_does_not_nest_checkpointing(
+    monkeypatch: pytest.MonkeyPatch, parent_checkpoint: str
+) -> None:
     grouped_linear = _frozen_fp8_grouped_linear()
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
     tokens_per_expert = [128, 128]
@@ -398,7 +401,14 @@ def test_frozen_fp8_forward_does_not_nest_checkpointing(monkeypatch: pytest.Monk
         materialized_weight_refs.append(weakref.ref(weights))
         return weights
 
-    monkeypatch.setattr(frozen_quantized, "is_checkpointing", lambda: True)
+    monkeypatch.setattr(
+        frozen_quantized, "is_checkpointing", lambda: parent_checkpoint == "megatron"
+    )
+    monkeypatch.setattr(
+        frozen_quantized,
+        "in_fp8_activation_recompute_phase",
+        lambda: parent_checkpoint == "transformer_engine",
+    )
     monkeypatch.setattr(frozen_quantized, "_materialize_bf16_weights", record_materialization)
 
     output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
@@ -413,3 +423,17 @@ def test_frozen_fp8_forward_does_not_nest_checkpointing(monkeypatch: pytest.Monk
     gc.collect()
     assert len(materialized_weight_refs) == 1
     assert materialized_weight_refs[0]() is None
+
+
+def test_frozen_fp8_forward_supports_autograd_grad() -> None:
+    grouped_linear = _frozen_fp8_grouped_linear()
+    input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
+        grouped_linear, input_tensor, [128, 128], is_first_microbatch=None
+    )
+    assert output is not None
+
+    (grad_input,) = torch.autograd.grad(output.sum(), input_tensor)
+
+    assert grad_input.shape == input_tensor.shape
+    assert torch.isfinite(grad_input).all()

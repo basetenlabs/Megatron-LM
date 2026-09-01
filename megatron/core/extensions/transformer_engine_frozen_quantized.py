@@ -30,6 +30,7 @@ import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
+from transformer_engine.pytorch.distributed import in_fp8_activation_recompute_phase
 from transformer_engine.pytorch.module.grouped_linear import (
     _GroupedLinear as _TEGroupedLinearAutograd,
 )
@@ -283,6 +284,7 @@ def try_frozen_quantized_to_bf16_forward(
             is_first_microbatch,
         )
 
-    if torch.is_grad_enabled() and input_tensor.requires_grad and not is_checkpointing():
-        return checkpoint(materialize_and_run, input_tensor, use_reentrant=True)
+    parent_checkpoint_active = is_checkpointing() or in_fp8_activation_recompute_phase()
+    if torch.is_grad_enabled() and input_tensor.requires_grad and not parent_checkpoint_active:
+        return checkpoint(materialize_and_run, input_tensor, use_reentrant=False)
     return materialize_and_run(input_tensor)
