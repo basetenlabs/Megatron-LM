@@ -383,3 +383,33 @@ def test_frozen_fp8_forward_rematerializes_weights_for_backward(
     assert all(weight_ref() is None for weight_ref in materialized_weight_refs)
     assert input_tensor.grad is not None
     torch.testing.assert_close(input_tensor.grad, reference_dgrad, rtol=1e-2, atol=1e-2)
+
+
+def test_frozen_fp8_forward_does_not_nest_checkpointing(monkeypatch: pytest.MonkeyPatch) -> None:
+    grouped_linear = _frozen_fp8_grouped_linear()
+    input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    tokens_per_expert = [128, 128]
+    real_materialize_bf16_weights = frozen_quantized._materialize_bf16_weights
+    materialized_weight_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def record_materialization(grouped_linear) -> torch.Tensor | None:
+        weights = real_materialize_bf16_weights(grouped_linear)
+        assert weights is not None
+        materialized_weight_refs.append(weakref.ref(weights))
+        return weights
+
+    monkeypatch.setattr(frozen_quantized, "is_checkpointing", lambda: True)
+    monkeypatch.setattr(frozen_quantized, "_materialize_bf16_weights", record_materialization)
+
+    output = frozen_quantized.try_frozen_quantized_to_bf16_forward(
+        grouped_linear, input_tensor, tokens_per_expert, is_first_microbatch=None
+    )
+    assert output is not None
+    gc.collect()
+    assert len(materialized_weight_refs) == 1
+    assert materialized_weight_refs[0]() is not None
+
+    output.sum().backward()
+    gc.collect()
+    assert len(materialized_weight_refs) == 1
+    assert materialized_weight_refs[0]() is None

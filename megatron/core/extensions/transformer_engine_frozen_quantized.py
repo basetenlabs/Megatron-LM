@@ -36,6 +36,7 @@ from transformer_engine.pytorch.module.grouped_linear import (
 from transformer_engine.pytorch.tensor import Float8BlockwiseQTensor, NVFP4Tensor
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.tensor_parallel.random import is_checkpointing
 
 _BLOCK_SIZE = 128
 
@@ -282,6 +283,6 @@ def try_frozen_quantized_to_bf16_forward(
             is_first_microbatch,
         )
 
-    if torch.is_grad_enabled() and input_tensor.requires_grad:
+    if torch.is_grad_enabled() and input_tensor.requires_grad and not is_checkpointing():
         return checkpoint(materialize_and_run, input_tensor, use_reentrant=True)
     return materialize_and_run(input_tensor)
