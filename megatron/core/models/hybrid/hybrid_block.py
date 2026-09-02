@@ -44,6 +44,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -466,6 +467,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        dsa_topk_cache: DSATopKCache | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -544,6 +546,11 @@ class HybridStack(MegatronModule):
             )
         else:
             sequence_len_offset = None
+        if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
+            dsa_topk_cache = DSATopKCache()
+        dsa_layer_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level
@@ -593,6 +600,7 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    transformer_layer_kwargs=dsa_layer_kwargs,
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
@@ -655,6 +663,8 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                if isinstance(layer, TransformerLayer):
+                                    layer_kwargs.update(dsa_layer_kwargs)
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif layer_cp_metadata is not None:
                                 hidden_states = layer(
