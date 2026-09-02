@@ -1684,7 +1684,7 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
-            dsa_topk_cache: Per-microbatch cache shared across DSA layers and recompute.
+            dsa_topk_cache: Top-k state owned by this microbatch's forward execution.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
@@ -1986,16 +1986,22 @@ class DSAttention(MegatronModule):
         )
 
         _dsa_full_recompute = (
-            self.config.recompute_granularity == "full"
-            and dsa_topk_cache is not None
-            and dsa_topk_cache.activation_recompute_enabled
+            self.training and self.config.recompute_granularity == "full"
         )
-        _dsa_in_recompute = dsa_topk_cache.in_recompute if dsa_topk_cache is not None else False
         _dsa_replay_enabled = _dsa_full_recompute and not use_indexer_loss
-        _dsa_needs_holder = self.index_share or _dsa_replay_enabled
-        if _dsa_needs_holder and dsa_topk_cache is None:
+        _dsa_checkpoint_forward = _dsa_full_recompute and not torch.is_grad_enabled()
+        _dsa_in_recompute = (
+            _dsa_full_recompute
+            and torch.is_grad_enabled()
+            and dsa_topk_cache is not None
+            and dsa_topk_cache.is_recompute_layer_pending(
+                self.source_layer, self.layer_number
+            )
+        )
+        _dsa_needs_cache = self.index_share or _dsa_full_recompute
+        if _dsa_needs_cache and dsa_topk_cache is None:
             raise RuntimeError(
-                "DSAttention requires a per-microbatch DSATopKCache when index sharing or "
+                "DSAttention requires a per-forward DSATopKCache when index sharing or "
                 "full-recompute replay is enabled."
             )
         topk_indices = None
@@ -2025,7 +2031,7 @@ class DSAttention(MegatronModule):
             topk_length = cached_topk.length
 
             if not _dsa_in_recompute:
-                if _dsa_full_recompute:
+                if _dsa_checkpoint_forward:
                     dsa_topk_cache.register_recompute_layer(
                         self.source_layer, self.layer_number
                     )
@@ -2329,10 +2335,15 @@ class DSAttention(MegatronModule):
             self.layer_number
         )
         if computes_topk and not _dsa_in_recompute and (
-            needs_forward_share or _dsa_replay_enabled
+            needs_forward_share or (_dsa_checkpoint_forward and _dsa_replay_enabled)
         ):
             assert dsa_topk_cache is not None and topk_indices is not None
-            remaining_layers = {self.layer_number} if _dsa_replay_enabled else None
+            remaining_layers = (
+                {self.layer_number}
+                if _dsa_checkpoint_forward
+                and (_dsa_replay_enabled or needs_forward_share)
+                else None
+            )
             dsa_topk_cache.store(
                 self.layer_number,
                 topk_indices,

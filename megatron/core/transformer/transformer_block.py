@@ -661,6 +661,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         dsa_topk_cache = (
             DSATopKCache() if self.config.experimental_attention_variant == "dsa" else None
         )
+        dsa_layer_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -675,7 +678,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
-                    dsa_topk_cache=dsa_topk_cache,
+                    transformer_layer_kwargs=dsa_layer_kwargs,
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
@@ -732,8 +735,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
-                            dsa_topk_cache=dsa_topk_cache,
                             **extra_layer_kwargs,
+                            **dsa_layer_kwargs,
                         )
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

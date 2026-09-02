@@ -172,20 +172,6 @@ class TestDSAIndexShareHelpers:
             assert cache.mark_recompute_layer_complete(1, order[-1])
             assert cache.source_layers == set()
 
-    def test_topk_cache_checkpoint_phase_is_scoped(self):
-        cache = DSATopKCache()
-
-        assert not cache.activation_recompute_enabled
-        assert not cache.in_recompute
-        with cache.checkpoint_phase(enabled=True, recomputing=True):
-            assert cache.activation_recompute_enabled
-            assert cache.in_recompute
-            with cache.checkpoint_phase(enabled=False, recomputing=False):
-                assert cache.activation_recompute_enabled
-                assert cache.in_recompute
-        assert not cache.activation_recompute_enabled
-        assert not cache.in_recompute
-
     def test_checkpointed_forward_isolates_interleaved_microbatch_caches(self, monkeypatch):
         pending_recomputes = []
         replayed_indices = []
@@ -196,7 +182,9 @@ class TestDSAIndexShareHelpers:
             def __call__(self, **kwargs):
                 hidden_states = kwargs["hidden_states"]
                 cache = kwargs["dsa_topk_cache"]
-                if cache.in_recompute:
+                if torch.is_grad_enabled() and cache.is_recompute_layer_pending(
+                    self.layer_number, self.layer_number
+                ):
                     entry = cache.get(self.layer_number)
                     assert entry is not None
                     replayed_indices.append(entry.indices)
@@ -247,7 +235,7 @@ class TestDSAIndexShareHelpers:
                 attention_bias=None,
                 packed_seq_params=None,
                 use_inner_quantization_context=False,
-                dsa_topk_cache=cache,
+                transformer_layer_kwargs={"dsa_topk_cache": cache},
             )
 
         for function, args in reversed(pending_recomputes):

@@ -650,7 +650,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
-            dsa_topk_cache (DSATopKCache, optional): Per-microbatch DSA top-k state.
+            dsa_topk_cache (DSATopKCache, optional): Top-k state for this microbatch's DSA layers.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:

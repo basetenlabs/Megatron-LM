@@ -1372,30 +1372,22 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin,
             sequence_len_offset,
         ):
-            recompute_context = (
-                dsa_topk_cache.checkpoint_phase(
-                    enabled=True, recomputing=torch.is_grad_enabled()
-                )
-                if dsa_topk_cache is not None
-                else nullcontext()
+            return self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                dsa_topk_cache=dsa_topk_cache,
             )
-            with recompute_context:
-                return self._proj_and_transformer_layer(
-                    hidden_states=hidden_states,
-                    decoder_input=decoder_input,
-                    attention_mask=attention_mask,
-                    padding_mask=padding_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    rotary_pos_cos=rotary_pos_cos,
-                    rotary_pos_sin=rotary_pos_sin,
-                    attention_bias=attention_bias,
-                    inference_params=inference_params,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    dsa_topk_cache=dsa_topk_cache,
-                )
 
         # Decide the outer quantization context, matching
         # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed

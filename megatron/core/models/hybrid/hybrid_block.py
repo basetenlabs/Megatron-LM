@@ -330,6 +330,9 @@ class HybridStack(MegatronModule):
             sequence_len_offset = None
         if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
             dsa_topk_cache = DSATopKCache()
+        dsa_layer_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level
@@ -369,7 +372,7 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
-                    dsa_topk_cache=dsa_topk_cache,
+                    transformer_layer_kwargs=dsa_layer_kwargs,
                 )
             else:
                 for layer in self.layers:
@@ -387,7 +390,7 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
-                                dsa_topk_cache=dsa_topk_cache,
+                                **dsa_layer_kwargs,
                             )
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
