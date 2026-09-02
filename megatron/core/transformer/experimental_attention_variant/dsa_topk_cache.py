@@ -11,12 +11,13 @@ class DSATopKCacheEntry:
 
     indices: torch.Tensor
     length: torch.Tensor | None
+    # Layer numbers are 1-indexed, matching DSAttention.layer_number.
     remaining_recompute_layers: set[int] = field(default_factory=set)
 
 
 @dataclass
 class DSATopKCache:
-    """Per-microbatch cache shared by DSA layers and their recompute forwards."""
+    """Per-microbatch cache of DSA top-k tensors shared with recompute forwards."""
 
     _entries: dict[int, DSATopKCacheEntry] = field(default_factory=dict)
 
