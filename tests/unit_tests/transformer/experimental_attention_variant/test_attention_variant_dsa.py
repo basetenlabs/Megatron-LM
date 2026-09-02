@@ -28,6 +28,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _DSATopKShareState,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -193,6 +194,88 @@ class TestDSAIndexShareHelpers:
         assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+
+    def test_recompute_state_isolated_by_packed_microbatch(self):
+        config = SimpleNamespace(
+            dsa_indexer_topk=8,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+            kv_channels=16,
+            num_layers=8,
+        )
+        attention = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(indexer=lambda *_args, **_kwargs: None),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=1.0,
+            pg_collection=SimpleNamespace(),
+        )
+        first = PackedSeqParams(qkv_format="thd")
+        second = PackedSeqParams(qkv_format="thd")
+        first_indices = torch.tensor([1])
+        second_indices = torch.tensor([2])
+        first_topk = attention._get_index_share_topk_holder(first)
+        first_lengths = attention._get_index_share_topk_length_holder(first)
+        first_states = attention._get_index_share_state_holder(first)
+        second_topk = attention._get_index_share_topk_holder(second)
+        second_states = attention._get_index_share_state_holder(second)
+        first_topk[1] = first_indices
+        second_topk[1] = second_indices
+        first_states[1] = _DSATopKShareState(remaining_recompute_layers={1})
+        second_states[1] = _DSATopKShareState(remaining_recompute_layers={1})
+
+        released = attention._mark_topk_recompute_layer_complete(
+            1, 1, first_topk, first_lengths, first_states
+        )
+
+        assert released
+        assert first_topk == {}
+        assert first_states == {}
+        assert second_topk[1] is second_indices
+        assert second_states[1].remaining_recompute_layers == {1}
+
+    def test_recompute_state_releases_in_any_layer_order(self):
+        for order in ([1, 2, 3, 4], [4, 3, 2, 1]):
+            indices = torch.tensor([1])
+            topk_holder = {1: indices}
+            length_holder = {}
+            state_holder = {
+                1: _DSATopKShareState(remaining_recompute_layers={1, 2, 3, 4})
+            }
+
+            for layer_number in order[:-1]:
+                assert not DSAttention._mark_topk_recompute_layer_complete(
+                    1, layer_number, topk_holder, length_holder, state_holder
+                )
+                assert topk_holder[1] is indices
+            assert DSAttention._mark_topk_recompute_layer_complete(
+                1, order[-1], topk_holder, length_holder, state_holder
+            )
+            assert topk_holder == {}
+            assert state_holder == {}
+
+    def test_recompute_layers_cover_source_and_skip_consumers(self):
+        config = SimpleNamespace(
+            dsa_indexer_topk=8,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+            kv_channels=16,
+            num_layers=8,
+        )
+        source = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(indexer=lambda *_args, **_kwargs: None),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=1.0,
+            pg_collection=SimpleNamespace(),
+        )
+        assert source._recompute_layers_for_source(1, include_source=True) == {1, 2, 3, 4}
+        assert source._recompute_layers_for_source(1, include_source=False) == {2, 3, 4}
+        assert source._next_layer_reuses_topk(1)
 
 
 def _build_packed_causal_mask_for_test(
