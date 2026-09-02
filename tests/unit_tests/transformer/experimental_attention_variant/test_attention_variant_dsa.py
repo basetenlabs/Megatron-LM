@@ -9,6 +9,7 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 import megatron.core.recompute as recompute_module
+from megatron.core import tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -3164,6 +3165,95 @@ class TestDSAttention:
         assert seen["q_indexer_len"] == seq_len
         torch.testing.assert_close(seen["varlen_starts"], expected_starts)
         torch.testing.assert_close(seen["varlen_ends"], torch.arange(5, 9, dtype=torch.int64))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_full_recompute_replays_topk_without_rescoring(self, monkeypatch, layout):
+        """Full recompute should reuse cached top-k for packed and non-packed inputs."""
+        seq_len = self.config.dsa_indexer_topk
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        device = torch.device("cuda")
+
+        monkeypatch.setattr(self.config, "attention_backend", "unfused")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "recompute_granularity", "full")
+
+        score_calls = 0
+
+        def counting_topk(*args, **kwargs):
+            nonlocal score_calls
+            score_calls += 1
+            return fused_qk_topk_naive(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_naive",
+            counting_topk,
+        )
+
+        query_shape = (seq_len, batch_size, num_heads, head_dim)
+        packed_seq_params = None
+        if layout == "thd":
+            query_shape = (seq_len, num_heads, head_dim)
+            cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_kv=seq_len,
+            )
+
+        query = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        key = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        value = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        x = torch.randn(
+            seq_len,
+            batch_size,
+            self.config.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        qr = torch.randn(
+            seq_len,
+            batch_size,
+            self.config.q_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        cache = DSATopKCache()
+
+        self.sparse_attention.train()
+        self.sparse_attention.cuda()
+
+        def checkpointed_dsa(query, key, value, x, qr):
+            return self.sparse_attention(
+                query=query,
+                key=key,
+                value=value,
+                x=x,
+                qr=qr,
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+                dsa_topk_cache=cache,
+            )
+
+        output = tensor_parallel.checkpoint(
+            checkpointed_dsa,
+            False,
+            query,
+            key,
+            value,
+            x,
+            qr,
+        )
+        output.float().sum().backward()
+
+        assert score_calls == 1
+        assert cache.source_layers == set()
+        assert query.grad is not None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_forward(self):
