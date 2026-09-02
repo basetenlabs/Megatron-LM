@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+import megatron.core.recompute as recompute_module
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -28,7 +29,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
-    _DSATopKShareState,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -53,6 +53,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -140,123 +141,125 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
-        config = SimpleNamespace(
-            dsa_indexer_topk=8,
-            dsa_indexer_topk_freq=4,
-            dsa_indexer_skip_topk_offset=1,
-            kv_channels=16,
-        )
-        attention = DSAttention(
-            config=config,
-            submodules=DSAttentionSubmodules(indexer=object()),
-            layer_number=2,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type="self",
-            softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
-        )
-        attention_mask = torch.empty(1)
-
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
-
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
-
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
-        config = SimpleNamespace(
-            dsa_indexer_topk=8,
-            dsa_indexer_topk_freq=4,
-            dsa_indexer_skip_topk_offset=1,
-            kv_channels=16,
-        )
-        attention = DSAttention(
-            config=config,
-            submodules=DSAttentionSubmodules(indexer=object()),
-            layer_number=2,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type="self",
-            softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
-        )
-        packed_seq_params = PackedSeqParams(qkv_format="thd")
-        attention_mask = torch.empty(1)
-
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
-
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-
-    def test_recompute_state_isolated_by_packed_microbatch(self):
-        config = SimpleNamespace(
-            dsa_indexer_topk=8,
-            dsa_indexer_topk_freq=4,
-            dsa_indexer_skip_topk_offset=1,
-            kv_channels=16,
-            num_layers=8,
-        )
-        attention = DSAttention(
-            config=config,
-            submodules=DSAttentionSubmodules(indexer=lambda *_args, **_kwargs: None),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type="self",
-            softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
-        )
-        first = PackedSeqParams(qkv_format="thd")
-        second = PackedSeqParams(qkv_format="thd")
+    def test_topk_cache_isolated_by_microbatch(self):
+        first = DSATopKCache()
+        second = DSATopKCache()
         first_indices = torch.tensor([1])
         second_indices = torch.tensor([2])
-        first_topk = attention._get_index_share_topk_holder(first)
-        first_lengths = attention._get_index_share_topk_length_holder(first)
-        first_states = attention._get_index_share_state_holder(first)
-        second_topk = attention._get_index_share_topk_holder(second)
-        second_states = attention._get_index_share_state_holder(second)
-        first_topk[1] = first_indices
-        second_topk[1] = second_indices
-        first_states[1] = _DSATopKShareState(remaining_recompute_layers={1})
-        second_states[1] = _DSATopKShareState(remaining_recompute_layers={1})
+        first.store(1, first_indices, None, recompute_layers={1})
+        second.store(1, second_indices, None, recompute_layers={1})
 
-        released = attention._mark_topk_recompute_layer_complete(
-            1, 1, first_topk, first_lengths, first_states
-        )
+        assert first.mark_recompute_layer_complete(1, 1)
+        assert first.source_layers == set()
+        second_entry = second.get(1)
+        assert second_entry is not None
+        assert second_entry.indices is second_indices
+        assert second_entry.remaining_recompute_layers == {1}
 
-        assert released
-        assert first_topk == {}
-        assert first_states == {}
-        assert second_topk[1] is second_indices
-        assert second_states[1].remaining_recompute_layers == {1}
-
-    def test_recompute_state_releases_in_any_layer_order(self):
+    def test_topk_cache_releases_in_any_recompute_layer_order(self):
         for order in ([1, 2, 3, 4], [4, 3, 2, 1]):
             indices = torch.tensor([1])
-            topk_holder = {1: indices}
-            length_holder = {}
-            state_holder = {
-                1: _DSATopKShareState(remaining_recompute_layers={1, 2, 3, 4})
-            }
+            cache = DSATopKCache()
+            cache.store(1, indices, None, recompute_layers={1})
+            for layer_number in (2, 3, 4):
+                cache.register_recompute_layer(1, layer_number)
 
             for layer_number in order[:-1]:
-                assert not DSAttention._mark_topk_recompute_layer_complete(
-                    1, layer_number, topk_holder, length_holder, state_holder
-                )
-                assert topk_holder[1] is indices
-            assert DSAttention._mark_topk_recompute_layer_complete(
-                1, order[-1], topk_holder, length_holder, state_holder
-            )
-            assert topk_holder == {}
-            assert state_holder == {}
+                assert not cache.mark_recompute_layer_complete(1, layer_number)
+                entry = cache.get(1)
+                assert entry is not None
+                assert entry.indices is indices
+            assert cache.mark_recompute_layer_complete(1, order[-1])
+            assert cache.source_layers == set()
 
-    def test_recompute_layers_cover_source_and_skip_consumers(self):
+    def test_topk_cache_checkpoint_phase_is_scoped(self):
+        cache = DSATopKCache()
+
+        assert not cache.activation_recompute_enabled
+        assert not cache.in_recompute
+        with cache.checkpoint_phase(enabled=True, recomputing=True):
+            assert cache.activation_recompute_enabled
+            assert cache.in_recompute
+            with cache.checkpoint_phase(enabled=False, recomputing=False):
+                assert cache.activation_recompute_enabled
+                assert cache.in_recompute
+        assert not cache.activation_recompute_enabled
+        assert not cache.in_recompute
+
+    def test_checkpointed_forward_isolates_interleaved_microbatch_caches(self, monkeypatch):
+        pending_recomputes = []
+        replayed_indices = []
+
+        class FakeTransformerLayer:
+            layer_number = 1
+
+            def __call__(self, **kwargs):
+                hidden_states = kwargs["hidden_states"]
+                cache = kwargs["dsa_topk_cache"]
+                if cache.in_recompute:
+                    entry = cache.get(self.layer_number)
+                    assert entry is not None
+                    replayed_indices.append(entry.indices)
+                    cache.mark_recompute_layer_complete(self.layer_number, self.layer_number)
+                else:
+                    cache.store(
+                        self.layer_number,
+                        hidden_states,
+                        None,
+                        recompute_layers={self.layer_number},
+                    )
+                return hidden_states, kwargs["context"]
+
+        stack = SimpleNamespace(
+            config=SimpleNamespace(
+                distribute_saved_activations=False,
+                fp4=False,
+                fp8=False,
+                recompute_method="uniform",
+                recompute_num_layers=1,
+            ),
+            layers=[FakeTransformerLayer()],
+            num_layers_per_pipeline_rank=1,
+        )
+
+        def fake_checkpoint(function, _distribute_saved_activations, *args):
+            with torch.no_grad():
+                output = function(*args)
+            pending_recomputes.append((function, args))
+            return output
+
+        monkeypatch.setattr(recompute_module, "TransformerLayer", FakeTransformerLayer)
+        monkeypatch.setattr(recompute_module.tensor_parallel, "checkpoint", fake_checkpoint)
+
+        first_cache = DSATopKCache()
+        second_cache = DSATopKCache()
+        first_indices = torch.tensor([1.0], requires_grad=True)
+        second_indices = torch.tensor([2.0], requires_grad=True)
+
+        for cache, indices in ((first_cache, first_indices), (second_cache, second_indices)):
+            recompute_module.checkpointed_forward(
+                stack,
+                hidden_states=indices,
+                attention_mask=None,
+                context=None,
+                context_mask=None,
+                rotary_pos_emb=None,
+                attention_bias=None,
+                packed_seq_params=None,
+                use_inner_quantization_context=False,
+                dsa_topk_cache=cache,
+            )
+
+        for function, args in reversed(pending_recomputes):
+            with torch.enable_grad():
+                function(*args)
+
+        assert replayed_indices[0] is second_indices
+        assert replayed_indices[1] is first_indices
+        assert first_cache.source_layers == set()
+        assert second_cache.source_layers == set()
+
+    def test_source_detects_next_topk_consumer(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
@@ -273,8 +276,6 @@ class TestDSAIndexShareHelpers:
             softmax_scale=1.0,
             pg_collection=SimpleNamespace(),
         )
-        assert source._recompute_layers_for_source(1, include_source=True) == {1, 2, 3, 4}
-        assert source._recompute_layers_for_source(1, include_source=False) == {2, 3, 4}
         assert source._next_layer_reuses_topk(1)
 
 

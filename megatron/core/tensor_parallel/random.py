@@ -588,27 +588,6 @@ _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
 
-# Global flag that's toggled whenever recomputing a checkpointed forward
-IS_IN_RECOMPUTE_PHASE = False
-
-
-def _set_in_recompute_phase():
-    """Set state to recompute-phase enabled."""
-    global IS_IN_RECOMPUTE_PHASE
-    IS_IN_RECOMPUTE_PHASE = True
-
-
-def _unset_in_recompute_phase():
-    """Unset state to recompute-phase enabled."""
-    global IS_IN_RECOMPUTE_PHASE
-    IS_IN_RECOMPUTE_PHASE = False
-
-
-def is_in_recompute_phase():
-    """Check if currently recomputing a checkpointed forward."""
-    return IS_IN_RECOMPUTE_PHASE
-
-
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -676,12 +655,8 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            _set_in_recompute_phase()
-            try:
-                with torch.enable_grad():
-                    outputs = ctx.run_function(*detached_inputs)
-            finally:
-                _unset_in_recompute_phase()
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

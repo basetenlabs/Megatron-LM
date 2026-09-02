@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from __future__ import annotations
 
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -11,6 +14,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -28,6 +34,7 @@ def checkpointed_forward(
     attention_bias: Optional[Tensor],
     packed_seq_params: PackedSeqParams,
     use_inner_quantization_context: bool,
+    dsa_topk_cache: DSATopKCache | None = None,
     padding_mask: Optional[Tensor] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
@@ -55,7 +62,7 @@ def checkpointed_forward(
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
 
-    def custom(start: int, end: int):
+    def custom(start: int, end: int, is_checkpointed: bool):
         def custom_forward(
             hidden_states,
             attention_mask,
@@ -71,60 +78,76 @@ def checkpointed_forward(
                 else rotary_pos_emb_global
             )
 
-            for index in range(start, end):
-                # Use self.layers[index] (not self._get_layer) so this
-                # function works for both TransformerBlock and HybridStack.
-                layer = self.layers[index]
+            recompute_context = (
+                dsa_topk_cache.checkpoint_phase(
+                    enabled=is_checkpointed,
+                    recomputing=is_checkpointed and torch.is_grad_enabled(),
+                )
+                if dsa_topk_cache is not None
+                else nullcontext()
+            )
+            with recompute_context:
+                for index in range(start, end):
+                    # Use self.layers[index] (not self._get_layer) so this
+                    # function works for both TransformerBlock and HybridStack.
+                    layer = self.layers[index]
 
-                # Get appropriate inner quantization context
-                if use_inner_quantization_context:
-                    if self.config.fp8:
-                        inner_quantization_context = get_fp8_context(
-                            self.config, layer.layer_number - 1
-                        )
-                    # TODO: check if fp4 is supported in this case
-                    elif self.config.fp4:
-                        inner_quantization_context = get_fp4_context(
-                            self.config, layer.layer_number - 1
-                        )
+                    # Get appropriate inner quantization context
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        # TODO: check if fp4 is supported in this case
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
                     else:
                         inner_quantization_context = nullcontext()
-                else:
-                    inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set; for non-TL
-                # layers (currently MambaLayer in HybridStack) pop the kwargs
-                # they don't accept and treat the return as a single tensor.
-                layer_kwargs = dict(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=attention_bias,
-                    inference_context=None,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                )
-                with inner_quantization_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
-                    else:  # MambaLayer (HybridStack `M` slot)
-                        for k in ("context", "context_mask", "attention_bias", "padding_mask"):
-                            layer_kwargs.pop(k, None)
-                        hidden_states = layer(**layer_kwargs)
-                        context = None
+                    # Build the full TransformerLayer kwarg set; for non-TL
+                    # layers (currently MambaLayer in HybridStack) pop the kwargs
+                    # they don't accept and treat the return as a single tensor.
+                    layer_kwargs = dict(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        context=context,
+                        context_mask=context_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        attention_bias=attention_bias,
+                        inference_context=None,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        dsa_topk_cache=dsa_topk_cache,
+                    )
+                    with inner_quantization_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, context = layer(**layer_kwargs)
+                        else:  # MambaLayer (HybridStack `M` slot)
+                            for k in (
+                                "context",
+                                "context_mask",
+                                "attention_bias",
+                                "padding_mask",
+                                "dsa_topk_cache",
+                            ):
+                                layer_kwargs.pop(k, None)
+                            hidden_states = layer(**layer_kwargs)
+                            context = None
 
-                # Some layer paths may still return a tuple (defensive).
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    # Some layer paths may still return a tuple (defensive).
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
             return hidden_states, context
 
         return custom_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
-        cf = custom(start, end)
+        cf = custom(start, end, use_checkpoint)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
         if use_checkpoint:
