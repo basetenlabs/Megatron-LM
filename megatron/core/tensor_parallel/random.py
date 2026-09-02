@@ -588,10 +588,7 @@ _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
 
-# Global flag that's toggled only while a checkpointed forward is being
-# recomputed in backward. DSA reads this to replay cached, non-differentiable
-# top-k indices instead of re-running the expensive fp32 indexer scoring;
-# a strict no-op when full recompute is off.
+# Global flag that's toggled whenever recomputing a checkpointed forward
 IS_IN_RECOMPUTE_PHASE = False
 
 
