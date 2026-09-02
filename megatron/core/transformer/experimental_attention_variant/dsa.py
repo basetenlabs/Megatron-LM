@@ -23,6 +23,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -32,12 +33,6 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
-
-
-from megatron.core.tensor_parallel.random import is_in_recompute_phase as _dsa_is_in_recompute_phase
-
-# Per-layer cache of the first forward's final top-k, replayed on the recompute-forward and cleared on read
-_DSA_TOPK_REPLAY_CACHE = {}
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -1597,8 +1592,6 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
-    _HOLDER_ATTR = "_dsa_index_share_topk_holder"
-    _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 
     def __init__(
         self,
@@ -1649,39 +1642,18 @@ class DSAttention(MegatronModule):
         self.softmax_scale = softmax_scale
         self.cp_comm_type = dsa_layout.normalize_cp_comm_type(cp_comm_type)
 
-    def _get_index_share_carrier(
-        self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
-    ) -> object:
-        """Return the object that carries DSA top-k sharing state for this forward."""
-        if packed_seq_params is not None:
-            return packed_seq_params
-        return attention_mask if attention_mask is not None else self.config
-
-    def _get_index_share_topk_holder(
-        self,
-        packed_seq_params: Optional[PackedSeqParams],
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> dict[int, torch.Tensor]:
-        """Return the per-forward top-k holder for DSA index sharing."""
-        carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
-        holder = getattr(carrier, self._HOLDER_ATTR, None)
-        if holder is None:
-            holder = {}
-            setattr(carrier, self._HOLDER_ATTR, holder)
-        return holder
-
-    def _get_index_share_topk_length_holder(
-        self,
-        packed_seq_params: Optional[PackedSeqParams],
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> dict[int, torch.Tensor]:
-        """Return the optional per-forward top-k length holder."""
-        carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
-        holder = getattr(carrier, self._LENGTH_HOLDER_ATTR, None)
-        if holder is None:
-            holder = {}
-            setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
-        return holder
+    def _next_layer_reuses_topk(self, source_layer: int) -> bool:
+        next_layer = self.layer_number + 1
+        return (
+            next_layer <= self.config.num_layers
+            and is_dsa_skip_topk_layer(
+                next_layer, self.index_skip_topk_offset, self.index_topk_freq
+            )
+            and source_dsa_compute_layer(
+                next_layer, self.index_skip_topk_offset, self.index_topk_freq
+            )
+            == source_layer
+        )
 
     def forward(
         self,
@@ -1696,6 +1668,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
+        dsa_topk_cache: DSATopKCache | None = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1711,6 +1684,7 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
+            dsa_topk_cache: Top-k state owned by this microbatch's forward execution.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
@@ -2011,16 +1985,25 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
-        topk_holder = (
-            self._get_index_share_topk_holder(packed_seq_params, attention_mask)
-            if self.index_share
-            else None
+        _dsa_full_recompute = (
+            self.training and self.config.recompute_granularity == "full"
         )
-        topk_length_holder = (
-            self._get_index_share_topk_length_holder(packed_seq_params, attention_mask)
-            if self.index_share
-            else None
+        _dsa_replay_enabled = _dsa_full_recompute and not use_indexer_loss
+        _dsa_checkpoint_forward = _dsa_full_recompute and not torch.is_grad_enabled()
+        _dsa_in_recompute = (
+            _dsa_full_recompute
+            and torch.is_grad_enabled()
+            and dsa_topk_cache is not None
+            and dsa_topk_cache.is_recompute_layer_pending(
+                self.source_layer, self.layer_number
+            )
         )
+        _dsa_needs_cache = self.index_share or _dsa_full_recompute
+        if _dsa_needs_cache and dsa_topk_cache is None:
+            raise RuntimeError(
+                "DSAttention requires a per-forward DSATopKCache when index sharing or "
+                "full-recompute replay is enabled."
+            )
         topk_indices = None
         topk_length = None
         q = k = weights = None
@@ -2031,8 +2014,9 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
         if self.skip_topk:
-            assert topk_holder is not None
-            if self.source_layer not in topk_holder:
+            assert dsa_topk_cache is not None
+            cached_topk = dsa_topk_cache.get(self.source_layer)
+            if cached_topk is None:
                 raise RuntimeError(
                     "DSA index-share skip layer "
                     f"(layer_number={self.layer_number}) needs top-k indices from source "
@@ -2041,11 +2025,18 @@ class DSAttention(MegatronModule):
                     "pipeline stage starts on a computing layer "
                     f"(dsa_indexer_topk_freq={self.index_topk_freq}, "
                     f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
-                    f"Holder has layers {sorted(topk_holder)}."
+                    f"Cache has layers {sorted(dsa_topk_cache.source_layers)}."
                 )
-            topk_indices = topk_holder[self.source_layer]
-            if topk_length_holder is not None:
-                topk_length = topk_length_holder.get(self.source_layer)
+            topk_indices = cached_topk.indices
+            topk_length = cached_topk.length
+
+            if not _dsa_in_recompute:
+                if _dsa_checkpoint_forward:
+                    dsa_topk_cache.register_recompute_layer(
+                        self.source_layer, self.layer_number
+                    )
+                if not self._next_layer_reuses_topk(self.source_layer):
+                    dsa_topk_cache.release_if_recompute_complete(self.source_layer)
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -2205,16 +2196,13 @@ class DSAttention(MegatronModule):
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
         # Replay cached top-k on the recompute-forward; gated to full recompute + the no-loss path (loss path needs grad through scores)
-        _dsa_replay_ok = (
-            computes_topk
-            and not use_indexer_loss
-            and getattr(self.config, "recompute_granularity", None) == "full"
-        )
         _dsa_replayed = False
-        if _dsa_replay_ok and _dsa_is_in_recompute_phase():
-            _dsa_cached = _DSA_TOPK_REPLAY_CACHE.pop(self.layer_number, None)
-            if _dsa_cached is not None:
-                topk_indices, topk_length = _dsa_cached
+        if computes_topk and _dsa_replay_enabled and _dsa_in_recompute:
+            assert dsa_topk_cache is not None
+            cached_topk = dsa_topk_cache.get(self.layer_number)
+            if cached_topk is not None:
+                topk_indices = cached_topk.indices
+                topk_length = cached_topk.length
                 _dsa_replayed = True
 
         if use_indexer_loss:
@@ -2343,16 +2331,25 @@ class DSAttention(MegatronModule):
                 packed_seq_params,
             )
 
-        if self.index_share and computes_topk:
-            assert topk_holder is not None and topk_indices is not None
-            topk_holder[self.layer_number] = topk_indices
-            if topk_length_holder is not None and topk_length is not None:
-                topk_length_holder[self.layer_number] = topk_length
-
-        # dsa-indexer-opt: cache the final top-k on the first (non-recompute)
-        # forward so the recompute pass can replay it.
-        if _dsa_replay_ok and not _dsa_replayed and not _dsa_is_in_recompute_phase():
-            _DSA_TOPK_REPLAY_CACHE[self.layer_number] = (topk_indices, topk_length)
+        needs_forward_share = self.index_share and self._next_layer_reuses_topk(
+            self.layer_number
+        )
+        if computes_topk and not _dsa_in_recompute and (
+            needs_forward_share or (_dsa_checkpoint_forward and _dsa_replay_enabled)
+        ):
+            assert dsa_topk_cache is not None and topk_indices is not None
+            remaining_layers = (
+                {self.layer_number}
+                if _dsa_checkpoint_forward
+                and (_dsa_replay_enabled or needs_forward_share)
+                else None
+            )
+            dsa_topk_cache.store(
+                self.layer_number,
+                topk_indices,
+                topk_length,
+                recompute_layers=remaining_layers,
+            )
 
         # ===================================
         # Run sparse attention kernel
@@ -2372,6 +2369,11 @@ class DSAttention(MegatronModule):
             varlen_ends=varlen_ends,
             key_positions=key_positions,
         )
+
+        if _dsa_full_recompute and _dsa_in_recompute and dsa_topk_cache is not None:
+            dsa_topk_cache.mark_recompute_layer_complete(
+                self.source_layer, self.layer_number
+            )
 
         if use_indexer_loss:
             if indexer_loss is None:

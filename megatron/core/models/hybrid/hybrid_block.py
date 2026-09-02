@@ -27,6 +27,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
@@ -276,6 +277,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        dsa_topk_cache: DSATopKCache | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -326,6 +328,11 @@ class HybridStack(MegatronModule):
             )
         else:
             sequence_len_offset = None
+        if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
+            dsa_topk_cache = DSATopKCache()
+        dsa_layer_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level
@@ -365,6 +372,7 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    transformer_layer_kwargs=dsa_layer_kwargs,
                 )
             else:
                 for layer in self.layers:
@@ -382,6 +390,7 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
+                                **dsa_layer_kwargs,
                             )
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(

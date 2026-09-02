@@ -8,6 +8,8 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+import megatron.core.recompute as recompute_module
+from megatron.core import tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -52,6 +54,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -139,60 +142,130 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
+    def test_topk_cache_isolated_by_microbatch(self):
+        first = DSATopKCache()
+        second = DSATopKCache()
+        first_indices = torch.tensor([1])
+        second_indices = torch.tensor([2])
+        first.store(1, first_indices, None, recompute_layers={1})
+        second.store(1, second_indices, None, recompute_layers={1})
+
+        assert first.mark_recompute_layer_complete(1, 1)
+        assert first.source_layers == set()
+        second_entry = second.get(1)
+        assert second_entry is not None
+        assert second_entry.indices is second_indices
+        assert second_entry.remaining_recompute_layers == {1}
+
+    def test_topk_cache_releases_in_any_recompute_layer_order(self):
+        for order in ([1, 2, 3, 4], [4, 3, 2, 1]):
+            indices = torch.tensor([1])
+            cache = DSATopKCache()
+            cache.store(1, indices, None, recompute_layers={1})
+            for layer_number in (2, 3, 4):
+                cache.register_recompute_layer(1, layer_number)
+
+            for layer_number in order[:-1]:
+                assert not cache.mark_recompute_layer_complete(1, layer_number)
+                entry = cache.get(1)
+                assert entry is not None
+                assert entry.indices is indices
+            assert cache.mark_recompute_layer_complete(1, order[-1])
+            assert cache.source_layers == set()
+
+    def test_checkpointed_forward_isolates_interleaved_microbatch_caches(self, monkeypatch):
+        pending_recomputes = []
+        replayed_indices = []
+
+        class FakeTransformerLayer:
+            layer_number = 1
+
+            def __call__(self, **kwargs):
+                hidden_states = kwargs["hidden_states"]
+                cache = kwargs["dsa_topk_cache"]
+                if torch.is_grad_enabled() and cache.is_recompute_layer_pending(
+                    self.layer_number, self.layer_number
+                ):
+                    entry = cache.get(self.layer_number)
+                    assert entry is not None
+                    replayed_indices.append(entry.indices)
+                    cache.mark_recompute_layer_complete(self.layer_number, self.layer_number)
+                else:
+                    cache.store(
+                        self.layer_number,
+                        hidden_states,
+                        None,
+                        recompute_layers={self.layer_number},
+                    )
+                return hidden_states, kwargs["context"]
+
+        stack = SimpleNamespace(
+            config=SimpleNamespace(
+                distribute_saved_activations=False,
+                fp4=False,
+                fp8=False,
+                recompute_method="uniform",
+                recompute_num_layers=1,
+            ),
+            layers=[FakeTransformerLayer()],
+            num_layers_per_pipeline_rank=1,
+        )
+
+        def fake_checkpoint(function, _distribute_saved_activations, *args):
+            with torch.no_grad():
+                output = function(*args)
+            pending_recomputes.append((function, args))
+            return output
+
+        monkeypatch.setattr(recompute_module, "TransformerLayer", FakeTransformerLayer)
+        monkeypatch.setattr(recompute_module.tensor_parallel, "checkpoint", fake_checkpoint)
+
+        first_cache = DSATopKCache()
+        second_cache = DSATopKCache()
+        first_indices = torch.tensor([1.0], requires_grad=True)
+        second_indices = torch.tensor([2.0], requires_grad=True)
+
+        for cache, indices in ((first_cache, first_indices), (second_cache, second_indices)):
+            recompute_module.checkpointed_forward(
+                stack,
+                hidden_states=indices,
+                attention_mask=None,
+                context=None,
+                context_mask=None,
+                rotary_pos_emb=None,
+                attention_bias=None,
+                packed_seq_params=None,
+                use_inner_quantization_context=False,
+                transformer_layer_kwargs={"dsa_topk_cache": cache},
+            )
+
+        for function, args in reversed(pending_recomputes):
+            with torch.enable_grad():
+                function(*args)
+
+        assert replayed_indices[0] is second_indices
+        assert replayed_indices[1] is first_indices
+        assert first_cache.source_layers == set()
+        assert second_cache.source_layers == set()
+
+    def test_source_detects_next_topk_consumer(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
+            num_layers=8,
         )
-        attention = DSAttention(
+        source = DSAttention(
             config=config,
-            submodules=DSAttentionSubmodules(indexer=object()),
-            layer_number=2,
+            submodules=DSAttentionSubmodules(indexer=lambda *_args, **_kwargs: None),
+            layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
             pg_collection=SimpleNamespace(),
         )
-        attention_mask = torch.empty(1)
-
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
-
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
-
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
-        config = SimpleNamespace(
-            dsa_indexer_topk=8,
-            dsa_indexer_topk_freq=4,
-            dsa_indexer_skip_topk_offset=1,
-            kv_channels=16,
-        )
-        attention = DSAttention(
-            config=config,
-            submodules=DSAttentionSubmodules(indexer=object()),
-            layer_number=2,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type="self",
-            softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
-        )
-        packed_seq_params = PackedSeqParams(qkv_format="thd")
-        attention_mask = torch.empty(1)
-
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
-
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+        assert source._next_layer_reuses_topk(1)
 
 
 def _build_packed_causal_mask_for_test(
@@ -3092,6 +3165,95 @@ class TestDSAttention:
         assert seen["q_indexer_len"] == seq_len
         torch.testing.assert_close(seen["varlen_starts"], expected_starts)
         torch.testing.assert_close(seen["varlen_ends"], torch.arange(5, 9, dtype=torch.int64))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_full_recompute_replays_topk_without_rescoring(self, monkeypatch, layout):
+        """Full recompute should reuse cached top-k for packed and non-packed inputs."""
+        seq_len = self.config.dsa_indexer_topk
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        device = torch.device("cuda")
+
+        monkeypatch.setattr(self.config, "attention_backend", "unfused")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "recompute_granularity", "full")
+
+        score_calls = 0
+
+        def counting_topk(*args, **kwargs):
+            nonlocal score_calls
+            score_calls += 1
+            return fused_qk_topk_naive(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_naive",
+            counting_topk,
+        )
+
+        query_shape = (seq_len, batch_size, num_heads, head_dim)
+        packed_seq_params = None
+        if layout == "thd":
+            query_shape = (seq_len, num_heads, head_dim)
+            cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_kv=seq_len,
+            )
+
+        query = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        key = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        value = torch.randn(query_shape, dtype=torch.bfloat16, device=device, requires_grad=True)
+        x = torch.randn(
+            seq_len,
+            batch_size,
+            self.config.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        qr = torch.randn(
+            seq_len,
+            batch_size,
+            self.config.q_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        cache = DSATopKCache()
+
+        self.sparse_attention.train()
+        self.sparse_attention.cuda()
+
+        def checkpointed_dsa(query, key, value, x, qr):
+            return self.sparse_attention(
+                query=query,
+                key=key,
+                value=value,
+                x=x,
+                qr=qr,
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+                dsa_topk_cache=cache,
+            )
+
+        output = tensor_parallel.checkpoint(
+            checkpointed_dsa,
+            False,
+            query,
+            key,
+            value,
+            x,
+            qr,
+        )
+        output.float().sum().backward()
+
+        assert score_calls == 1
+        assert cache.source_layers == set()
+        assert query.grad is not None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_forward(self):

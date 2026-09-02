@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -1200,10 +1201,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        dsa_topk_cache: DSATopKCache | None = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
         """
+        if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
+            dsa_topk_cache = DSATopKCache()
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1235,6 +1239,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
+                        dsa_topk_cache=dsa_topk_cache,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1251,6 +1256,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
+                        dsa_topk_cache=dsa_topk_cache,
                     )
 
         hidden_states = self._postprocess(hidden_states)
@@ -1331,6 +1337,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        dsa_topk_cache: DSATopKCache | None = None,
     ):
         """Forward through ``_proj_and_transformer_layer`` with activation
         recomputation.
@@ -1379,6 +1386,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                dsa_topk_cache=dsa_topk_cache,
             )
 
         # Decide the outer quantization context, matching
@@ -1473,6 +1481,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                dsa_topk_cache=dsa_topk_cache,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -1528,6 +1537,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
         )
+        dsa_topk_cache = (
+            DSATopKCache() if self.config.experimental_attention_variant == "dsa" else None
+        )
 
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
@@ -1544,6 +1556,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                dsa_topk_cache=dsa_topk_cache,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -1560,6 +1573,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                dsa_topk_cache=dsa_topk_cache,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask

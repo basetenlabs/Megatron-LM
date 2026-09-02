@@ -28,6 +28,7 @@ def checkpointed_forward(
     attention_bias: Optional[Tensor],
     packed_seq_params: PackedSeqParams,
     use_inner_quantization_context: bool,
+    transformer_layer_kwargs: Optional[dict[str, object]] = None,
     padding_mask: Optional[Tensor] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
@@ -41,6 +42,8 @@ def checkpointed_forward(
         layer_offset (int): The global layer offset for the current
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
+        transformer_layer_kwargs (dict, optional): Opaque keyword arguments passed only to
+            TransformerLayer instances.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -48,6 +51,8 @@ def checkpointed_forward(
     """
     if extract_layer_indices is None:
         extract_layer_indices = set()
+    if transformer_layer_kwargs is None:
+        transformer_layer_kwargs = {}
     intermediate_hidden_states: List[Tensor] = []
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
@@ -108,6 +113,7 @@ def checkpointed_forward(
                 )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
+                        layer_kwargs.update(transformer_layer_kwargs)
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in ("context", "context_mask", "attention_bias", "padding_mask"):
