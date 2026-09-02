@@ -36,12 +36,7 @@ except ImportError:
 
 from megatron.core.tensor_parallel.random import is_in_recompute_phase as _dsa_is_in_recompute_phase
 
-# dsa-indexer-opt: per-layer cache of FINAL top-k (indices, length) from the
-# first forward, replayed on the checkpoint recompute-forward so the fp32
-# per-head indexer scoring runs once per step instead of twice. Keyed by
-# layer_number; a single slot per layer (micro_batch_size==1). Populated only
-# under full recompute and only on the non-loss top-k path; cleared on replay
-# read so it cannot leak across forward_backward steps.
+# Per-layer cache of the first forward's final top-k, replayed on the recompute-forward and cleared on read
 _DSA_TOPK_REPLAY_CACHE = {}
 
 
@@ -2209,10 +2204,7 @@ class DSAttention(MegatronModule):
             if topk_length is not None:
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
-        # dsa-indexer-opt: on the recompute-forward, replay the cached final
-        # top-k for this layer and skip the (non-differentiable) scoring. Gated
-        # to full recompute + the no-loss top-k path (the loss path needs grad
-        # through the scores). index_share holder is still populated below.
+        # Replay cached top-k on the recompute-forward; gated to full recompute + the no-loss path (loss path needs grad through scores)
         _dsa_replay_ok = (
             computes_topk
             and not use_indexer_loss
