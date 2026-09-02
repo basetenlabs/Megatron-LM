@@ -588,30 +588,28 @@ _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
 
-import contextlib as _dsa_contextlib
-
-# dsa-indexer-opt: a process-local flag marking that we are inside a
-# checkpoint recompute-forward (backward pass re-running the layer forward).
-# DSA reads this to replay cached, non-differentiable top-k indices instead of
-# re-running the expensive fp32 indexer scoring. Set only around the recompute
-# call below; a strict no-op when full recompute is off.
-_IN_RECOMPUTE_PHASE = False
+# Global flag that's toggled only while a checkpointed forward is being
+# recomputed in backward. DSA reads this to replay cached, non-differentiable
+# top-k indices instead of re-running the expensive fp32 indexer scoring;
+# a strict no-op when full recompute is off.
+IS_IN_RECOMPUTE_PHASE = False
 
 
-def is_in_recompute_phase() -> bool:
-    """True while a checkpointed layer forward is being recomputed in backward."""
-    return _IN_RECOMPUTE_PHASE
+def _set_in_recompute_phase():
+    """Set state to recompute-phase enabled."""
+    global IS_IN_RECOMPUTE_PHASE
+    IS_IN_RECOMPUTE_PHASE = True
 
 
-@_dsa_contextlib.contextmanager
-def _recompute_phase_marker():
-    global _IN_RECOMPUTE_PHASE
-    prev = _IN_RECOMPUTE_PHASE
-    _IN_RECOMPUTE_PHASE = True
-    try:
-        yield
-    finally:
-        _IN_RECOMPUTE_PHASE = prev
+def _unset_in_recompute_phase():
+    """Unset state to recompute-phase enabled."""
+    global IS_IN_RECOMPUTE_PHASE
+    IS_IN_RECOMPUTE_PHASE = False
+
+
+def is_in_recompute_phase():
+    """Check if currently recomputing a checkpointed forward."""
+    return IS_IN_RECOMPUTE_PHASE
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -681,8 +679,12 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), _recompute_phase_marker():
-                outputs = ctx.run_function(*detached_inputs)
+            _set_in_recompute_phase()
+            try:
+                with torch.enable_grad():
+                    outputs = ctx.run_function(*detached_inputs)
+            finally:
+                _unset_in_recompute_phase()
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
