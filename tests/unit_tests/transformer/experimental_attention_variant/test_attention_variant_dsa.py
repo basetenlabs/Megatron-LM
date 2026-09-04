@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _get_packed_allgather_cp_layout,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -38,6 +39,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     rotate_activation,
     source_dsa_compute_layer,
     unfused_dsa_fn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_packed_allgather_cp_local_positions,
@@ -182,7 +186,7 @@ class TestDSAIndexShareHelpers:
 
             def __call__(self, **kwargs):
                 hidden_states = kwargs["hidden_states"]
-                cache = kwargs["dsa_topk_cache"]
+                cache = kwargs["dsa_forward_context"].topk_cache
                 if torch.is_grad_enabled() and cache.is_recompute_layer_pending(
                     self.layer_number, self.layer_number
                 ):
@@ -226,6 +230,7 @@ class TestDSAIndexShareHelpers:
         second_indices = torch.tensor([2.0], requires_grad=True)
 
         for cache, indices in ((first_cache, first_indices), (second_cache, second_indices)):
+            forward_context = DSAForwardContext(topk_cache=cache)
             recompute_module.checkpointed_forward(
                 stack,
                 hidden_states=indices,
@@ -236,7 +241,7 @@ class TestDSAIndexShareHelpers:
                 attention_bias=None,
                 packed_seq_params=None,
                 use_inner_quantization_context=False,
-                transformer_layer_kwargs={"dsa_topk_cache": cache},
+                transformer_layer_kwargs={"dsa_forward_context": forward_context},
             )
 
         for function, args in reversed(pending_recomputes):
@@ -1042,42 +1047,32 @@ class TestDSACPPositionHelpers:
         restored = gathered_key_pos.index_select(0, key_reorder_idx)
         assert restored.tolist() == list(range(16))
 
-    def test_packed_allgather_cp_layout_cache_is_scoped_to_unchanged_cu_seqlens(self):
+    def test_packed_allgather_cp_layout_is_reused_by_forward_context(self):
         cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
-        kwargs = {
-            "cp_size": 2,
-            "cp_rank": 0,
-            "device": torch.device("cpu"),
-            "query_cu_seqlens_cover_output": True,
-            "key_cu_seqlens_cover_output": True,
-        }
+        forward_context = DSAForwardContext()
+        kwargs = dict(
+            dsa_forward_context=forward_context,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=2,
+            cp_rank=0,
+            device=torch.device("cpu"),
+            local_output_size=8,
+            key_local_output_size=8,
+            global_output_size=16,
+            query_cu_seqlens_cover_output=True,
+            key_cu_seqlens_cover_output=True,
+        )
 
-        first = build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
-        )
-        second = build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
-        )
-        assert first[0] is second[0]
-        assert first[1] is second[1]
+        first = _get_packed_allgather_cp_layout(**kwargs)
+        second = _get_packed_allgather_cp_layout(**kwargs)
 
-        cu_seqlens[1] = 8
-        after_mutation = build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
-        )
-        assert after_mutation[0] is not first[0]
-        assert after_mutation[1] is not first[1]
-
-        distinct_q = cu_seqlens.clone()
-        distinct_kv = cu_seqlens.clone()
-        bypass_first = build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=distinct_q, cu_seqlens_kv=distinct_kv, **kwargs
-        )
-        bypass_second = build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=distinct_q, cu_seqlens_kv=distinct_kv, **kwargs
-        )
-        assert bypass_first[0] is not bypass_second[0]
-        assert bypass_first[1] is not bypass_second[1]
+        assert first is second
+        assert forward_context.packed_cp_layout is first
+        with pytest.raises(RuntimeError, match="changed within one microbatch"):
+            _get_packed_allgather_cp_layout(
+                **{**kwargs, "local_output_size": 4, "global_output_size": 8}
+            )
 
     def test_cp_packed_zigzag_varlen_matches_dense_mask(self):
         """Packed zigzag CP query positions + gathered-KV reorder should match dense masking."""
@@ -3259,7 +3254,8 @@ class TestDSAttention:
             dtype=torch.bfloat16,
             device=device,
         )
-        cache = DSATopKCache()
+        forward_context = DSAForwardContext()
+        cache = forward_context.topk_cache
 
         self.sparse_attention.train()
         self.sparse_attention.cuda()
@@ -3274,7 +3270,7 @@ class TestDSAttention:
                 attention_mask=None,
                 attn_mask_type=AttnMaskType.causal,
                 packed_seq_params=packed_seq_params,
-                dsa_topk_cache=cache,
+                dsa_forward_context=forward_context,
             )
 
         output = tensor_parallel.checkpoint(

@@ -23,7 +23,10 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+    PackedAllGatherCPLayout,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -249,6 +252,62 @@ def _validate_nonpacked_cp_uniform_length(
             "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
             f"got local query length {sq} and key length {skv} for cp_size={cp_size}."
         )
+
+
+def _get_packed_allgather_cp_layout(
+    dsa_forward_context: Optional[DSAForwardContext],
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    local_output_size: Optional[int],
+    key_local_output_size: Optional[int],
+    global_output_size: Optional[int],
+    *,
+    query_cu_seqlens_cover_output: bool = False,
+    key_cu_seqlens_cover_output: bool = False,
+) -> PackedAllGatherCPLayout:
+    """Build this microbatch's packed CP layout once, then reuse it across DSA layers."""
+    if dsa_forward_context is not None and dsa_forward_context.packed_cp_layout is not None:
+        layout = dsa_forward_context.packed_cp_layout
+        if (
+            (local_output_size is not None and layout.query_positions.numel() != local_output_size)
+            or (
+                global_output_size is not None
+                and layout.key_reorder_indices.numel() != global_output_size
+            )
+            or layout.query_positions.device != device
+            or layout.key_reorder_indices.device != device
+        ):
+            raise RuntimeError(
+                "DSA packed CP layout changed within one microbatch forward: "
+                f"cached query/reorder sizes="
+                f"({layout.query_positions.numel()}, {layout.key_reorder_indices.numel()}), "
+                f"requested=({local_output_size}, {global_output_size}), device={device}."
+            )
+        return layout
+
+    query_positions, key_reorder_indices = (
+        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            device=device,
+            local_output_size=local_output_size,
+            key_local_output_size=key_local_output_size,
+            global_output_size=global_output_size,
+            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+        )
+    )
+    layout = PackedAllGatherCPLayout(
+        query_positions=query_positions, key_reorder_indices=key_reorder_indices
+    )
+    if dsa_forward_context is not None:
+        dsa_forward_context.packed_cp_layout = layout
+    return layout
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -1668,7 +1727,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1684,11 +1743,12 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
-            dsa_topk_cache: Top-k state owned by this microbatch's forward execution.
+            dsa_forward_context: State shared by this microbatch's DSA layers.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        dsa_topk_cache = dsa_forward_context.topk_cache if dsa_forward_context is not None else None
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -1791,20 +1851,21 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-                    )
+                packed_cp_layout = _get_packed_allgather_cp_layout(
+                    dsa_forward_context=dsa_forward_context,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    device=query.device,
+                    local_output_size=packed_query_output_size,
+                    key_local_output_size=packed_query_output_size,
+                    global_output_size=packed_global_output_size,
+                    query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                    key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
                 )
+                packed_query_positions = packed_cp_layout.query_positions
+                kv_reorder_idx = packed_cp_layout.key_reorder_indices
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
@@ -1844,7 +1905,8 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                    layout = _get_packed_allgather_cp_layout(
+                        dsa_forward_context=dsa_forward_context,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_kv=cu_seqlens_kv,
                         cp_size=cp_size,
@@ -1854,7 +1916,7 @@ class DSAttention(MegatronModule):
                         key_local_output_size=local_len,
                         global_output_size=local_len * cp_size,
                     )
-                    return idx
+                    return layout.key_reorder_indices
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
                     sq=local_len, cp_size=cp_size, device=query.device
                 )

@@ -24,8 +24,6 @@ __all__ = [
     "normalize_cp_comm_type",
 ]
 
-_PACKED_CP_LAYOUT_CACHE_ATTR = "_mcore_packed_allgather_cp_layout_cache"
-
 
 @dataclass(frozen=True)
 class PackedCPIndexerLayout:
@@ -327,32 +325,7 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     rank0-local-packed, rank1-local-packed, ..., rank{cp_size-1}-local-packed.
     This helper returns the permutation that restores those gathered KV tensors
     to global packed order, matching the Slime GLM5 implementation semantics.
-
-    When query and key/value cu_seqlens are the same tensor, the result is cached
-    on that tensor. PackedSeqParams reuses it across attention layers and
-    activation recomputation, avoiding repeated GPU-to-host synchronization while
-    keeping the cache lifetime scoped to one microbatch.
     """
-    cache: Optional[dict[tuple[object, ...], Tuple[torch.Tensor, torch.Tensor]]] = None
-    cache_key: Optional[tuple[object, ...]] = None
-    if cu_seqlens_q is cu_seqlens_kv:
-        cache_key = (
-            cp_size,
-            cp_rank,
-            str(device),
-            local_output_size,
-            key_local_output_size,
-            global_output_size,
-            query_cu_seqlens_cover_output,
-            key_cu_seqlens_cover_output,
-            cu_seqlens_q._version,
-        )
-        cache = getattr(cu_seqlens_q, _PACKED_CP_LAYOUT_CACHE_ATTR, None)
-        if cache is not None:
-            cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
-
     query_positions = build_packed_allgather_cp_local_positions(
         cu_seqlens_q,
         cp_size,
@@ -381,13 +354,7 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
             f"Packed DSA CP key reorder length mismatch: got {key_reorder_idx.numel()}, "
             f"expected {global_output_size}"
         )
-    result = (query_positions, key_reorder_idx)
-    if cache_key is not None:
-        if cache is None:
-            cache = {}
-            setattr(cu_seqlens_q, _PACKED_CP_LAYOUT_CACHE_ATTR, cache)
-        cache[cache_key] = result
-    return result
+    return query_positions, key_reorder_idx
 
 
 def extract_query_positions_from_position_ids(
