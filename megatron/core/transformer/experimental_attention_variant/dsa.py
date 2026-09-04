@@ -254,62 +254,6 @@ def _validate_nonpacked_cp_uniform_length(
         )
 
 
-def _get_packed_allgather_cp_layout(
-    dsa_forward_context: Optional[DSAForwardContext],
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-    device: torch.device,
-    local_output_size: Optional[int],
-    key_local_output_size: Optional[int],
-    global_output_size: Optional[int],
-    *,
-    query_cu_seqlens_cover_output: bool = False,
-    key_cu_seqlens_cover_output: bool = False,
-) -> PackedAllGatherCPLayout:
-    """Build this microbatch's packed CP layout once, then reuse it across DSA layers."""
-    if dsa_forward_context is not None and dsa_forward_context.packed_cp_layout is not None:
-        layout = dsa_forward_context.packed_cp_layout
-        if (
-            (local_output_size is not None and layout.query_positions.numel() != local_output_size)
-            or (
-                global_output_size is not None
-                and layout.key_reorder_indices.numel() != global_output_size
-            )
-            or layout.query_positions.device != device
-            or layout.key_reorder_indices.device != device
-        ):
-            raise RuntimeError(
-                "DSA packed CP layout changed within one microbatch forward: "
-                f"cached query/reorder sizes="
-                f"({layout.query_positions.numel()}, {layout.key_reorder_indices.numel()}), "
-                f"requested=({local_output_size}, {global_output_size}), device={device}."
-            )
-        return layout
-
-    query_positions, key_reorder_indices = (
-        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            device=device,
-            local_output_size=local_output_size,
-            key_local_output_size=key_local_output_size,
-            global_output_size=global_output_size,
-            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-        )
-    )
-    layout = PackedAllGatherCPLayout(
-        query_positions=query_positions, key_reorder_indices=key_reorder_indices
-    )
-    if dsa_forward_context is not None:
-        dsa_forward_context.packed_cp_layout = layout
-    return layout
-
-
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
     Reference:
@@ -1820,25 +1764,7 @@ class DSAttention(MegatronModule):
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
-            if sequence_parallel_query_is_local and cp_size == 1:
-                row_start = sequence_parallel_tp_row_start
-                packed_query_positions = torch.arange(
-                    row_start, row_start + sq, dtype=torch.int64, device=query.device
-                )
-            elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
-                )
-                if sequence_parallel_query_is_local:
-                    row_start = sequence_parallel_tp_row_start
-                    packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
-                else:
-                    packed_query_positions = packed_query_positions_full
-            elif cp_size > 1:
+            if cp_size > 1:
                 # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
                 # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
                 query_cu_seqlens_cover_output = (
@@ -1851,21 +1777,43 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_cp_layout = _get_packed_allgather_cp_layout(
-                    dsa_forward_context=dsa_forward_context,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_kv,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                    device=query.device,
-                    local_output_size=packed_query_output_size,
-                    key_local_output_size=packed_query_output_size,
-                    global_output_size=packed_global_output_size,
-                    query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                    key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                packed_cp_layout = (
+                    dsa_forward_context.packed_cp_layout
+                    if dsa_forward_context is not None
+                    else None
                 )
+                if packed_cp_layout is None:
+                    query_positions, key_reorder_indices = (
+                        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                    )
+                    packed_cp_layout = PackedAllGatherCPLayout(
+                        query_positions=query_positions,
+                        key_reorder_indices=key_reorder_indices,
+                    )
+                    if dsa_forward_context is not None:
+                        dsa_forward_context.packed_cp_layout = packed_cp_layout
+
                 packed_query_positions = packed_cp_layout.query_positions
                 kv_reorder_idx = packed_cp_layout.key_reorder_indices
+                if sequence_parallel_query_is_local:
+                    row_start = sequence_parallel_tp_row_start
+                    packed_query_positions = packed_query_positions[row_start : row_start + sq]
+            elif sequence_parallel_query_is_local:
+                row_start = sequence_parallel_tp_row_start
+                packed_query_positions = torch.arange(
+                    row_start, row_start + sq, dtype=torch.int64, device=query.device
+                )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
@@ -1904,19 +1852,6 @@ class DSAttention(MegatronModule):
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
-                if packed_thd:
-                    layout = _get_packed_allgather_cp_layout(
-                        dsa_forward_context=dsa_forward_context,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
-                    )
-                    return layout.key_reorder_indices
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
                     sq=local_len, cp_size=cp_size, device=query.device
                 )

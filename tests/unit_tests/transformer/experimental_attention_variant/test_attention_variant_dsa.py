@@ -30,7 +30,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
-    _get_packed_allgather_cp_layout,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -1046,33 +1045,6 @@ class TestDSACPPositionHelpers:
         )
         restored = gathered_key_pos.index_select(0, key_reorder_idx)
         assert restored.tolist() == list(range(16))
-
-    def test_packed_allgather_cp_layout_is_reused_by_forward_context(self):
-        cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
-        forward_context = DSAForwardContext()
-        kwargs = dict(
-            dsa_forward_context=forward_context,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cp_size=2,
-            cp_rank=0,
-            device=torch.device("cpu"),
-            local_output_size=8,
-            key_local_output_size=8,
-            global_output_size=16,
-            query_cu_seqlens_cover_output=True,
-            key_cu_seqlens_cover_output=True,
-        )
-
-        first = _get_packed_allgather_cp_layout(**kwargs)
-        second = _get_packed_allgather_cp_layout(**kwargs)
-
-        assert first is second
-        assert forward_context.packed_cp_layout is first
-        with pytest.raises(RuntimeError, match="changed within one microbatch"):
-            _get_packed_allgather_cp_layout(
-                **{**kwargs, "local_output_size": 4, "global_output_size": 8}
-            )
 
     def test_cp_packed_zigzag_varlen_matches_dense_mask(self):
         """Packed zigzag CP query positions + gathered-KV reorder should match dense masking."""
@@ -2938,6 +2910,12 @@ class TestDSAttention:
         head_dim = self.config.hidden_size // num_heads
         seen = {}
         cp_group = _FakeCPGroup(cp_size, cp_rank)
+        layout_build_count = 0
+
+        def _counting_layout_builder(*args, **kwargs):
+            nonlocal layout_build_count
+            layout_build_count += 1
+            return build_packed_allgather_cp_query_positions_and_key_reorder(*args, **kwargs)
 
         def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
             q_indexer = torch.randn(key_seq_len, batch_size, 2, 4)
@@ -2986,6 +2964,11 @@ class TestDSAttention:
             "gather_from_sequence_parallel_region",
             _fake_gather_from_sequence_parallel_region,
         )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder",
+            _counting_layout_builder,
+        )
 
         was_training = self.sparse_attention.training
         self.sparse_attention.train()
@@ -2999,21 +2982,30 @@ class TestDSAttention:
             max_seqlen_q=global_seq_len,
             max_seqlen_kv=global_seq_len,
         )
+        forward_context = DSAForwardContext()
+        outputs = []
         try:
-            output = self.sparse_attention(
-                query=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                key=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                value=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
-                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
-                attention_mask=None,
-                attn_mask_type=AttnMaskType.causal,
-                packed_seq_params=packed_seq_params,
-            )
+            for _ in range(2):
+                outputs.append(
+                    self.sparse_attention(
+                        query=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        key=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        value=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                        qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                        attention_mask=None,
+                        attn_mask_type=AttnMaskType.causal,
+                        packed_seq_params=packed_seq_params,
+                        dsa_forward_context=forward_context,
+                    )
+                )
         finally:
             self.sparse_attention.train(was_training)
 
-        torch.testing.assert_close(output, expected_output)
+        for output in outputs:
+            torch.testing.assert_close(output, expected_output)
+        assert layout_build_count == 1
+        assert forward_context.packed_cp_layout is not None
         assert seen["loss_coeff"] == 0.0
         assert seen["q_indexer_len"] == key_seq_len
         assert seen["k_indexer_len"] == global_seq_len
