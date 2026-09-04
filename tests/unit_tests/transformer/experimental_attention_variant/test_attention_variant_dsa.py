@@ -694,11 +694,19 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config,
+            q,
+            k,
+            topk_indices,
+            1.0,
+            1,
+            topk_length,
+            all_rows_nonempty=True,
         )
         is expected_sparse
     )
-    assert seen["sparse_args"][-1] is topk_length
+    assert seen["sparse_args"][-2] is topk_length
+    assert seen["sparse_args"][-1] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(

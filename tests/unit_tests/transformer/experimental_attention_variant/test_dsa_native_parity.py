@@ -2183,6 +2183,48 @@ def test_cudnn_sparse_attention_uses_supplied_topk_length(monkeypatch):
     )
 
 
+def test_cudnn_sparse_attention_threads_nonempty_rows_to_backward(monkeypatch):
+    seen = {}
+
+    def fake_forward(query, kv_full, topk_indices, _softmax_scale, d_v, topk_length):
+        sq, b, num_heads, d = query.shape
+        q_flat = query.reshape(sq * b, num_heads, d)
+        kv_flat = kv_full.reshape(-1, kv_full.size(-1))
+        out_flat = query.new_zeros((sq * b, num_heads, d_v))
+        lse = query.new_zeros((sq * b, num_heads), dtype=torch.float32)
+        attn_sink = query.new_zeros((num_heads,))
+        global_idxs = topk_indices.reshape(sq * b, -1)
+        topk_length_flat = torch.full((sq * b,), topk_indices.size(-1), dtype=torch.int32)
+        return out_flat, lse, q_flat, kv_flat, attn_sink, global_idxs, topk_length_flat
+
+    def fake_backward(**kwargs):
+        seen["all_rows_nonempty"] = kwargs["all_rows_nonempty"]
+        return (
+            torch.zeros(
+                kwargs["sq"], kwargs["b"], kwargs["num_heads"], kwargs["d"]
+            ),
+            torch.zeros(kwargs["skv"], kwargs["b"], kwargs["kv_flat"].size(-1)),
+        )
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_run_sparse_attention_forward", fake_forward)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_run_sparse_attention_backward", fake_backward)
+
+    query = torch.randn(2, 1, 1, 4, requires_grad=True)
+    kv_full = torch.randn(3, 1, 4, requires_grad=True)
+    output = dsa_cudnn_kernels.FusedSparseAttentionFunc.apply(
+        query,
+        kv_full,
+        torch.zeros((1, 2, 2), dtype=torch.int32),
+        1.0,
+        2,
+        None,
+        True,
+    )
+    output.sum().backward()
+
+    assert seen["all_rows_nonempty"] is True
+
+
 def test_cudnn_sparse_attention_declines_unsupported_flashmla_value_dim(monkeypatch):
     def fail_flash_mla(*_args, **_kwargs):
         raise AssertionError("unsupported FlashMLA value dim must decline before FlashMLA")

@@ -120,8 +120,10 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[torch.Tensor] = None,
+    all_rows_nonempty: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run fused TileLang SparseMLA for absorbed DSA sparse attention."""
+    del all_rows_nonempty  # TileLang uses sentinel indices instead of backward row compaction.
     if topk_length is not None:
         if topk_indices.ndim != 3 or topk_length.shape != topk_indices.shape[:-1]:
             return None
