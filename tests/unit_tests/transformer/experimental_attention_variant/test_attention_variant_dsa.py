@@ -1042,6 +1042,43 @@ class TestDSACPPositionHelpers:
         restored = gathered_key_pos.index_select(0, key_reorder_idx)
         assert restored.tolist() == list(range(16))
 
+    def test_packed_allgather_cp_layout_cache_is_scoped_to_unchanged_cu_seqlens(self):
+        cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32)
+        kwargs = {
+            "cp_size": 2,
+            "cp_rank": 0,
+            "device": torch.device("cpu"),
+            "query_cu_seqlens_cover_output": True,
+            "key_cu_seqlens_cover_output": True,
+        }
+
+        first = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
+        )
+        second = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
+        )
+        assert first[0] is second[0]
+        assert first[1] is second[1]
+
+        cu_seqlens[1] = 8
+        after_mutation = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, **kwargs
+        )
+        assert after_mutation[0] is not first[0]
+        assert after_mutation[1] is not first[1]
+
+        distinct_q = cu_seqlens.clone()
+        distinct_kv = cu_seqlens.clone()
+        bypass_first = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=distinct_q, cu_seqlens_kv=distinct_kv, **kwargs
+        )
+        bypass_second = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=distinct_q, cu_seqlens_kv=distinct_kv, **kwargs
+        )
+        assert bypass_first[0] is not bypass_second[0]
+        assert bypass_first[1] is not bypass_second[1]
+
     def test_cp_packed_zigzag_varlen_matches_dense_mask(self):
         """Packed zigzag CP query positions + gathered-KV reorder should match dense masking."""
         cp_size, cp_rank = 2, 1
