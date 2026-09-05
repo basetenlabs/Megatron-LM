@@ -41,6 +41,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
     DSAForwardContext,
+    DSATopKCache,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_packed_allgather_cp_local_positions,
@@ -57,7 +58,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
