@@ -2573,6 +2573,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         softmax_scale: float,
         d_v: int,
         topk_length: Optional[Tensor],
+        all_rows_nonempty: bool,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
@@ -2591,6 +2592,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
+        ctx.all_rows_nonempty = all_rows_nonempty
 
         return out_flat.reshape(sq, b, num_heads, d_v)
 
@@ -2616,9 +2618,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
+            all_rows_nonempty=ctx.all_rows_nonempty,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        return grad_query, grad_kv_full, None, None, None, None, None
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2628,6 +2631,7 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
@@ -2645,7 +2649,13 @@ def run_fused_absorbed_sparse_attention(
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query,
+        kv_full,
+        topk_indices,
+        softmax_scale,
+        v_channels,
+        topk_length,
+        all_rows_nonempty,
     )
 
 

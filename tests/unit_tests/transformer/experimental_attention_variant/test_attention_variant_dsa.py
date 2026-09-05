@@ -39,6 +39,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
     unfused_dsa_fn,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+    DSATopKCache,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_packed_allgather_cp_local_positions,
     build_packed_allgather_cp_query_positions_and_key_reorder,
@@ -54,7 +58,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -182,7 +185,7 @@ class TestDSAIndexShareHelpers:
 
             def __call__(self, **kwargs):
                 hidden_states = kwargs["hidden_states"]
-                cache = kwargs["dsa_topk_cache"]
+                cache = kwargs["dsa_forward_context"].topk_cache
                 if torch.is_grad_enabled() and cache.is_recompute_layer_pending(
                     self.layer_number, self.layer_number
                 ):
@@ -226,6 +229,7 @@ class TestDSAIndexShareHelpers:
         second_indices = torch.tensor([2.0], requires_grad=True)
 
         for cache, indices in ((first_cache, first_indices), (second_cache, second_indices)):
+            forward_context = DSAForwardContext(topk_cache=cache)
             recompute_module.checkpointed_forward(
                 stack,
                 hidden_states=indices,
@@ -236,7 +240,7 @@ class TestDSAIndexShareHelpers:
                 attention_bias=None,
                 packed_seq_params=None,
                 use_inner_quantization_context=False,
-                transformer_layer_kwargs={"dsa_topk_cache": cache},
+                transformer_layer_kwargs={"dsa_forward_context": forward_context},
             )
 
         for function, args in reversed(pending_recomputes):
@@ -690,11 +694,19 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config,
+            q,
+            k,
+            topk_indices,
+            1.0,
+            1,
+            topk_length,
+            all_rows_nonempty=True,
         )
         is expected_sparse
     )
-    assert seen["sparse_args"][-1] is topk_length
+    assert seen["sparse_args"][-2] is topk_length
+    assert seen["sparse_args"][-1] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(
@@ -2906,6 +2918,12 @@ class TestDSAttention:
         head_dim = self.config.hidden_size // num_heads
         seen = {}
         cp_group = _FakeCPGroup(cp_size, cp_rank)
+        layout_build_count = 0
+
+        def _counting_layout_builder(*args, **kwargs):
+            nonlocal layout_build_count
+            layout_build_count += 1
+            return build_packed_allgather_cp_query_positions_and_key_reorder(*args, **kwargs)
 
         def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
             q_indexer = torch.randn(key_seq_len, batch_size, 2, 4)
@@ -2954,6 +2972,11 @@ class TestDSAttention:
             "gather_from_sequence_parallel_region",
             _fake_gather_from_sequence_parallel_region,
         )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder",
+            _counting_layout_builder,
+        )
 
         was_training = self.sparse_attention.training
         self.sparse_attention.train()
@@ -2967,21 +2990,30 @@ class TestDSAttention:
             max_seqlen_q=global_seq_len,
             max_seqlen_kv=global_seq_len,
         )
+        forward_context = DSAForwardContext()
+        outputs = []
         try:
-            output = self.sparse_attention(
-                query=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                key=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                value=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
-                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
-                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
-                attention_mask=None,
-                attn_mask_type=AttnMaskType.causal,
-                packed_seq_params=packed_seq_params,
-            )
+            for _ in range(2):
+                outputs.append(
+                    self.sparse_attention(
+                        query=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        key=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        value=torch.randn(key_seq_len, batch_size, num_heads, head_dim),
+                        x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                        qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                        attention_mask=None,
+                        attn_mask_type=AttnMaskType.causal,
+                        packed_seq_params=packed_seq_params,
+                        dsa_forward_context=forward_context,
+                    )
+                )
         finally:
             self.sparse_attention.train(was_training)
 
-        torch.testing.assert_close(output, expected_output)
+        for output in outputs:
+            torch.testing.assert_close(output, expected_output)
+        assert layout_build_count == 1
+        assert forward_context.packed_cp_layout is not None
         assert seen["loss_coeff"] == 0.0
         assert seen["q_indexer_len"] == key_seq_len
         assert seen["k_indexer_len"] == global_seq_len
@@ -3222,7 +3254,8 @@ class TestDSAttention:
             dtype=torch.bfloat16,
             device=device,
         )
-        cache = DSATopKCache()
+        forward_context = DSAForwardContext()
+        cache = forward_context.topk_cache
 
         self.sparse_attention.train()
         self.sparse_attention.cuda()
@@ -3237,7 +3270,7 @@ class TestDSAttention:
                 attention_mask=None,
                 attn_mask_type=AttnMaskType.causal,
                 packed_seq_params=packed_seq_params,
-                dsa_topk_cache=cache,
+                dsa_forward_context=forward_context,
             )
 
         output = tensor_parallel.checkpoint(

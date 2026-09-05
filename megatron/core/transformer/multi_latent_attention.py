@@ -80,7 +80,9 @@ else:
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
+    from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+        DSAForwardContext,
+    )
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -310,7 +312,7 @@ class MultiLatentAttention(Attention):
         packed_seq_params: PackedSeqParams | None = None,
         position_ids: torch.Tensor | None = None,
         sequence_len_offset: int | None = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
         *,
         inference_params: BaseInferenceContext | None = None,
     ):
@@ -376,7 +378,7 @@ class MultiLatentAttention(Attention):
             core_attention_extra_kwargs = {
                 "x": hidden_states,
                 "qr": q_compressed,
-                "dsa_topk_cache": dsa_topk_cache,
+                "dsa_forward_context": dsa_forward_context,
             }
 
         # ==================================

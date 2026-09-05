@@ -23,7 +23,10 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+    PackedAllGatherCPLayout,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -128,6 +131,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -155,6 +159,7 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
+                all_rows_nonempty=all_rows_nonempty,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
@@ -1668,7 +1673,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1684,11 +1689,12 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
-            dsa_topk_cache: Top-k state owned by this microbatch's forward execution.
+            dsa_forward_context: State shared by this microbatch's DSA layers.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        dsa_topk_cache = dsa_forward_context.topk_cache if dsa_forward_context is not None else None
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -1760,25 +1766,7 @@ class DSAttention(MegatronModule):
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
-            if sequence_parallel_query_is_local and cp_size == 1:
-                row_start = sequence_parallel_tp_row_start
-                packed_query_positions = torch.arange(
-                    row_start, row_start + sq, dtype=torch.int64, device=query.device
-                )
-            elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
-                )
-                if sequence_parallel_query_is_local:
-                    row_start = sequence_parallel_tp_row_start
-                    packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
-                else:
-                    packed_query_positions = packed_query_positions_full
-            elif cp_size > 1:
+            if cp_size > 1:
                 # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
                 # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
                 query_cu_seqlens_cover_output = (
@@ -1791,19 +1779,42 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                packed_cp_layout = (
+                    dsa_forward_context.packed_cp_layout
+                    if dsa_forward_context is not None
+                    else None
+                )
+                if packed_cp_layout is None:
+                    query_positions, key_reorder_indices = (
+                        dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
                     )
+                    packed_cp_layout = PackedAllGatherCPLayout(
+                        query_positions=query_positions,
+                        key_reorder_indices=key_reorder_indices,
+                    )
+                    if dsa_forward_context is not None:
+                        dsa_forward_context.packed_cp_layout = packed_cp_layout
+
+                packed_query_positions = packed_cp_layout.query_positions
+                kv_reorder_idx = packed_cp_layout.key_reorder_indices
+                if sequence_parallel_query_is_local:
+                    row_start = sequence_parallel_tp_row_start
+                    packed_query_positions = packed_query_positions[row_start : row_start + sq]
+            elif sequence_parallel_query_is_local:
+                row_start = sequence_parallel_tp_row_start
+                packed_query_positions = torch.arange(
+                    row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -1843,18 +1854,6 @@ class DSAttention(MegatronModule):
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
-                if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
-                    )
-                    return idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
                     sq=local_len, cp_size=cp_size, device=query.device
                 )
@@ -1977,6 +1976,9 @@ class DSAttention(MegatronModule):
             and varlen_ends is not None
             and key_positions is None
             and (self.indexer is None or self.indexer.supports_local_indexer_varlen)
+        )
+        all_sparse_attention_rows_nonempty = (
+            query_valid_rows is None and use_local_indexer_varlen
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -2368,6 +2370,7 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            all_rows_nonempty=all_sparse_attention_rows_nonempty,
         )
 
         if _dsa_full_recompute and _dsa_in_recompute and dsa_topk_cache is not None:
