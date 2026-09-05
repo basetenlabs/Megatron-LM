@@ -40,11 +40,13 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+)
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -467,7 +469,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -546,10 +548,10 @@ class HybridStack(MegatronModule):
             )
         else:
             sequence_len_offset = None
-        if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
-            dsa_topk_cache = DSATopKCache()
+        if dsa_forward_context is None and self.config.experimental_attention_variant == "dsa":
+            dsa_forward_context = DSAForwardContext()
         dsa_layer_kwargs = (
-            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+            {"dsa_forward_context": dsa_forward_context} if dsa_forward_context is not None else {}
         )
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),

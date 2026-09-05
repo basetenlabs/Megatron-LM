@@ -767,7 +767,7 @@ class AbsorbedMLASelfAttention(Attention):
         position_ids=None,
         attn_mask_type=None,
         packed_seq_params=None,
-        dsa_topk_cache=None,
+        dsa_forward_context=None,
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -791,7 +791,7 @@ class AbsorbedMLASelfAttention(Attention):
                 position_ids=position_ids,
                 attn_mask_type=attn_mask_type,
                 packed_seq_params=packed_seq_params,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
             return output_
 
@@ -826,7 +826,7 @@ class AbsorbedMLASelfAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
-        dsa_topk_cache=None,
+        dsa_forward_context=None,
         *,
         inference_params=None,
     ):
@@ -869,7 +869,7 @@ class AbsorbedMLASelfAttention(Attention):
                 v_up_weight,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
         else:
             core_attn_out = self.core_attention(
@@ -883,7 +883,7 @@ class AbsorbedMLASelfAttention(Attention):
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=self.attn_mask_type,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
 
         # ==================================

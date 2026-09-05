@@ -32,7 +32,9 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1740,13 +1742,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[torch.Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
         """
-        if dsa_topk_cache is None and self.config.experimental_attention_variant == "dsa":
-            dsa_topk_cache = DSATopKCache()
+        if dsa_forward_context is None and self.config.experimental_attention_variant == "dsa":
+            dsa_forward_context = DSAForwardContext()
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1780,7 +1782,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         packed_seq_params_by_layout=packed_seq_params_by_layout,
                         cp_layout_plan=cp_layout_plan,
-                        dsa_topk_cache=dsa_topk_cache,
+                        dsa_forward_context=dsa_forward_context,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1797,7 +1799,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
-                        dsa_topk_cache=dsa_topk_cache,
+                        dsa_forward_context=dsa_forward_context,
                     )
 
         if not self.mhc_enabled:
@@ -1893,7 +1895,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
+        dsa_forward_context: DSAForwardContext | None = None,
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
@@ -1940,7 +1942,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
 
         # Decide the outer quantization context, matching
@@ -2036,7 +2038,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -2111,8 +2113,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             decoder_input, hidden_states = self._get_precomputed_embeddings(
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
-        dsa_topk_cache = (
-            DSATopKCache() if self.config.experimental_attention_variant == "dsa" else None
+        dsa_forward_context = (
+            DSAForwardContext() if self.config.experimental_attention_variant == "dsa" else None
         )
 
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
@@ -2140,7 +2142,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -2159,7 +2161,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
+                dsa_forward_context=dsa_forward_context,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
