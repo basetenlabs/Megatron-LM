@@ -2865,6 +2865,7 @@ def unwrap_model(model, module_instances=None):
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            HAVE_MEGATRON_FSDP,
             FullyShardedDataParallelV1,
             FullyShardedDataParallelV2,
         )
@@ -2877,6 +2878,12 @@ def unwrap_model(model, module_instances=None):
             FullyShardedDataParallelV2,
             Float16Module,
         )
+        if HAVE_MEGATRON_FSDP:
+            from megatron.core.distributed.fsdp.mcore_fsdp_adapter import MegatronFSDP
+
+            # V1 wraps the model twice: adapter -> MegatronFSDP -> model.
+            # Stopping at the inner wrapper hides attributes such as post_process.
+            module_instances += (MegatronFSDP,)
 
     return_list = True
     if not isinstance(model, list):
