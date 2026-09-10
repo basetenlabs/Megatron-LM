@@ -1146,8 +1146,11 @@ class MegatronFSDP(torch.nn.Module):
         # Register root module pre- and post-backward hooks in cases where the
         # forward function of root module is not called, but rather the forward
         # function of the root module from named_modules() is called instead.
+        # Registering hooks does not change the parameter set. Avoid traversing
+        # all model parameters again for every descendant module.
+        root_param_count = sum(1 for _ in root_module.parameters())
         for name, module in root_module.named_modules():
-            if len(list(module.parameters())) != len(list(root_module.parameters())):
+            if sum(1 for _ in module.parameters()) != root_param_count:
                 # Only attach to root sub-module.
                 continue
             # Install the root pre-backward hook.
