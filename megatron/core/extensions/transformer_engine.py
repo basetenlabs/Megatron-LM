@@ -23,6 +23,7 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.frozen_grouped_mm import try_frozen_bf16_grouped_mm
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -2779,9 +2780,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = try_frozen_quantized_to_bf16_forward(
-                    self, x, m_splits, is_first_microbatch=_is_first_microbatch
-                )
+                out = try_frozen_bf16_grouped_mm(self, x, m_splits)
+                if out is not None:
+                    out = (out, None) if self.te_return_bias else out
+                else:
+                    out = try_frozen_quantized_to_bf16_forward(
+                        self, x, m_splits, is_first_microbatch=_is_first_microbatch
+                    )
                 if out is None:
                     out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False

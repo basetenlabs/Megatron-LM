@@ -118,6 +118,12 @@ class DistributedDataParallelConfig:
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
+    fsdp_param_gather_prefetch: bool = True
+    """Prefetch future FSDP units while gathering required parameters.
+    Disable lookahead to reduce peak memory without disabling required
+    asynchronous gathers or changing the gradient-reduction queue capacity.
+    """
+
     nccl_ub: bool = False
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
       This flag enables SM efficient nccl algorithm that could improve the performance

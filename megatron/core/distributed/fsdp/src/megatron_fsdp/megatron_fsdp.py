@@ -476,7 +476,7 @@ class MegatronFSDP(torch.nn.Module):
         # the model training weights to reflect the reduced gradient descent step.
         ag_pipeline.all_gather_params(
             params=params,
-            prefetch=prefetch,
+            prefetch=prefetch and self.ddp_config.fsdp_param_gather_prefetch,
             prefetch_order=prefetch_order,
             suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
             outer_fsdp_group_param_gather=(

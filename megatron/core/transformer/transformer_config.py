@@ -847,6 +847,12 @@ class TransformerConfig(ModelParallelConfig):
     ``moe_use_grouped_tensor=True`` to use its CUDA-graph-safe GroupedTensor path.
     """
 
+    moe_use_torch_grouped_mm: bool = False
+    """Experimental BF16 grouped-MM for frozen, contiguously FSDP-packed experts.
+    Requires TP1 and full activation recomputation; no new weight packing is
+    performed during forward or backward. Other grouped GEMMs remain on TE.
+    """
+
     moe_use_grouped_tensor: bool = False
     """Use Transformer Engine's native GroupedTensor path for grouped MoE GEMMs.
 
