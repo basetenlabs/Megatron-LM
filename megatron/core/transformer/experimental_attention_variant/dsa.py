@@ -2293,6 +2293,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk

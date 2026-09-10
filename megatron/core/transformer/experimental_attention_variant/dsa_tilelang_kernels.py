@@ -32,8 +32,10 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """Adapt TileLang's indices-only result to the shared backend hook contract."""
+    del varlen_is_plain_causal  # This backend already consumes explicit row bounds.
     topk_indices = tilelang_dsa.run_fused_qk_topk(
         q,
         k,

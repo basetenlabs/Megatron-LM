@@ -1132,6 +1132,7 @@ def _indexer_topk_bshd(
     packed_max_seqlen_q: Optional[int] = None,
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1179,7 +1180,28 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
-    if starts is None:
+    if (
+        varlen_is_plain_causal
+        and packed_cp_size == 1
+        and sq == sk
+        and not explicit_key_positions
+        and not return_scores
+    ):
+        # The mask builder proves these rows are ordinary causal self-attention.
+        # Preserve global query offsets while chunking, just as the packed CP
+        # route does; otherwise long CP1 sequences fall into per-head FP32 bmm.
+        # Do not infer this from CUDA bounds tensors (which would force a sync).
+        seq_lens = torch.arange(1, sq + 1, device=device, dtype=torch.int32).repeat(b)
+        topk_indices, topk_scores = _indexer_topk_from_score_chunks(
+            q_bshd,
+            k_bshd,
+            w_bsh,
+            seq_lens,
+            topk_k,
+            return_topk_scores,
+            bottom_right_key_start=0,
+        )
+    elif starts is None:
         q_idx = torch.arange(sq, device=device)
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
@@ -1369,6 +1391,7 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     _assert_supported_indexer_scoring(use_relu)
@@ -1408,6 +1431,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return topk_indices, topk_length
 
