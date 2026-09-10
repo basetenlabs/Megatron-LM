@@ -755,11 +755,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
             )
 
-        # Permutation 2: Sort tokens by local expert.
+        # Permutation 2: Sort tokens by local expert. With a single source rank,
+        # permutation 1 already groups tokens by expert; chunk sorting is identity.
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
-        if self.num_local_experts > 1:
+        if self.num_local_experts > 1 and (self.ep_size > 1 or self.tp_size > 1):
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
@@ -804,8 +805,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         This may involve un-sorting tokens and a Reduce-Scatter in the tensor
         parallel dimension.
         """
-        # Unpermutation 2: Unsort tokens by local expert.
-        if self.num_local_experts > 1:
+        # Undo the source-rank/expert transpose only when dispatch performed it.
+        if self.num_local_experts > 1 and (self.ep_size > 1 or self.tp_size > 1):
             if self.drop_and_pad:
                 hidden_states = (
                     hidden_states.view(
