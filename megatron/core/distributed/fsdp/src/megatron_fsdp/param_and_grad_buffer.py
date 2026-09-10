@@ -2900,10 +2900,22 @@ class ParamAndGradBuffer:
                         if not module_reset_flag.get(m_name, False):
                             old_params = list(m.parameters(recurse=False))
 
-                            # If the GPU memory over threshold, empty cache to leave
-                            # some memory for initialization of the model on the
-                            # CUDA device.
-                            if check_gpu_memory(threshold=0.5):
+                            # Persistent shards can legitimately exceed half of
+                            # device memory. A fixed utilization threshold would
+                            # then scan the entire Python heap and flush the CUDA
+                            # cache before every remaining module. Reclaim only
+                            # when materializing this module could exhaust free
+                            # memory, including reusable allocator cache.
+                            module_bytes = sum(
+                                param.numel() * param.element_size() for param in old_params
+                            )
+                            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                            reusable_bytes = max(
+                                0,
+                                torch.cuda.memory_reserved(self.device)
+                                - torch.cuda.memory_allocated(self.device),
+                            )
+                            if module_bytes > free_bytes + reusable_bytes:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
