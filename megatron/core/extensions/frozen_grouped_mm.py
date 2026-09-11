@@ -78,6 +78,6 @@ def try_frozen_bf16_grouped_mm(
     # Constructing a CUDA tensor directly from the CPU list synchronizes the
     # current stream after its H2D copy. Stage in pinned memory so expert work
     # stays asynchronous; PyTorch tracks the pinned allocation's copy lifetime.
-    offsets_cpu = torch.tensor(m_splits, dtype=torch.int32, pin_memory=True)
+    offsets_cpu = torch.tensor(m_splits, device="cpu", dtype=torch.int32, pin_memory=True)
     offsets = offsets_cpu.to(device=inp.device, non_blocking=True).cumsum(0, dtype=torch.int32)
     return _FrozenGroupedMM.apply(inp, offsets, module, module.num_gemms)
