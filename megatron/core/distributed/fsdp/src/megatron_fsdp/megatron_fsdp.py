@@ -491,9 +491,17 @@ class MegatronFSDP(torch.nn.Module):
             bwd=bwd,
         )
         if wait_bucket_ready:
+            ready_buckets = set()
             for param in params:
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                ag_pipeline.wait_bucket_ready(bucket_id, bwd)
+                # Readiness is bucket state, not parameter state. Keep each
+                # parameter's FP8 postprocessing in its original order.
+                if (
+                    not self.ddp_config.fsdp_cache_parameter_metadata
+                    or bucket_id not in ready_buckets
+                ):
+                    ag_pipeline.wait_bucket_ready(bucket_id, bwd)
+                    ready_buckets.add(bucket_id)
                 if bwd and is_float8tensor(param):
                     fp8_create_transpose_cache(param)
 
@@ -620,8 +628,14 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            for param in module.parameters():
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            bucket_ids = (
+                self.param_and_grad_buffer.param_to_param_group[p] for p in module.parameters()
+            )
+            if self.ddp_config.fsdp_cache_parameter_metadata:
+                # release_bucket changes bucket state on its first call; later
+                # calls for the same bucket are redundant (also for lazy release).
+                bucket_ids = dict.fromkeys(bucket_ids)
+            for bucket_id in bucket_ids:
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
