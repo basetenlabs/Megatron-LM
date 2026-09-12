@@ -1411,6 +1411,10 @@ class MegatronFSDP(torch.nn.Module):
     def _replace_param_with_distributed_if_needed(self):
         if self.is_param_fsdp_distributed:
             return
+        if self.ddp_config.fsdp_cache_parameter_metadata:
+            self._replace_cached_parameters(distributed=True)
+            self.is_param_fsdp_distributed = True
+            return
         self.is_param_fsdp_distributed = True
 
         pg_buffer = self.param_and_grad_buffer
@@ -1432,6 +1436,10 @@ class MegatronFSDP(torch.nn.Module):
     def _replace_param_with_raw_if_needed(self):
         if not self.is_param_fsdp_distributed:
             return
+        if self.ddp_config.fsdp_cache_parameter_metadata:
+            self._replace_cached_parameters(distributed=False)
+            self.is_param_fsdp_distributed = False
+            return
         self.is_param_fsdp_distributed = False
 
         for name, _ in self.module.named_parameters():
@@ -1444,6 +1452,36 @@ class MegatronFSDP(torch.nn.Module):
         pg_buffer = self.param_and_grad_buffer
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
         self._reestablish_shared_weights(fsdp_params, self.raw_param)
+
+    def _replace_cached_parameters(self, *, distributed: bool) -> None:
+        """Swap static parameter slots without resolving each dotted name again."""
+        bindings = getattr(self, "_cached_parameter_bindings", None)
+        if bindings is None:
+            fsdp_params = dict(self.param_and_grad_buffer.optimizer_named_parameters)
+            by_identity = {}
+            for name, raw in self.raw_param.items():
+                dist = fsdp_params[name]
+                raw._megatron_fsdp_model = self
+                dist._megatron_fsdp_model = self
+                dist.__fsdp_param__ = True
+                by_identity[id(raw)] = (raw, dist)
+                by_identity[id(dist)] = (raw, dist)
+            bindings = []
+            for owner in self.module.modules():
+                # Include aliases explicitly: named_parameters() suppresses
+                # tied parameters, requiring a second full traversal to fix up.
+                for name, param in owner._parameters.items():
+                    if param is None:
+                        continue
+                    raw, dist = by_identity[id(param)]
+                    bindings.append((owner, name, raw, dist))
+            self._cached_parameter_bindings = bindings
+        for owner, name, raw, dist in bindings:
+            current = owner._parameters.get(name)
+            if current is not raw and current is not dist:
+                raise RuntimeError("FSDP cached parameter topology changed after initialization")
+            # Keep Module.__setattr__ and registration-hook semantics intact.
+            setattr(owner, name, dist if distributed else raw)
 
     def _reestablish_shared_weights(self, old_params, new_params):
         """

@@ -1282,6 +1282,8 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self._cached_param_views = None
+        self._cached_param_views_key = None
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -1342,6 +1344,40 @@ class DataParallelBuffer:
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
+            allocator = self.temporary_bucket_allocator
+            cache_views = (
+                self.ddp_config.fsdp_cache_parameter_metadata
+                and dtype == torch.bfloat16
+                and isinstance(allocator, (FixedPoolAllocator, MaxPoolAllocator))
+                and allocator.fsdp_param_groups[self.bucket_id].fsdp_unit_id
+                in allocator.fsdp_double_buffer_units
+                and all(not p.requires_grad for p in self.params)
+            )
+            if cache_views:
+                # These allocators own persistent backing buffers independently
+                # of the views. Never retain views into dynamically freed buckets.
+                # Include storage identity and address: a pool may assign a
+                # different slot, or resize a storage, between fetches.
+                key = (
+                    bucket.data.untyped_storage()._cdata,
+                    bucket.data.data_ptr(),
+                    bucket.data.numel(),
+                    dtype,
+                )
+                if key != self._cached_param_views_key:
+                    self._cached_param_views = [
+                        (
+                            to_local_if_dtensor(p),
+                            self.get_item_from_bucket(bucket, self.param_idx[p]).view(
+                                to_local_if_dtensor(p).shape
+                            ),
+                        )
+                        for p in self.params
+                    ]
+                    self._cached_param_views_key = key
+                for p, data in self._cached_param_views:
+                    p.data = data
+                return bucket
             for p in self.params:
                 item_id = self.param_idx[p]
                 p = to_local_if_dtensor(p)

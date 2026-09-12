@@ -124,6 +124,12 @@ class DistributedDataParallelConfig:
     asynchronous gathers or changing the gradient-reduction queue capacity.
     """
 
+    fsdp_cache_parameter_metadata: bool = False
+    """Cache parameter owners and frozen BF16 views for static FSDP module trees.
+    Experimental host-overhead ablation; do not add/replace submodules after first use.
+    Communication, parameter swapping and gradient semantics are unchanged.
+    """
+
     nccl_ub: bool = False
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
       This flag enables SM efficient nccl algorithm that could improve the performance

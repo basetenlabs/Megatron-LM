@@ -83,6 +83,9 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_cache_parameter_metadata: bool = False
+    """Cache owners and persistent frozen BF16 views for static module trees."""
+
     fsdp_all_gather_in_start_param_sync: bool = True
     """
     If True, use all-gather during the initial Megatron-FSDP parameter
