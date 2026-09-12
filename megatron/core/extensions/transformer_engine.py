@@ -1,43 +1,47 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import inspect
 import io
 import os
 import pickle
+import re
 import warnings
-from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.frozen_grouped_mm import try_frozen_bf16_grouped_mm
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
-    get_expert_data_parallel_rank,
-    get_expert_model_parallel_rank,
-    get_expert_model_parallel_world_size,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
+from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -45,12 +49,15 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -62,16 +69,59 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
     HAVE_TE = True
 except ImportError:
-    from unittest.mock import MagicMock
+    if TYPE_CHECKING:
+        # For type checking, treat transformer_engine as always available.
+        import transformer_engine as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
-    te = MagicMock()
-    HAVE_TE = False
+        HAVE_TE = True
+    else:
+        from unittest.mock import MagicMock
+
+        te = MagicMock()
+        HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+_EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _set_expert_parameter_attributes(
+    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
+) -> None:
+    """Set process-group and tensor-partition metadata on an expert TE module.
+
+    ``allreduce=False`` selects the expert topology, including EDP for gradient reduction.
+
+    Weights and biases, including TEGroupedLinear's numbered parameters, are also marked as
+    TP-partitioned according to ``parallel_mode``; row-parallel biases remain replicated.
+
+    Any parameter which is partitioned along TP or ETP is marked with ``tensor_model_parallel``,
+    which ensures that all shards contribute to the gradient norm.
+
+    Args:
+        module: Transformer Engine module whose direct parameters should be marked.
+        parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
+        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/GTP/CP/DP.
+    """
+    for name, param in module.named_parameters(recurse=False):
+        param.allreduce = not use_expert_pgs
+
+        name_match = _EXPERT_PARAMETER_NAME_PATTERN.fullmatch(name)
+        parameter_kind = name_match.group(1) if name_match else None
+        is_weight = parameter_kind == "weight"
+        is_bias = parameter_kind == "bias"
+        is_partitioned = parallel_mode in ("column", "row") and (
+            is_weight or (parallel_mode == "column" and is_bias)
+        )
+        if is_weight or is_bias:
+            param.tensor_model_parallel = is_partitioned
+        if is_partitioned:
+            param.partition_dim = 1 if parallel_mode == "row" else 0
+            param.partition_stride = 1
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -115,6 +165,28 @@ class TEQuantizationRecipe:
     If an amax reduction is applicable, such as in per-tensor quantization recipe,
     whether to reduce only along TP groups.
     """
+    fp8_param: bool = False
+    """
+    If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
+    """
+    preserve_high_precision_init_val: Optional[bool] = None
+    """
+    Whether TE should retain a high-precision copy of initialized quantized parameters.
+    If None, preserve the existing behavior based on whether gradients are enabled.
+    """
+    fp8_block_scaling_fp32_scales: bool = False
+    """Whether blockwise FP8 should use unconstrained FP32 rather than power-of-two scales."""
+    fp4_param: bool = False
+    """
+    If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
+    """
+    nvfp4_disable_2d_quantization: bool = False
+    """
+    Whether to group NVFP4 scales over 16 elements along a row instead of TE's default
+    2D 16x16 blocks. A 2D block straddles 16 rows, so when the source checkpoint carries
+    its own per-row scales one destination block spans many source scales and precision
+    is lost. Leave unset to keep TE's behaviour.
+    """
 
     @classmethod
     def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
@@ -132,6 +204,29 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
+        if instance.preserve_high_precision_init_val is not None and not isinstance(
+            instance.preserve_high_precision_init_val, bool
+        ):
+            raise ValueError("preserve_high_precision_init_val must be a bool or None.")
+        boolean_options = ("fp8_block_scaling_fp32_scales", "nvfp4_disable_2d_quantization")
+        for option in boolean_options:
+            if not isinstance(getattr(instance, option), bool):
+                raise ValueError(f"{option} must be a bool.")
+        if (
+            instance.nvfp4_disable_2d_quantization
+            and instance.fp4_quantization_recipe != Fp4Recipe.nvfp4
+        ):
+            raise ValueError(
+                "nvfp4_disable_2d_quantization is only supported with the nvfp4 recipe."
+            )
+        if (
+            instance.fp8_block_scaling_fp32_scales
+            and instance.fp8_quantization_recipe != Fp8Recipe.blockwise
+        ):
+            raise ValueError(
+                "fp8_block_scaling_fp32_scales is only supported with blockwise FP8 "
+                "quantization."
+            )
         if (
             instance.fp8_quantization_recipe is not None
             and instance.fp4_quantization_recipe is not None
@@ -197,6 +292,82 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _get_nvfp4_block_scaling_recipe(qrecipe: TEQuantizationRecipe):
+    recipe_kwargs = {}
+    if qrecipe.nvfp4_disable_2d_quantization:
+        recipe_kwargs["disable_2d_quantization"] = True
+    return te.common.recipe.NVFP4BlockScaling(**recipe_kwargs)
+
+
+def _get_float8_block_scaling_recipe(qrecipe: TEQuantizationRecipe, fp8_format):
+    recipe_kwargs = {"fp8_format": fp8_format}
+    if qrecipe.fp8_block_scaling_fp32_scales:
+        recipe_kwargs.update(
+            fp8_quant_fwd_inp=te.common.recipe.QParams(power_2_scale=False),
+            fp8_quant_fwd_weight=te.common.recipe.QParams(power_2_scale=False),
+            fp8_quant_bwd_grad=te.common.recipe.QParams(power_2_scale=False),
+        )
+    return te.common.recipe.Float8BlockScaling(**recipe_kwargs)
+
+
+def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
+        enabled = False
+        quant_recipe = None
+    elif qrecipe.fp8_quantization_recipe is not None:
+        enabled = qrecipe.fp8_param
+        if qrecipe.fp8_format == "e4m3":
+            fp8_format = te.common.recipe.Format.E4M3
+        elif qrecipe.fp8_format == "hybrid":
+            fp8_format = te.common.recipe.Format.HYBRID
+        else:
+            raise ValueError(f"Unhandled fp8_format {qrecipe.fp8_format}")
+
+        if qrecipe.fp8_quantization_recipe == Fp8Recipe.custom:
+            from megatron.core.fp8_utils import _get_custom_recipe
+
+            assert qrecipe.custom_recipe_factory is not None
+            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
+            quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
+            quant_recipe = _get_float8_block_scaling_recipe(qrecipe, fp8_format)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
+            quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+        else:
+            raise ValueError(f"Unhandled fp8 recipe: {qrecipe.fp8_quantization_recipe}")
+    else:
+        # Fp4 configured.
+        enabled = qrecipe.fp4_param
+        if qrecipe.fp4_quantization_recipe == Fp4Recipe.custom:
+            from megatron.core.fp8_utils import _get_custom_recipe
+
+            assert qrecipe.custom_recipe_factory is not None
+            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+        elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
+            quant_recipe = _get_nvfp4_block_scaling_recipe(qrecipe)
+        else:
+            raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
+
+    preserve_high_precision_init_val = qrecipe.preserve_high_precision_init_val
+    if preserve_high_precision_init_val is None:
+        preserve_high_precision_init_val = torch.is_grad_enabled()
+    return fp8_model_init(
+        enabled=enabled,
+        recipe=quant_recipe,
+        preserve_high_precision_init_val=preserve_high_precision_init_val,
+    )
+
+
+def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    if qparams is None:
+        return nullcontext()
+    elif not training and qparams.evaluation_recipe is not None:
+        return _get_fp8_model_init_for_quant_recipe(qparams.evaluation_recipe)
+    else:
+        return _get_fp8_model_init_for_quant_recipe(qparams.training_recipe)
+
+
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
@@ -233,7 +404,7 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             if qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
                 quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
-                quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+                quant_recipe = _get_float8_block_scaling_recipe(qrecipe, fp8_format)
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
                 quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
             else:
@@ -241,9 +412,9 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             # Fp4 configured.
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-                quant_recipe = te.common.recipe.NVFP4BlockScaling()
+                quant_recipe = _get_nvfp4_block_scaling_recipe(qrecipe)
             else:
-                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
@@ -304,6 +475,90 @@ def _get_extra_te_kwargs(config: TransformerConfig):
 def condition_init_method(config, init_method):
     """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
+
+
+def _gtp_pre_init(
+    module,
+    output_size,
+    gtp_remat_group,
+    extra_kwargs,
+    *,
+    is_expert=False,
+    rng_via_kwarg=True,
+    out_split_size=1,
+):
+    """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
+    RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
+
+    ``out_split_size`` is the factor TE further splits ``out_features`` by AFTER GTP (=tp_size for
+    column-parallel, else 1). GTP pads the per-TP slice (``output_size // out_split_size``) so each
+    rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
+    post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
+    """
+    from megatron.core.tensor_parallel.gtp_api import gtp_remat_shard_dim0
+    from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
+
+    assert (
+        output_size % out_split_size == 0
+    ), f"_gtp_pre_init: output_size={output_size} not divisible by out_split_size={out_split_size}"
+    per_rank, pad_length = gtp_remat_shard_dim0(output_size // out_split_size, gtp_remat_group)
+    shard_out = per_rank * out_split_size
+    gtp_ctx = (gtp_remat_group, pad_length, output_size)
+
+    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
+    if rng_via_kwarg:
+        extra_kwargs["rng_tracker_name"] = tracker_name
+    else:
+        module.rng_tracker_name = tracker_name
+    return shard_out, gtp_ctx
+
+
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+    """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
+
+    ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
+    """
+    from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
+
+    gtp_remat_group, pad_length, logical_out_features = gtp_ctx
+    # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in
+    # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
+    # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
+    module.out_features = logical_out_features
+    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+
+
+@contextmanager
+def _init_gtp_remat_context(
+    module,
+    output_size,
+    gtp_remat_group,
+    extra_kwargs,
+    *,
+    is_expert=False,
+    is_grouped=False,
+    rng_via_kwarg=True,
+    out_split_size=1,
+):
+    """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
+    GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
+
+    ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
+    """
+    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
+        yield output_size
+        return
+    out_features, gtp_ctx = _gtp_pre_init(
+        module,
+        output_size,
+        gtp_remat_group,
+        extra_kwargs,
+        is_expert=is_expert,
+        rng_via_kwarg=rng_via_kwarg,
+        out_split_size=out_split_size,
+    )
+    yield out_features
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -425,41 +680,458 @@ else:
     TEActivationOp = None
 
 
+if HAVE_TE and is_te_min_version("1.13.0"):
+
+    class TEFusedOpsMixin:
+        """Shared lifecycle helpers for modules backed by TE fused ops.
+
+        Requirements and assumptions:
+        - The mixin must appear before the concrete module class in the MRO.
+        - Subclasses must call ``super().__init__`` so the mixin can initialize
+          the unregistered fused-ops cache.
+        - Subclasses must implement ``_make_fused_impl`` and return a
+          ``te.pytorch.ops.Sequential`` whose parameters alias parameters owned
+          by the registered MCore/TE modules.
+        - The fused implementation is built lazily on first forward, after the
+          concrete module has created its submodules and parameters.
+        - The fused implementation must not be registered as a PyTorch
+          submodule, because checkpointing and optimizer state should continue
+          to use the original module hierarchy as the source of truth.
+        - The fused implementation is an unregistered execution view over
+          registered source modules and parameters.
+        - Forward hooks on source modules are best-effort emulated on the fused
+          implementation. Hooks that modify tensors are unsupported because TE
+          fused ops do not expose intermediate tensors.
+        - Hooks, config, and source module replacement after first forward are
+          not reflected in the cached fused implementation. Call
+          ``_reset_fused_impl`` before the next forward after such changes.
+        """
+
+        _fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._fused_impl = None
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct the fused implementation."""
+            raise NotImplementedError
+
+        def _get_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Return the lazily-built fused implementation.
+
+            This owns cache initialization and hook registration for all fused
+            wrappers. The fused implementation is stored in a tuple so PyTorch
+            does not register the TE ops graph as a submodule with duplicate
+            parameters.
+            """
+            if self._fused_impl is None:
+                fused_impl = self._make_fused_impl()
+                self._register_hooks_on_fused_impl(fused_impl)
+                self._fused_impl = (fused_impl,)
+            return self._fused_impl[0]
+
+        def _reset_fused_impl(self) -> None:
+            """Discard the cached unregistered fused implementation.
+
+            This is intended for tests and for internal use after replacing
+            source modules, changing config that affects TE ops, or changing
+            hooks after the first forward.
+            """
+            self._fused_impl = None
+
+        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+            """
+
+            # Get submodule hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            backward_pre_hooks = []
+            backward_post_hooks = []
+            for submodule in self.modules():
+                for hook_id, hook in submodule._forward_pre_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
+                    forward_pre_hooks.append((submodule, hook, with_kwargs))
+                for hook_id, hook in submodule._forward_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
+                    forward_post_hooks.append((submodule, hook, with_kwargs))
+                for hook in submodule._backward_pre_hooks.values():
+                    backward_pre_hooks.append((submodule, hook))
+                for hook in submodule._backward_hooks.values():
+                    backward_post_hooks.append((submodule, hook))
+
+            module_name = self.__class__.__name__
+
+            # Pre-forward hooks
+            # Note: DDP pre-forward hooks are safe since they do not
+            # interact with input tensor.
+            if forward_pre_hooks:
+                from megatron.core.distributed import distributed_data_parallel
+
+                if any(
+                    inspect.getmodule(hook) != distributed_data_parallel
+                    for _, hook, _ in forward_pre_hooks
+                ):
+                    warnings.warn(
+                        f"{module_name} module has a submodule with a pre-forward hook. "
+                        f"{module_name} module does not expose intermediate tensors, "
+                        "so the hook may have incorrect behavior if it attempts to "
+                        "access the input tensor."
+                    )
+
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {})
+                        else:
+                            ret = hook(submodule, ())
+                        if ret is not None:
+                            raise RuntimeError(
+                                f"{module_name} module does not expose intermediate tensors, "
+                                "but submodule has pre-forward hook that modifies input tensor."
+                            )
+
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+            # Post-forward hooks
+            if forward_post_hooks:
+                warnings.warn(
+                    f"{module_name} module has a submodule with a post-forward hook. "
+                    f"{module_name} module does not expose intermediate tensors, "
+                    "so the hook may have incorrect behavior if it attempts to "
+                    "access the input or output tensors."
+                )
+
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook, with_kwargs in forward_post_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {}, None)
+                        else:
+                            ret = hook(submodule, (), None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                f"{module_name} module does not expose intermediate tensors, "
+                                "but submodule has post-forward hook that modifies output tensor."
+                            )
+
+                fused_impl.register_forward_hook(forward_post_hook)
+
+            # Backward hooks
+            if backward_pre_hooks:
+                raise RuntimeError(
+                    f"{module_name} module does not support submodules with pre-backward hooks"
+                )
+            if backward_post_hooks:
+                raise RuntimeError(
+                    f"{module_name} module does not support submodules with post-backward hooks"
+                )
+
+    def _te_ops_has_nested_attr(module: torch.nn.Module, attr_name: str) -> bool:
+        """Return whether an adapter input exposes a possibly-nested attribute."""
+        current: Any = module
+        for part in attr_name.split("."):
+            if not hasattr(current, part):
+                return False
+            current = getattr(current, part)
+        return True
+
+    def _validate_te_ops_adapter_module(
+        module: torch.nn.Module, module_name: str, required_attrs: Sequence[str]
+    ) -> None:
+        """Validate that a module has the MCore/TE wrapper attributes needed by an adapter."""
+        missing_attrs = [
+            attr for attr in required_attrs if not _te_ops_has_nested_attr(module, attr)
+        ]
+        if missing_attrs:
+            raise ValueError(
+                f"{module_name} must be a Megatron Core Transformer Engine wrapper, "
+                f"but got {module.__class__.__name__} with missing required attributes: "
+                f"{', '.join(missing_attrs)}."
+            )
+
+    def _get_te_ops_tensor_parallel_context() -> (
+        Tuple[int, Optional[torch.distributed.ProcessGroup]]
+    ):
+        """Return tensor-parallel world size and group for TE ops."""
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_group = None
+        if tp_world_size > 1:
+            tp_group = get_tensor_model_parallel_group()
+        return tp_world_size, tp_group
+
+    def _get_te_ops_rng_state_tracker_function() -> Optional[Callable]:
+        """Return the CUDA RNG tracker function if it is initialized."""
+        if get_cuda_rng_tracker().is_initialized():
+            return get_cuda_rng_tracker
+        return None
+
+    def _make_te_ops_rmsnorm_from_te_rmsnorm(
+        module: torch.nn.Module, module_name: str
+    ) -> te.pytorch.ops.RMSNorm:
+        """Construct a TE RMSNorm op that aliases an existing TE RMSNorm module."""
+        _validate_te_ops_adapter_module(
+            module, module_name, ("eps", "weight", "zero_centered_gamma")
+        )
+
+        kwargs = {
+            "eps": module.eps,
+            "device": "meta",
+            "dtype": module.weight.dtype,
+            "zero_centered_gamma": module.zero_centered_gamma,
+        }
+        if hasattr(module, '_sm_margins'):
+            kwargs["sm_margin"] = module._sm_margins
+
+        op = te.pytorch.ops.RMSNorm(module.weight.shape, **kwargs)
+        op.weight = module.weight
+        return op
+
+    def _make_te_ops_norm_from_mcore_te_layernorm_linear(
+        module: torch.nn.Module, module_name: str
+    ) -> te.pytorch.ops.FusibleOperation:
+        """Construct a TE norm op that aliases a Megatron TE LayerNormLinear wrapper."""
+        _validate_te_ops_adapter_module(
+            module,
+            module_name,
+            (
+                "eps",
+                "layer_norm_bias",
+                "layer_norm_weight",
+                "normalization",
+                "weight",
+                "zero_centered_gamma",
+            ),
+        )
+
+        norm_type = module.normalization
+        norm_shape = module.weight.size(1)
+        kwargs = {
+            "eps": module.eps,
+            "device": "meta",
+            "dtype": module.layer_norm_weight.dtype,
+            "zero_centered_gamma": module.zero_centered_gamma,
+        }
+
+        if norm_type == "LayerNorm":
+            op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
+            op.weight = module.layer_norm_weight
+            op.bias = module.layer_norm_bias
+        elif norm_type == "RMSNorm":
+            op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
+            op.weight = module.layer_norm_weight
+        else:
+            raise ValueError(f"Unsupported normalization ({norm_type})")
+        return op
+
+    def _make_te_ops_basic_linear_from_mcore_te_linear(
+        module: torch.nn.Module,
+        *,
+        module_name: str,
+        output_features: Optional[int] = None,
+        tensor_parallel_mode: Optional[str] = None,
+        tensor_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sequence_parallel: Optional[bool] = None,
+        rng_state_tracker_function: Optional[Callable] = None,
+    ) -> te.pytorch.ops.BasicLinear:
+        """Construct a TE BasicLinear op that aliases a Megatron TE linear wrapper."""
+        _validate_te_ops_adapter_module(
+            module,
+            module_name,
+            ("config.tp_comm_overlap", "fuse_wgrad_accumulation", "ub_name", "weight"),
+        )
+
+        weight = module.weight
+        userbuffers_options = None
+        if module.config.tp_comm_overlap and module.ub_name is not None:
+            userbuffers_options = {"comm_name": module.ub_name}
+        if output_features is None:
+            output_features = weight.size(0)
+        if sequence_parallel is None:
+            sequence_parallel = False
+
+        op = te.pytorch.ops.BasicLinear(
+            weight.size(1),
+            output_features,
+            device="meta",
+            dtype=weight.dtype,
+            tensor_parallel_mode=tensor_parallel_mode,
+            tensor_parallel_group=tensor_parallel_group,
+            sequence_parallel=sequence_parallel,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=module.fuse_wgrad_accumulation,
+            userbuffers_options=userbuffers_options,
+        )
+        op.weight = weight
+        return op
+
+    def _make_te_ops_bias_from_tensor(
+        bias: Optional[torch.Tensor],
+    ) -> Optional[te.pytorch.ops.Bias]:
+        """Construct a TE Bias op that aliases an existing bias tensor."""
+        if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+            bias = None
+        if bias is None:
+            return None
+
+        op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
+        op.bias = bias
+        return op
+
+    def _make_te_ops_activation(
+        activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
+    ) -> te.pytorch.ops.FusibleOperation:
+        """Construct a TE activation op."""
+        op_type = None
+        if (activation_func, gated_linear_unit) == (F.gelu, False):
+            op_type = te.pytorch.ops.GELU
+        elif (activation_func, gated_linear_unit) == (F.gelu, True):
+            op_type = te.pytorch.ops.GEGLU
+        elif (activation_func, gated_linear_unit) == (F.silu, False):
+            if not is_te_min_version("2.8.0"):
+                raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
+            op_type = te.pytorch.ops.SiLU
+        elif (activation_func, gated_linear_unit) == (F.silu, True):
+            op_type = te.pytorch.ops.SwiGLU
+        elif (activation_func, gated_linear_unit) == (F.relu, False):
+            op_type = te.pytorch.ops.ReLU
+        elif (activation_func, gated_linear_unit) == (F.relu, True):
+            op_type = te.pytorch.ops.ReGLU
+
+        if op_type is None:
+            raise NotImplementedError(
+                "Transformer Engine operation-based API does not support "
+                f"activation_func={activation_func}, "
+                f"gated_linear_unit={gated_linear_unit}"
+            )
+
+        kwargs = {}
+        if is_te_min_version("2.3"):
+            kwargs["cache_quantized_input"] = cache_quantized_input
+        return op_type(**kwargs)
+
+    class TEFusedResidualRMSNorm(TEFusedOpsMixin, te.pytorch.RMSNorm):
+        """
+        RMSNorm with fused residual output for Megatron Core.
+
+        Inherits from te.pytorch.RMSNorm to maintain all parameter management,
+        checkpoint compatibility, and Megatron-specific features. Creates a fused
+        implementation using TE's ops API that shares the base class parameters.
+
+        The fused implementation uses:
+        - MakeExtraOutput: Forks the residual connection
+        - RMSNorm: Normalizes the main path
+
+        Forward pass returns: (normalized_output, residual)
+        """
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """
+            Construct fused ops pipeline that shares parameters with base RMSNorm.
+
+            Creates MakeExtraOutput + RMSNorm ops, where the RMSNorm op shares
+            the weight parameter with self.weight from the base class.
+            """
+
+            fused_impl = te.pytorch.ops.Sequential()
+
+            # Op 1: MakeExtraOutput - forks the residual
+            fused_impl.append(te.pytorch.ops.MakeExtraOutput())
+
+            # Op 2: RMSNorm - shares weight parameter with self
+            fused_impl.append(
+                _make_te_ops_rmsnorm_from_te_rmsnorm(self, module_name=self.__class__.__name__)
+            )
+
+            return fused_impl
+
+        def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            """
+            Forward pass with fused residual output.
+
+            Args:
+                hidden_states: Input tensor [s, b, h]
+
+            Returns:
+                Tuple of (normalized_output, residual), both [s, b, h]
+
+            Note:
+                Sequential.forward() automatically returns (output, extra_outputs...)
+                when MakeExtraOutput is present, so we don't need manual unpacking.
+            """
+
+            # Apply fused implementation
+            # Sequential returns (normalized_output, residual) automatically
+            return self._get_fused_impl()(hidden_states)
+
+else:
+    TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
-    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
+    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
+
+    Residual fusion is a two-level opt-in mechanism:
+
+    1. Global capability: config.fused_residual_rmsnorm must be True (enables the feature)
+    2. Local intent: has_residual=True must be passed at build site (declares this specific
+       norm is followed by a residual connection)
+
+    Fusion only happens when BOTH conditions are met.
+
+    """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        has_residual: bool = False,
+    ):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
 
+        use_fused_residual = config.fused_residual_rmsnorm and has_residual
+        if use_fused_residual and config.normalization != "RMSNorm":
+            raise ValueError("Fused residual is only supported " "for RMSNorm normalization")
+
         if config.normalization == "LayerNorm":
-            instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
-            )
+            norm_module = te.pytorch.LayerNorm
         elif config.normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
-            )
+            if use_fused_residual:
+                assert (
+                    TEFusedResidualRMSNorm is not None
+                ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
+                norm_module = TEFusedResidualRMSNorm
+            else:
+                norm_module = te.pytorch.RMSNorm
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
-        return instance
+        instance = norm_module(
+            normalized_shape=hidden_size,
+            eps=eps,
+            sequence_parallel=config.sequence_parallel,
+            zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            **_get_extra_te_kwargs(config),
+        )
+
+        instance.returns_residual = use_fused_residual
+        return cast(LayerNormInterface, instance)
 
 
 class TELinear(te.pytorch.Linear):
@@ -483,7 +1155,7 @@ class TELinear(te.pytorch.Linear):
         output_size: int,
         *,
         parallel_mode: Optional[str],
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
@@ -492,7 +1164,13 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -522,6 +1200,7 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -582,6 +1261,11 @@ class TELinear(te.pytorch.Linear):
             tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
+        use_expert_pgs = is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
+        )
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
@@ -593,9 +1277,10 @@ class TELinear(te.pytorch.Linear):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         te_parallel_mode = parallel_mode
+        tp_group_for_te = tp_group
         if parallel_mode == "duplicated":
             # Handle non-parallel case
-            tp_group = None
+            tp_group_for_te = None
             tp_size = 1
             explicit_expert_comm = False
             te_parallel_mode = None
@@ -610,38 +1295,57 @@ class TELinear(te.pytorch.Linear):
                     input_size = divide(input_size, tp_size)
                 te_parallel_mode = None
                 tp_size = 1
-                tp_group = None
+                tp_group_for_te = None
 
-        super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            sequence_parallel=self.config.sequence_parallel,
-            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            # Pass None if not initialized for backward compatibility with the ckpt converter.
-            tp_group=tp_group if torch.distributed.is_initialized() else None,
-            tp_size=tp_size,
-            get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-            ),
-            init_method=condition_init_method(config, init_method),
-            bias=bias,
-            return_bias=self.te_return_bias,
-            parallel_mode=te_parallel_mode,
-            **extra_kwargs,
-        )
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            is_expert=is_expert,
+            out_split_size=tp_size if te_parallel_mode == "column" else 1,
+        )
 
-        for param in self.parameters():
-            if is_expert:
-                # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, "allreduce", not self.expert_parallel)
-            else:
+        with init_quant_context, init_gtp_remat_context as output_size:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                sequence_parallel=self.config.sequence_parallel,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                # Pass None if not initialized for backward compatibility with the ckpt converter.
+                tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
+                tp_size=tp_size,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                return_bias=self.te_return_bias,
+                parallel_mode=te_parallel_mode,
+                **extra_kwargs,
+            )
+
+        if is_expert:
+            _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
+        else:
+            for param in self.parameters():
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
                 if parallel_mode == "duplicated":
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                    # Mark as NOT tensor parallel since weight is duplicated
+                    setattr(param, "tensor_model_parallel", False)
+
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -656,7 +1360,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, self.training, is_context_quantized
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -683,7 +1387,14 @@ class TELinear(te.pytorch.Linear):
             self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
@@ -709,7 +1420,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
+        name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -731,6 +1451,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -799,30 +1520,56 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            eps=self.config.layernorm_epsilon,
-            sequence_parallel=self.config.sequence_parallel,
-            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=tp_group if torch.distributed.is_initialized() else None,
-            tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-            ),
-            init_method=(
-                condition_init_method(config, init_method)
-                if not config.use_cpu_initialization
-                else lambda w: None
-            ),
-            bias=bias,
-            return_bias=self.te_return_bias,
-            parallel_mode="column",
-            return_layernorm_output=False,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            **extra_kwargs,
-        )
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        self.stride = stride
+
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+        # Yield a separate gtp_output_size: the logical output_size is reused below for cpu-init
+        # (divide(output_size, tp_size)), so it must stay unsharded.
+        # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            out_split_size=self.tp_size,
+        )
+
+        with init_quant_context, init_gtp_remat_context as gtp_output_size:
+            super().__init__(
+                in_features=input_size,
+                out_features=gtp_output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=self.config.sequence_parallel,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=tp_group if torch.distributed.is_initialized() else None,
+                tp_size=self.config.tensor_model_parallel_size,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=(
+                    condition_init_method(config, init_method)
+                    if not config.use_cpu_initialization
+                    else lambda w: None
+                ),
+                bias=bias,
+                return_bias=self.te_return_bias,
+                parallel_mode="column",
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
+
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
@@ -833,7 +1580,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=self.tp_rank,
                 world_size=self.tp_size,
@@ -843,7 +1590,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
@@ -868,6 +1615,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
+        # FP32 residual connections pass the FP32 residual stream into this fused module, but
+        # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
+        # torch.autocast. Tensor.to() is out-of-place, so this only narrows the local norm/linear
+        # input; the residual tensor retained by TransformerLayer remains FP32.
+        if x.dtype != self.layer_norm_weight.dtype:
+            x = x.to(self.layer_norm_weight.dtype)
+
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
@@ -882,15 +1636,30 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
@@ -908,7 +1677,7 @@ class TEColumnParallelLinear(TELinear):
         input_size: int,
         output_size: int,
         *,
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         gather_output: bool,
         bias: bool,
@@ -917,7 +1686,16 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
+        name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -927,8 +1705,11 @@ class TEColumnParallelLinear(TELinear):
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
+        self.stride = stride
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -947,7 +1728,14 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
+            gtp_remat_group=gtp_remat_group,
         )
+
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, world_size)
@@ -958,7 +1746,7 @@ class TEColumnParallelLinear(TELinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=rank,
                 world_size=world_size,
@@ -968,28 +1756,182 @@ class TEColumnParallelLinear(TELinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
+
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
+            )
+            _set_expert_parameter_attributes(self, "column", use_expert_pgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
+
+
+class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
+    """Wrapper for ``TEColumnParallelLinear`` used as the LM-head output projection under MXFP8.
+
+    Drop-in replacement for the ``tensor_parallel.ColumnParallelLinear`` LM head:
+    ``delay_wgrad_compute`` is forced off to mirror its no-op ``backward_dw``,
+    and ``get/set_extra_state`` match the bf16 LM head's state-dict shim. The
+    LM-head kwargs ``keep_master_weight_for_test``, ``skip_weight_param_allocation``,
+    ``defer_embedding_wgrad_compute`` buffers, ``disable_grad_reduce``, and ``output_dtype`` are
+    accepted to preserve the ``ColumnParallelLinear`` signature but currently
+    raise when set non-default — TE will not support them natively, so they
+    would have to be implemented in this subclass, which has not been done yet.
+
+    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        config,
+        init_method,
+        bias=True,
+        gather_output=False,
+        stride=1,
+        keep_master_weight_for_test=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation: bool = False,
+        embedding_activation_buffer=None,
+        grad_output_buffer=None,
+        is_expert: bool = False,
+        tp_comm_buffer_name: Optional[str] = None,
+        disable_grad_reduce: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        output_dtype: Optional[torch.dtype] = None,
+    ):
+        from megatron.core.fp8_utils import is_mxfp8_output_proj_active
+
+        if not is_mxfp8_output_proj_active(config):
+            raise RuntimeError(
+                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, "
+                "fp8=True, and fp8_recipe='mxfp8'."
+            )
+        if keep_master_weight_for_test:
+            raise ValueError("TE output projection does not support keep_master_weight_for_test.")
+        if skip_weight_param_allocation:
+            raise ValueError("TE output projection does not support skip_weight_param_allocation.")
+        if embedding_activation_buffer is not None or grad_output_buffer is not None:
+            raise ValueError(
+                "TE MXFP8 output projection does not support defer_embedding_wgrad_compute."
+            )
+        if disable_grad_reduce:
+            raise ValueError("TE output projection does not support disable_grad_reduce.")
+        if output_dtype is not None:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
+
+        te_config = copy.copy(config)
+        # Match ColumnParallelLinear.backward_dw's no-op so the LM head keeps
+        # the same wgrad-timing behavior it had before this subclass existed.
+        te_config.delay_wgrad_compute = False
+
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            config=te_config,
+            init_method=init_method,
+            gather_output=False,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+            stride=stride,
+        )
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.output_size_per_partition = divide(output_size, self.tp_size)
+        self.gather_output = gather_output
+        self.skip_bias_add = skip_bias_add
+        self.embedding_activation_buffer = None
+        self.grad_output_buffer = None
+        self.disable_grad_reduce = False
+        self.tp_group = self._tp_group
+
+        self._register_load_state_dict_pre_hook(
+            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
+                f"{prefix}_extra_state"
+            )
+        )
+
+    def get_extra_state(self):
+        """Return None to match ``ColumnParallelLinear``'s no-extra-state shim.
+
+        Keeps the LM-head state dict compatible across the bf16 / MXFP8 swap.
+        """
+        return None
+
+    def set_extra_state(self, state):
+        """No-op to match ``ColumnParallelLinear.set_extra_state`` (ignored)."""
+        return
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+    ):
+        """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
+        from megatron.core.fp8_utils import get_fp8_context
+
+        if weight is not None and weight is not self.weight:
+            raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
+
+        with get_fp8_context(self.config):
+            torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
+            try:
+                output_parallel, output_bias = super().forward(input_)
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+        gather_output = self.gather_output
+        if runtime_gather_output is not None:
+            gather_output = runtime_gather_output
+        if gather_output:
+            output = gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+        else:
+            output = output_parallel
+        return output, output_bias
 
 
 class TERowParallelLinear(TELinear):
@@ -1001,7 +1943,7 @@ class TERowParallelLinear(TELinear):
         input_size: int,
         output_size: int,
         *,
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         bias: bool,
         input_is_parallel: bool,
@@ -1009,7 +1951,15 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1021,6 +1971,8 @@ class TERowParallelLinear(TELinear):
                 "Transformer Engine linear layers do not support input_is_parallel = False"
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1040,6 +1992,8 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
+            gtp_remat_group=gtp_remat_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1067,17 +2021,39 @@ class TERowParallelLinear(TELinear):
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
 
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
+            )
+            _set_expert_parameter_attributes(self, "row", use_expert_pgs)
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 1},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
+            + (
+                f", GTP_remat={self.weight.gtp_remat_size}"
+                if getattr(self.weight, "gtp_remat_size", None) is not None
+                else ""
+            )
         )
 
     def backward_dw(self):
@@ -1108,8 +2084,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         num_splits: Optional[int] = None,
-        cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = "p2p",
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1163,6 +2139,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 assert hasattr(
                     pg_collection, "hcp"
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+        self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -1238,6 +2215,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
+
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
             # copies (#555)
@@ -1251,6 +2229,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
+
+        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        self.kept_packed_seq_params.discard("total_tokens")
+        self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("tokens_per_sample")
+        self.kept_packed_seq_params.discard("cp_scatter_cache")
+
+        if get_te_version() < PkgVersion("2.2.0"):
+            self.kept_packed_seq_params.discard("pad_between_seqs")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1282,13 +2270,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Optional[Tensor],
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
-    ):
+    ) -> torch.Tensor:
         """Forward."""
+        if packed_seq_params is not None:
+            # If Dynamic CP group is provided, update TE DPA CP group
+            if packed_seq_params.cp_group is not None:
+                self.cp_group = packed_seq_params.cp_group
+                super().set_context_parallel_group(
+                    self.cp_group,
+                    torch.distributed.get_process_group_ranks(self.cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            # If cp_group is None but local_cp_size is provided,
+            # Indicates to turn off CP dynamically
+            elif packed_seq_params.local_cp_size is not None:
+                assert (
+                    packed_seq_params.local_cp_size == 1
+                ), "local_cp_size must be == 1 if provided without cp_group"
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("local_cp_size")
+
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:
             num_splits = self.num_splits
@@ -1303,6 +2311,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+
+        # Released TE mis-detects tail-only padding as "no padding", which
+        # under context parallelism silently corrupts chunk-boundary rows.
+        # Pass the answer explicitly instead of relying on TE's auto-detect.
+        # Details: basetenlabs/Megatron-LM#25.
+        if qkv_format == "thd" and self.config.context_parallel_size > 1:
+            cu_q = packed_seq_kwargs.get("cu_seqlens_q")
+            cu_q_padded = packed_seq_kwargs.get("cu_seqlens_q_padded")
+            cu_kv = packed_seq_kwargs.get("cu_seqlens_kv")
+            cu_kv_padded = packed_seq_kwargs.get("cu_seqlens_kv_padded")
+            if (
+                cu_q_padded is not None and cu_q is not None and not torch.equal(cu_q_padded, cu_q)
+            ) or (
+                cu_kv_padded is not None
+                and cu_kv is not None
+                and not torch.equal(cu_kv_padded, cu_kv)
+            ):
+                packed_seq_kwargs["pad_between_seqs"] = True
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -1344,6 +2370,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 # Update Q K outside of TE Attention API
                 core_attn_out, batch_max_attention_logits = core_attn_out
 
+                # The max attention logit is only used as a statistic for qk-clip
+                # and logging, so it never needs gradients. Detach it from the
+                # autograd graph, otherwise accumulating it into
+                # current_max_attn_logits keeps every batch's attention forward
+                # graph alive and leaks memory (most visibly when only
+                # log_max_attention_logit is set and clip_qk() never resets it).
+                batch_max_attention_logits = batch_max_attention_logits.detach()
+
                 # Update QK_Clip balancing eta
                 if self.current_max_attn_logits is None:
                     self.current_max_attn_logits = batch_max_attention_logits
@@ -1372,11 +2406,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+
+    from megatron.core.extensions.transformer_engine_frozen_quantized import (
+        try_frozen_quantized_to_bf16_forward,
+    )
+
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
+        "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+    )
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
@@ -1400,8 +2447,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             self.config = config
 
             # TE returns a zero length Tensor when bias=False and
@@ -1415,9 +2467,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
-            if self.config.delay_wgrad_compute:
+            self.delay_wgrad_compute = (
+                self.config.delay_wgrad_compute
+                or self.config.overlap_dispatch_backward_with_experts_wgrad
+            )
+            if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                    extra_kwargs["delay_wgrad_compute"] = True
                 else:
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
@@ -1426,15 +2482,33 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
+            use_expert_pgs = is_expert and (
+                self.expert_parallel
+                or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+                or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
+            )
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+            if pg_collection is None:
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            self._pg_collection = pg_collection
+            assert is_expert, "TEGroupedLinear only supports expert parallelism"
+            tp_group = pg_collection.expt_tp
+            self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
-
+            tp_group_for_te = tp_group
+            gtp_remat_group = pg_collection.expt_gtp_remat
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
+
+            # Save original parallel_mode before clearing it for explicit_expert_comm.
+            # When explicit_expert_comm is True, Megatron handles TP communication externally
+            # and passes parallel_mode=None to TE. This causes TE to set partition_dim=0 on
+            # all weights (its default for non-parallel mode). We need to fix this after init
+            # so that refit/resharding can correctly identify which dimension is TP-partitioned.
+            original_parallel_mode = parallel_mode
 
             if self.explicit_expert_comm:
                 if parallel_mode == "column":
@@ -1443,28 +2517,87 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     input_size = divide(input_size, tp_size)
                 parallel_mode = None
                 tp_size = 1
-                tp_group = None
+                tp_group_for_te = None
 
-            super().__init__(
-                num_gemms=num_gemms,
-                in_features=input_size,
-                out_features=output_size,
-                sequence_parallel=self.config.sequence_parallel,
-                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-                tp_group=tp_group if torch.distributed.is_initialized() else None,
-                tp_size=tp_size,
-                get_rng_state_tracker=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-                ),
-                init_method=condition_init_method(config, init_method),
-                bias=bias,
-                return_bias=self.te_return_bias,
-                parallel_mode=parallel_mode,
-                **extra_kwargs,
-            )
+            if is_te_min_version("2.14.0"):
+                # Some TE 2.14 builds predate these keyword arguments. Cache the
+                # installed constructor signature instead of relying on the version alone.
+                global _TE_GROUPED_LINEAR_INIT_PARAMS
+                try:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                except NameError:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                        inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                    )
+                if "single_grouped_weight" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
+
+            if _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR:
+                extra_kwargs["use_grouped_tensor"] = config.moe_use_grouped_tensor
+            elif config.moe_use_grouped_tensor and not config.use_transformer_engine_op_fuser:
+                raise RuntimeError(
+                    "moe_use_grouped_tensor=True requires a Transformer Engine GroupedLinear "
+                    "that exposes the use_grouped_tensor argument."
+                )
+
             self.te_quant_params: Optional[TEQuantizationParams] = None
-            for param in self.parameters():
-                setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+            quant_config = get_quant_config_or_none(name, config.quant_recipe)
+            self.finish_init(quant_config)
+            init_quant_context = _get_fp8_model_init_for_quant_params(
+                self.te_quant_params, torch.is_grad_enabled()
+            )
+            frozen_quantized_init_context = nullcontext()
+            if (
+                self.te_quant_params is not None
+                and self.te_quant_params.training_recipe.preserve_high_precision_init_val is False
+            ):
+                # TE uses grad mode to decide whether to allocate a columnwise
+                # training copy. Frozen native weights need rowwise storage only.
+                frozen_quantized_init_context = torch.no_grad()
+            init_gtp_remat_context = _init_gtp_remat_context(
+                self,
+                output_size,
+                gtp_remat_group,
+                extra_kwargs,
+                is_expert=True,
+                is_grouped=True,
+                out_split_size=tp_size if parallel_mode == "column" else 1,
+            )
+
+            with (
+                frozen_quantized_init_context,
+                init_quant_context,
+                init_gtp_remat_context as output_size,
+            ):
+                super().__init__(
+                    num_gemms=num_gemms,
+                    in_features=input_size,
+                    out_features=output_size,
+                    sequence_parallel=self.config.sequence_parallel,
+                    fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                    tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
+                    tp_size=tp_size,
+                    get_rng_state_tracker=(
+                        get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                    ),
+                    init_method=condition_init_method(config, init_method),
+                    bias=bias,
+                    return_bias=self.te_return_bias,
+                    parallel_mode=parallel_mode,
+                    **extra_kwargs,
+                )
+
+            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
+
+            self._register_load_state_dict_pre_hook(
+                type(self)._normalize_grouped_parameter_keys, with_module=True
+            )
 
             def merge_extra_states(
                 self,
@@ -1556,6 +2689,76 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
 
+        def _normalize_grouped_parameter_keys(
+            self,
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        ):
+            """Make grouped checkpoint keys compatible across parameter layouts.
+
+            Registered as a load_state_dict pre-hook to bridge checkpoints saved
+            in one layout (single grouped tensor vs per-GEMM indexed tensors)
+            and a model expecting the other.
+            """
+
+            def maybe_remap_param(param_name: str, single_grouped: bool) -> None:
+                grouped_key = f"{prefix}{param_name}"
+                indexed_keys = [
+                    f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
+                ]
+                has_grouped_key = grouped_key in state_dict
+                has_any_indexed_key = any(key in state_dict for key in indexed_keys)
+                has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
+
+                if single_grouped:
+                    if has_grouped_key or not has_all_indexed_keys:
+                        return
+                    state_dict[grouped_key] = torch.stack(
+                        [state_dict.pop(key) for key in indexed_keys], dim=0
+                    )
+                else:
+                    if has_any_indexed_key or not has_grouped_key:
+                        return
+                    split_tensors = self._split_grouped_checkpoint_tensor(
+                        state_dict.pop(grouped_key), grouped_key
+                    )
+                    for gemm_idx, tensor in enumerate(split_tensors):
+                        state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
+
+            maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
+            if self.use_bias:
+                maybe_remap_param("bias", getattr(self, "single_grouped_bias", False))
+
+        def _split_grouped_checkpoint_tensor(
+            self, tensor: torch.Tensor, checkpoint_key: str
+        ) -> list[torch.Tensor]:
+            """Split grouped checkpoint tensor into one tensor per GEMM."""
+            if hasattr(tensor, "split_into_quantized_tensors") and callable(
+                tensor.split_into_quantized_tensors
+            ):
+                grouped_tensors = getattr(tensor, "quantized_tensors", None)
+                if grouped_tensors is None:
+                    grouped_tensors = tensor.split_into_quantized_tensors()
+                if len(grouped_tensors) != self.num_gemms:
+                    raise RuntimeError(
+                        f"Grouped checkpoint tensor {checkpoint_key} has {len(grouped_tensors)} "
+                        f"groups, expected {self.num_gemms}."
+                    )
+                return list(grouped_tensors)
+            if tensor.ndim > 0 and tensor.shape[0] == self.num_gemms:
+                return list(tensor.unbind(dim=0))
+            if tensor.ndim > 0 and tensor.shape[0] % self.num_gemms == 0:
+                return list(torch.chunk(tensor, self.num_gemms, dim=0))
+            raise RuntimeError(
+                f"Cannot split checkpoint tensor {checkpoint_key} with shape {tuple(tensor.shape)} "
+                f"into {self.num_gemms} GEMM shards."
+            )
+
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""
             if quantization_config is None:
@@ -1577,7 +2780,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                out = try_frozen_bf16_grouped_mm(self, x, m_splits)
+                if out is not None:
+                    out = (out, None) if self.te_return_bias else out
+                else:
+                    out = try_frozen_quantized_to_bf16_forward(
+                        self, x, m_splits, is_first_microbatch=_is_first_microbatch
+                    )
+                if out is None:
+                    out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
@@ -1599,11 +2810,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return state_serialized
 
         def _decode_extra_state(self, state):
+            from megatron.core.safe_globals import SafeUnpickler
+
             if isinstance(state, torch.Tensor):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
                     return
-                return pickle.loads(state.detach().cpu().numpy().tobytes())
+                return SafeUnpickler(io.BytesIO(state.detach().cpu().numpy().tobytes())).load()
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
                 return torch.load(state, map_location="cuda")
@@ -1617,6 +2830,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return [state] * self.num_gemms
 
             state = self._decode_extra_state(state)
+            if state is None:
+                return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1
@@ -1660,18 +2875,33 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
-            num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
-            local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
+            grouped_split_cache = {}
+
+            def get_gemm_tensor(param_name: str, gemm_idx: int) -> torch.Tensor:
+                indexed_name = f"{param_name}{gemm_idx}"
+                if indexed_name in full_state_dict:
+                    return full_state_dict[indexed_name]
+                if param_name not in full_state_dict:
+                    raise KeyError(indexed_name)
+                if param_name not in grouped_split_cache:
+                    grouped_split_cache[param_name] = self._split_grouped_checkpoint_tensor(
+                        full_state_dict[param_name], param_name
+                    )
+                grouped_splits = grouped_split_cache[param_name]
+                return grouped_splits[gemm_idx]
+
+            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
             for gemm_idx in range(self.num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
-                    f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                    f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
                 }
                 if self.use_bias:
-                    state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
+                    state_dict[f"{gemm_idx}.bias"] = get_gemm_tensor("bias", gemm_idx)
                 if singleton_local_shards:
                     expert_prefix = f"{global_expert_idx}.{prefix}"
                     new_sharded_offsets = sharded_offsets
@@ -1682,7 +2912,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets
+                    state_dict,
+                    '',
+                    tp_axis_map,
+                    new_sharded_offsets,
+                    tp_group=self._tp_group,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -1696,7 +2931,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
                 if self.use_bias:
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
-            # Adjust replica ids - replication along DP modulo EP
+            # Set the expert-DP replica_id, picking the group by what EGTP_remat does to each entry:
+            #   - _extra_state ShardedObject: REPLICATED across EGTP_remat → need distinct ids
+            #     to avoid duplicate-writer collisions → use the full ``expt_dp_gtp_remat``.
+            #   - weight ShardedTensor: SHARDED across EGTP_remat (distinct) → not replicas →
+            #     elect the writer over the replicate group ``expt_dp``.
+            # EGTP_remat=1: the two groups coincide, so this is a no-op.
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (
@@ -1704,8 +2944,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
+                elif isinstance(sh_ten, ShardedObject):
+                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp_gtp_remat)
                 else:
-                    edp_replica_id = get_expert_data_parallel_rank()
+                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
@@ -1714,8 +2956,19 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             Compute weight gradients during the backward pass
             if delay_wgrad_compute is enabled.
             """
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 super().backward_dw()
+
+        def __repr__(self):
+            gtp_remat = getattr(getattr(self, "weight0", None), "gtp_remat_size", None)
+            gtp_str = f", GTP_remat={gtp_remat}" if gtp_remat is not None else ""
+            return (
+                f"{type(self).__name__}(per expert(["
+                f"in={self.in_features}, out={self.out_features}]) "
+                f"X num_gemms={self.num_gemms}, "
+                f"bias={self.use_bias}, TP={self.tp_size}"
+                f"{gtp_str})"
+            )
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
@@ -1735,8 +2988,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,
@@ -1748,7 +3006,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
-                tp_group=tp_group,
+                pg_collection=pg_collection,
+                name=name,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -1781,8 +3040,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,
@@ -1794,7 +3058,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
-                tp_group=tp_group,
+                pg_collection=pg_collection,
+                name=name,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -1808,6 +3073,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
 else:
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = False
     TEGroupedLinear = None  # type: ignore[assignment, misc]
     TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
     TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
@@ -1815,14 +3081,12 @@ else:
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
-    class TEFusedMLP(MLP):
+    class TEFusedMLP(TEFusedOpsMixin, MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-
-            # Fused implementation
-            self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
@@ -1830,18 +3094,166 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
 
-            # Tensor parallelism configuration
-            tp_world_size = get_tensor_model_parallel_world_size()
-            tp_group = None
+            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context()
+            rng_state_tracker_function = _get_te_ops_rng_state_tracker_function()
+
+            # Check submodule types
+            if not isinstance(self.linear_fc1, TELayerNormColumnParallelLinear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC1 to be "
+                    "Megatron Core TELayerNormColumnParallelLinear, but found "
+                    f"{self.linear_fc1.__class__.__name__}."
+                )
+            if not isinstance(self.linear_fc2, TERowParallelLinear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC2 to be "
+                    "Megatron Core TERowParallelLinear, but found "
+                    f"{self.linear_fc2.__class__.__name__}."
+                )
+
+            fused_impl.append(
+                _make_te_ops_norm_from_mcore_te_layernorm_linear(
+                    self.linear_fc1, module_name="linear_fc1"
+                )
+            )
+
+            # FC1 linear op
+            weight = self.linear_fc1.weight
+            fused_impl.append(
+                _make_te_ops_basic_linear_from_mcore_te_linear(
+                    self.linear_fc1,
+                    module_name="linear_fc1",
+                    output_features=weight.size(0) * tp_world_size,
+                    tensor_parallel_mode="column" if tp_world_size > 1 else None,
+                    tensor_parallel_group=tp_group,
+                    sequence_parallel=self.linear_fc1.sequence_parallel,
+                    rng_state_tracker_function=rng_state_tracker_function,
+                )
+            )
+
+            # FC1 bias op
+            op = _make_te_ops_bias_from_tensor(self.linear_fc1.bias)
+            if op is not None:
+                fused_impl.append(op)
+
+            # Activation op
+            op = _make_te_ops_activation(
+                self.activation_func,
+                self.config.gated_linear_unit,
+                self.config.activation_func_fp8_input_store,
+            )
+            fused_impl.append(op)
+
+            # FC2 linear op
+            fused_impl.append(
+                _make_te_ops_basic_linear_from_mcore_te_linear(
+                    self.linear_fc2,
+                    module_name="linear_fc2",
+                    rng_state_tracker_function=rng_state_tracker_function,
+                )
+            )
             if tp_world_size > 1:
-                tp_group = get_tensor_model_parallel_group()
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
+
+            # FC2 bias op
+            if not self.linear_fc2.te_return_bias:
+                op = _make_te_ops_bias_from_tensor(self.linear_fc2.bias)
+                if op is not None:
+                    fused_impl.append(op)
+
+            return fused_impl
+
+        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward."""
+
+            # Apply fused impl
+            out = self._get_fused_impl()(hidden_states)
+
+            # Return bias tensor if requested
+            bias = None
+            if self.linear_fc2.te_return_bias:
+                bias = self.linear_fc2.bias
+                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                    bias = None
+
+            return out, bias
+
+        @classmethod
+        def as_mlp_submodule(
+            cls,
+            submodules: MLPSubmodules,
+            config: TransformerConfig,
+            pg_collection: ProcessGroupCollection,
+            is_mtp_layer: bool,
+            is_expert: bool = False,
+            input_size: int | None = None,
+            ffn_hidden_size: int | None = None,
+            name: str | None = None,
+        ) -> MLP:
+            """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+            del is_mtp_layer
+            assert hasattr(
+                pg_collection, 'tp'
+            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            return cls(
+                config=config,
+                submodules=submodules,
+                tp_group=pg_collection.tp,
+                is_expert=is_expert,
+                input_size=input_size,
+                ffn_hidden_size=ffn_hidden_size,
+                name=name,
+            )
+
+    class TEFusedMLPWithGroupedLinear(TEFusedMLP):
+        """Dense MLP using GroupedLinear(num_groups=1) to trigger
+        ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+
+        Subclass of TEFusedMLP -> does not modify TEFusedMLP or TEGroupedMLP.
+        The fused kernel fires automatically via the TE op fuser when it detects
+        the GroupedLinear -> ScaledSwiGLU -> GroupedLinear pattern with MXFP8 recipe.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._norm_seq: Optional[Tuple[te.pytorch.ops.Sequential]] = None
+            if not is_te_min_version("2.14.0"):
+                raise RuntimeError(
+                    f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
+                    "(needs pytorch.ops.GroupedLinear and pytorch.ops.ScaledSwiGLU)"
+                )
+            if self.config.add_bias_linear:
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support add_bias_linear=True; "
+                    "the CuTeGEMM fused kernel requires bias-free linear layers."
+                )
+            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires SwiGLU activation "
+                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    "for the CuTeGEMM fused kernel, but got "
+                    f"activation_func={self.config.activation_func}, "
+                    f"gated_linear_unit={self.config.gated_linear_unit}."
+                )
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
+
+            tp_world_size = get_tensor_model_parallel_world_size()
+            if tp_world_size > 1:
+                return super()._make_fused_impl()
+
+            fused_impl = te.pytorch.ops.Sequential()
 
             # RNG state
             rng_state_tracker_function = None
             if get_cuda_rng_tracker().is_initialized():
                 rng_state_tracker_function = get_cuda_rng_tracker
 
-            # Check submodule types
+            # Check submodule types (same as TEFusedMLP)
             if not isinstance(self.linear_fc1, te.pytorch.LayerNormLinear):
                 raise ValueError(
                     f"{self.__class__.__name__} expects FC1 to be "
@@ -1850,12 +3262,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 )
             if not isinstance(self.linear_fc2, te.pytorch.Linear):
                 raise ValueError(
-                    f"{self.__class__.__name__} expects FC1 to be "
+                    f"{self.__class__.__name__} expects FC2 to be "
                     "Transformer Engine Linear, but found "
                     f"{self.linear_fc2.__class__.__name__}."
                 )
 
-            # Norm op
+            # Norm op (same as TEFusedMLP)
             norm_type = self.linear_fc1.normalization
             norm_shape = self.linear_fc1.weight.size(1)
             kwargs = {
@@ -1874,219 +3286,99 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 op.weight = self.linear_fc1.layer_norm_weight
             else:
                 raise ValueError(f"Unsupported normalization ({norm_type})")
-            fused_impl.append(op)
+            # Store norm in a separate Sequential applied OUTSIDE the MXFP8 autocast
+            # in forward(). Running norm inside MXFP8 context corrupts the saved rstd
+            # used in RMSNorm backward, causing gradient amplification up to 10^6.
+            # Wrapped in tuple to avoid nn.Module submodule registration (which would
+            # duplicate the shared norm weight in state_dict/parameters).
+            norm_seq = te.pytorch.ops.Sequential()
+            norm_seq.append(op)
+            self._norm_seq = (norm_seq,)
 
-            # FC1 linear op
+            # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
+            _GLU_INTERLEAVE_SIZE = 32
+
+            # FC1: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc1.weight
-            userbuffers_options = None
-            if self.linear_fc1.config.tp_comm_overlap and self.linear_fc1.ub_name is not None:
-                userbuffers_options = {"comm_name": self.linear_fc1.ub_name}
-            op = te.pytorch.ops.BasicLinear(
-                weight.size(1),
-                weight.size(0) * tp_world_size,
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0) * tp_world_size,
                 device="meta",
                 dtype=weight.dtype,
-                tensor_parallel_mode="column" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=self.linear_fc1.sequence_parallel,
+                bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-                userbuffers_options=userbuffers_options,
             )
-            op.weight = weight
+            op.weight0 = weight
+            op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
             fused_impl.append(op)
 
-            # FC1 bias op
-            bias = self.linear_fc1.bias
-            if isinstance(bias, torch.Tensor) and bias.numel() == 0:
-                bias = None
-            if bias is not None:
-                op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
-                op.bias = bias
-                fused_impl.append(op)
+            # ScaledSwiGLU with glu_interleave_size=32
+            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
 
-            # Activation op
-            op = self._make_activation_op(
-                self.activation_func,
-                self.config.gated_linear_unit,
-                self.config.activation_func_fp8_input_store,
-            )
-            fused_impl.append(op)
-
-            # FC2 linear op
+            # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight
-            userbuffers_options = None
-            if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
-                userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
-            op = te.pytorch.ops.BasicLinear(
-                weight.size(1),
-                weight.size(0),
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0),
                 device="meta",
                 dtype=weight.dtype,
+                bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-                userbuffers_options=userbuffers_options,
             )
-            op.weight = weight
+            op.weight0 = weight
+            # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
+            # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
             fused_impl.append(op)
-            if tp_world_size > 1:
-                if self.linear_fc2.sequence_parallel:
-                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
-                else:
-                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
 
-            # FC2 bias op
-            if not self.linear_fc2.te_return_bias:
-                bias = self.linear_fc2.bias
-                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
-                    bias = None
-                if bias is not None:
-                    op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
-                    op.bias = bias
-                    fused_impl.append(op)
-
-            # Emulate submodule forward hooks if needed
             self._register_hooks_on_fused_impl(fused_impl)
-
             return fused_impl
 
-        def _make_activation_op(
-            self, activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
-        ) -> te.pytorch.ops.FusibleOperation:
-            """Construct activation op."""
+        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            # Get op type
-            op_type = None
-            if (activation_func, gated_linear_unit) == (F.gelu, False):
-                op_type = te.pytorch.ops.GELU
-            elif (activation_func, gated_linear_unit) == (F.gelu, True):
-                op_type = te.pytorch.ops.GEGLU
-            elif (activation_func, gated_linear_unit) == (F.silu, False):
-                if not is_te_min_version("2.8.0"):
-                    raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
-                op_type = te.pytorch.ops.SiLU
-            elif (activation_func, gated_linear_unit) == (F.silu, True):
-                op_type = te.pytorch.ops.SwiGLU
-            elif (activation_func, gated_linear_unit) == (F.relu, False):
-                op_type = te.pytorch.ops.ReLU
-            elif (activation_func, gated_linear_unit) == (F.relu, True):
-                op_type = te.pytorch.ops.ReGLU
+            if get_tensor_model_parallel_world_size() > 1:
+                return super().forward(hidden_states, **kwargs)
 
-            # Could not find corresponding activation op
-            if op_type is None:
-                raise NotImplementedError(
-                    "Transformer Engine operation-based API does not support "
-                    f"activation_func={activation_func}, "
-                    f"gated_linear_unit={gated_linear_unit}"
-                )
+            orig_shape = hidden_states.shape
+            hidden_size = hidden_states.size(-1)
+            hidden_states_2d = hidden_states.view(-1, hidden_size)
+            total_tokens = hidden_states_2d.size(0)
 
-            # Construct op
-            kwargs = {}
-            if is_te_min_version("2.3"):
-                kwargs["cache_quantized_input"] = cache_quantized_input
-            return op_type(**kwargs)
+            tokens_per_expert = torch.full(
+                (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+            )
+            scales = torch.ones(
+                total_tokens, device=hidden_states.device, dtype=hidden_states.dtype
+            )
 
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """Attempt to emulate submodule callback hooks.
+            # Build fused impl and cache recipe lazily on first forward pass.
+            # Both are created once and reused — avoids object creation every call.
+            if not hasattr(self, '_recipe'):
+                if os.getenv("FP4_RECIPE", "") == "nvfp4":
+                    self._recipe = te.common.recipe.NVFP4BlockScaling()
+                else:
+                    self._recipe = te.common.recipe.MXFP8BlockScaling()
+            recipe = self._recipe
 
-            This is not always possible because Transformer Engine's
-            op fuser does not expose intermediate tensors. Depending
-            on what kernel fusions the op fuser chooses, the
-            intermediate tensors may not even exist. Hooks that modify
-            tensors will result in incorrect behavior.
-
-            """
-
-            # Get submodule hooks
-            forward_pre_hooks = []
-            forward_post_hooks = []
-            backward_pre_hooks = []
-            backward_post_hooks = []
-            for submodule in self.modules():
-                for hook in submodule._forward_pre_hooks.values():
-                    forward_pre_hooks.append((submodule, hook))
-                for hook in submodule._forward_hooks.values():
-                    forward_post_hooks.append((submodule, hook))
-                for hook in submodule._backward_pre_hooks.values():
-                    backward_pre_hooks.append((submodule, hook))
-                for hook in submodule._backward_hooks.values():
-                    backward_post_hooks.append((submodule, hook))
-
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
-            if forward_pre_hooks:
-                from megatron.core.distributed import distributed_data_parallel
-
-                if any(
-                    inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook in forward_pre_hooks
-                ):
-                    warnings.warn(
-                        "TEFusedMLP module has a submodule with a pre-forward hook. "
-                        "TEFusedMLP module does not expose intermediate tensors, "
-                        "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
-                    )
-
-                def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook in forward_pre_hooks:
-                        # Assume that hook does not interact with input
-                        ret = hook(submodule, None)
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedMLP module does not expose intermediate tensors, but "
-                                "submodule has pre-forward hook that modifies input tensor."
-                            )
-
-                fused_impl.register_forward_pre_hook(forward_pre_hook)
-
-            # Post-forward hooks
-            if forward_post_hooks:
-                warnings.warn(
-                    "TEFusedMLP module has a submodule with a post-forward hook. "
-                    "TEFusedMLP module does not expose intermediate tensors, "
-                    "so the hook may have incorrect behavior if it attempts to "
-                    "access the input or output tensors."
-                )
-
-                def forward_post_hook(module, *_) -> None:
-                    for submodule, hook in forward_post_hooks:
-                        # Assume that hook does not interact with input or output
-                        ret = hook(submodule, None, None)
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedMLP module does not expose intermediate tensors, but "
-                                "submodule has post-forward hook that modifies output tensor."
-                            )
-
-                fused_impl.register_forward_hook(forward_post_hook)
-
-            # Backward hooks
-            if backward_pre_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with pre-backward hooks"
-                )
-            if backward_post_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with post-backward hooks"
-                )
-
-        def forward(self, hidden_states: torch.Tensor) -> Tuple[Tensor, Optional[Tensor]]:
-            """Forward."""
-
-            # Construct fused impl if needed
-            # Note: We initialize during the first forward pass in
-            # case the params are modified after the constructor.
-            # Note: The fused impl is stored in a tuple to avoid
-            # registering as a submodule.
             if self._fused_impl is None:
-                self._fused_impl = (self._make_fused_impl(),)
+                with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
+                    self._fused_impl = (self._make_fused_impl(),)
 
-            # Apply fused impl
-            out = self._fused_impl[0](hidden_states)
+            # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
+            # tensor used by RMSNorm backward (running it inside causes up to 10^6
+            # gradient amplification, and causes convergence issues).
+            normed = self._norm_seq[0](hidden_states_2d)
 
-            # Return bias tensor if requested
+            with te.pytorch.autocast(enabled=True, recipe=recipe):
+                out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
+
+            out = out.view(*orig_shape[:-1], out.size(-1))
+
             bias = None
             if self.linear_fc2.te_return_bias:
                 bias = self.linear_fc2.bias
@@ -2097,6 +3389,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
+    TEFusedMLPWithGroupedLinear = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
@@ -2217,10 +3510,22 @@ try:
         activation_offloading,
         weight_offloading,
         double_buffering,
+        retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
-        if is_te_min_version("2.5.0"):
-            # Enables the additional double buffering switch for activations during LLM training
+        if is_te_min_version("2.10.0"):
+            # TE 2.10+ supports retain_pinned_cpu_buffers
+            context, sync_func = _get_cpu_offload_context(
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
+            )
+        elif is_te_min_version("2.5.0"):
+            # TE 2.5-2.9 supports double_buffering but not retain_pinned_cpu_buffers
             context, sync_func = _get_cpu_offload_context(
                 enabled,
                 num_layers,
@@ -2276,11 +3581,26 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.12.0", check_equality=True):
+        if interleaved:
+            assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
+
+        if is_te_min_version("2.3.0", check_equality=True):
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                interleaved=interleaved,
+            )
+        elif is_te_min_version("1.12.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
                 freqs,
@@ -2329,6 +3649,14 @@ except ImportError:
     fused_unpermute = None
 
 try:
+    from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs
+
+    fused_permute_and_pad_with_probs = moe_permute_and_pad_with_probs
+
+except ImportError:
+    fused_permute_and_pad_with_probs = None
+
+try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
     _TE_SUPPORTS_CG_CAPTURABLE = is_te_min_version("2.7.0")
@@ -2354,7 +3682,13 @@ except ImportError:
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
-    from transformer_engine.pytorch.module.base import get_workspace
+
+    try:
+        from transformer_engine.pytorch.module.base import get_workspace
+
+        _get_workspace = get_workspace
+    except ImportError:
+        _get_workspace = None
 
     def te_general_gemm(
         A: torch.Tensor,
@@ -2372,10 +3706,7 @@ try:
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
         """
-        return general_gemm(
-            A,
-            B,
-            workspace=get_workspace(),
+        kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
@@ -2391,6 +3722,9 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
+        if _get_workspace is not None:
+            kwargs["workspace"] = _get_workspace()
+        return general_gemm(A, B, **kwargs)
 
 except ImportError:
     te_general_gemm = None  # type: ignore[assignment, misc]
@@ -2427,3 +3761,18 @@ def set_save_original_input(module):
             "set_save_original_input is only needed on transformer-engine modules that save "
             "quantized tensors by default. It needs transformer-engine>=2.6.0dev0."
         )
+
+
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
+except ImportError:
+    try:
+        from transformer_engine.pytorch import cpu_offload
+    except ImportError:
+        cpu_offload = None
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+except ImportError:
+    Float8Tensor = None

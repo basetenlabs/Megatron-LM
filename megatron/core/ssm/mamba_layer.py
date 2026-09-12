@@ -11,14 +11,24 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
 
@@ -38,7 +48,7 @@ class MambaLayerSubmodules:
             after the mixer.
     """
 
-    norm: Union[ModuleSpec, type] = IdentityOp
+    norm: LayerNormBuilder = IdentityOp
     mixer: Union[ModuleSpec, type] = IdentityOp
     mamba_bda: Union[ModuleSpec, type] = IdentityOp
 
@@ -59,18 +69,22 @@ class MambaLayer(GraphableMegatronModule):
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
-        residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        name: str | None = None,
     ):
-        """Initialize Mamba Layer."""
+        """Initialize Mamba Layer.
+
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
+        self.tp_group = pg_collection.tp
 
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
-        self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -79,10 +93,27 @@ class MambaLayer(GraphableMegatronModule):
             layer_number=layer_number,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=(name + f".mixer") if name is not None else None,
         )
-        self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
+        self.norm = submodules.norm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+    def create_mcore_cudagraph_manager(self, config):
+        """Register the mamba layer for cudagraphs."""
+        assert self.config.cuda_graph_impl == "local"
+
+        from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+        if (
+            not self.config.cuda_graph_modules
+            and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
+        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules:
+            self.cudagraph_manager = CudaGraphManager(config)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
@@ -96,6 +127,7 @@ class MambaLayer(GraphableMegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -117,21 +149,36 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
+        # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
+        # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
+        # group is enabled, so zero cost on normal runs.
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            residual = hidden_states
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
 
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = self.norm(hidden_states)
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+            hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
+            # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
+            # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
+            # lands on the first pass).
+            with _otel_managed_span('layer', 'megatron.layer.mamba'):
+                mixer_out_with_bias = self.mixer(
+                    hidden_states,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
 
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mamba_bda(
+                    training=self.training, fused=self.config.bias_dropout_fusion
+                )(mixer_out_with_bias, residual, self.hidden_dropout)
 
-        return hidden_states
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -173,14 +220,22 @@ class MambaLayer(GraphableMegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        # Training and validation mode CUDA graphs
-        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
-            return True
-        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif not self.training and (
+        # Training and validation mode CUDA graphs.
+        if (
             hasattr(self, 'cudagraph_manager')
-            and kwargs.get('attention_mask') is None
-            and kwargs['inference_context'].is_decode_only()
+            and kwargs.get('inference_context') is None
+            and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
+        elif InferenceMode.is_active() and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs.get('attention_mask') is None
+            and kwargs.get('inference_context') is not None
+            and not self.config.cuda_graph_modules  # empty-list = per-layer CUDA graphs
+        ):
+            context = kwargs['inference_context']
+            using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
+                not context.is_static_batching() and context.using_cuda_graph_this_step()
+            )
+            return using_cuda_graph
         return False

@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Helpers for defining sharding for optimizer states based on existing sharding
+"""Helpers for defining sharding for optimizer states based on existing sharding
 for model parameters.
 """
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 import torch
 
-from megatron.core.utils import to_local_if_dtensor
+from megatron.core.utils import log_single_rank, to_local_if_dtensor
 
 from .dict_utils import nested_values
 from .mapping import (
@@ -67,13 +67,15 @@ def get_param_id_to_sharded_param_map(
         if id(ten.data) in param_to_id_map:
             id_to_sharded_param_map[param_to_id_map[id(ten.data)]] = ten
         else:
-            logger.debug(f'{ten} is not tracked by the optimizer')
+            logger.debug('%s is not tracked by the optimizer', ten)
 
     if not id_to_sharded_param_map:
-        logger.warning(
+        log_single_rank(
+            logger,
+            logging.WARNING,
             "Sharded parameters mapping is empty. It means tensors in model state dict"
             " do not correspond to tensors in optimizer parameters map."
-            " Make sure to call state_dict with `keep_vars=True`."
+            " Make sure to call state_dict with `keep_vars=True`.",
         )
     return id_to_sharded_param_map
 

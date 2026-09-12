@@ -14,7 +14,9 @@
 
 import logging
 import random
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple, Type
+
+__all__ = ["FullyShardedDataParallel"]
 
 try:
     import einops
@@ -26,6 +28,7 @@ except ImportError:
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch import nn
 
 try:
     from torch.distributed import DeviceMesh
@@ -38,14 +41,25 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import log_single_rank
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        FSDPDistributedIndex,
+        MegatronFSDP,
+        MixedPrecisionPolicy,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        Flat,
+        Placements,
+        fully_shard,
+        fully_shard_context,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -55,17 +69,61 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
-class FullyShardedDataParallel(_BaseDataParallel):
+class FullyShardedDataParallelV1(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
     """
+
+    # Module type registry (forked from Megatron-Bridge param_mapping utilities).
+    _MODULE_TYPE_REGISTRY: Dict[str, set] = {
+        "column": {
+            "ColumnParallelLinear",
+            "TEColumnParallelLinear",
+            "TELayerNormColumnParallelLinear",
+            "TEColumnParallelGroupedLinear",
+            "VocabParallelEmbedding",
+            "DotProductAttention",  # for attention sink only
+            "TEDotProductAttention",  # for attention sink only
+        },
+        "row": {"RowParallelLinear", "TERowParallelLinear", "TERowParallelGroupedLinear"},
+        "replicated": {
+            # Normalization layers
+            "TENorm",
+            "FusedLayerNorm",
+            "WrappedTorchNorm",
+            "LayerNorm",
+            "RMSNorm",
+            "L2Norm",
+            # Other non-parallel modules
+            "IdentityOp",
+            "TopKRouter",
+        },
+    }
+
+    @staticmethod
+    def _fine_grained_recurse_module_types(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> Tuple[Type[nn.Module], ...]:
+        """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            # Lazy import to avoid circular chain.
+            from megatron.core.transformer.moe.experts import TEGroupedMLP
+            from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+            return (TEGroupedMLP, SharedExpertMLP)
+        return ()
 
     def __init__(
         self,
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
+        # This should be named fsdp_unit_module_types; the v1 name is retained for API
+        # compatibility.
+        fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -76,14 +134,32 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+        self.mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
+            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up Megatron-FSDP MixedPrecisionPolicy with config {self.mp_policy}',
+        )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
+
+        if config.gradient_accumulation_fusion:
+            assert is_te_min_version("2.10"), (
+                "Megatron-FSDP with gradient_accumulation_fusion requires "
+                "Transformer Engine version 2.10 or higher."
+            )
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
@@ -93,17 +169,47 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if fsdp_unit_modules is not None:
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
-            if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+            # FSDP unit modules control the granularity of FSDP communications.
+            # "optim": Reduce-scatter communication groups on the final microbatch.
+            # "optim_grads": Additionally, RS communication groups on all microbatches.
+            # "optim_grads_params": RS & AG communication groups on all microbatches.
+            if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
+                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
 
-        self._fix_tensor_parallel_attributes(module)
+        self._annotate_tensor_parallelism(module)
 
+        if config.overlap_moe_expert_parallel_comm:
+            assert not ddp_config.fsdp_double_buffer, (
+                "1F1B overlap with FSDP does not support double buffer. "
+                "Please set fsdp_double_buffer=False in the ddp config."
+            )
+            assert config.cuda_graph_impl in ("none", "full_iteration"), (
+                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
+                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
+                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
+                "(cuda_graph_impl='none')."
+            )
+
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            assert self.fsdp_unit_modules and all(
+                module in supported_fsdp_unit_modules for module in self.fsdp_unit_modules
+            ), (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                "to contain only supported MCore modules "
+                f"{supported_fsdp_unit_modules}, "
+                f"got {self.fsdp_unit_modules}."
+            )
         super().__init__(
             config=config,
             module=MegatronFSDP(
                 ddp_config=ddp_config,
+                mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,
@@ -111,6 +217,25 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                # EP overlap schedule calls sub-modules directly instead of
+                # TransformerLayer.forward(), so fine-grained hooks are needed
+                # to manage _training_state and all-gather each sub-module's
+                # parameters individually.  This applies to all sharding
+                # strategies (not only optim_grads_params) because the hooks
+                # also maintain per-module training-state bookkeeping that the
+                # gradient-reduction pipeline relies on.
+                enable_fine_grained_param_gather_hook=(
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or config.overlap_moe_expert_parallel_comm
+                    or self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
+                ),
+                enable_fine_grained_param_gather_backward_hook=(
+                    config.overlap_moe_expert_parallel_comm
+                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                ),
+                fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
+                    config, ddp_config
+                ),
             ),
         )
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
@@ -121,8 +246,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
+        self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
+        self.module.config = config
 
         self.sync_rng_states_across_tp_group()
 
@@ -148,43 +275,75 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
-    def _fix_tensor_parallel_attributes(self, module):
-        is_expert_param = lambda n, p: ".experts." in n
-        is_router_param = lambda n, p: ".router.weight" in n
+    def _detect_parallelism_type(self, param_name: str, module: nn.Module) -> Optional[str]:
+        """
+        Infer tensor-parallelism type for a parameter under a given module
+        (forked from Megatron-Bridge).
 
-        if parallel_state.get_tensor_model_parallel_group():
-            tp_size = parallel_state.get_tensor_model_parallel_group().size()
-        else:
-            tp_size = 1
+        Returns:
+            "column", "row", or "replicated" if a type can be inferred, else None.
+        """
+        module_type = type(module).__name__
 
-        if parallel_state.get_expert_tensor_parallel_group():
-            expt_tp_size = parallel_state.get_expert_tensor_parallel_group().size()
-        else:
-            expt_tp_size = 1
+        # Handle fused modules like TELayerNormColumnParallelLinear
+        # These modules have both column-parallel weights (weight, bias)
+        # and replicated layer norm weights (layer_norm_weight, layer_norm_bias)
+        if module_type == "TELayerNormColumnParallelLinear":
+            # Check the actual parameter name to determine the correct parallelism type
+            if param_name.endswith("layer_norm_weight") or param_name.endswith("layer_norm_bias"):
+                return "replicated"
+            # All other parameters (weight, bias) are column-parallel
+            return "column"
 
-        param_to_direct_module = {}
-        for name, m in module.named_modules():
-            for p in m.parameters(recurse=False):
-                param_to_direct_module[p] = (name, m)
+        # Check registry first
+        for parallelism, types in self._MODULE_TYPE_REGISTRY.items():
+            if module_type in types:
+                if parallelism == "row" and "bias" in param_name:
+                    return "replicated"
+                return parallelism
 
-        for name, param in module.named_parameters():
-            if is_expert_param(name, param) and expt_tp_size > 1:
-                setattr(param, "_mcore_tp", True)
-                if "linear_fc1.weight" in name:
-                    setattr(param, "_tp_partition_dim", 0)
-                elif "linear_fc2.weight" in name:
-                    setattr(param, "_tp_partition_dim", 1)
+        # Fallback to inspecting module attributes
+        if hasattr(module, "tensor_model_parallel"):
+            if not module.tensor_model_parallel:
+                return "replicated"
 
-            if not is_expert_param(name, param) and tp_size > 1:
-                m_name, direct_module = param_to_direct_module[param]
-                if isinstance(direct_module, (TELinear,)):
-                    parallel_mode = getattr(direct_module, "parallel_mode", None)
-                    if parallel_mode is None:
-                        setattr(param, "_mcore_tp", True)
-                        setattr(param, "_tp_duplicated", True)
-                elif is_router_param(name, param):
-                    setattr(param, "_mcore_tp", True)
-                    setattr(param, "_tp_duplicated", True)
+            # Check partition dimension
+            partition_dim = getattr(module, "partition_dim", None)
+            if partition_dim == 0:
+                return "column"
+            elif partition_dim == 1:
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+
+        # Fallback for normalization layers
+        if any(norm in module_type for norm in ["Norm", "Normalization"]):
+            return "replicated"
+
+        # Check parallel_mode for TELinear
+        if module_type == "TELinear":
+            if module.parallel_mode == "column":
+                return "column"
+            elif module.parallel_mode == "row":
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+            else:
+                return "replicated"
+
+        return None
+
+    def _annotate_tensor_parallelism(self, root_module: nn.Module) -> None:
+        """Annotate parameters under root_module with inferred tensor-parallel metadata.
+
+        Each parameter that can be classified will get a `_tensor_parallel_mode` attribute
+        set to one of: "column", "row", or "replicated".
+        """
+        for submodule in root_module.modules():
+            for name, param in submodule.named_parameters(recurse=False):
+                detected_type = self._detect_parallelism_type(name, submodule)
+                if detected_type is not None:
+                    setattr(param, "_tensor_parallel_mode", detected_type)
 
     def _init_dist_index(self, pg_collection):
         """
@@ -208,6 +367,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
+                expt_dp_group = parallel_state.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=True
+                )
+                hybrid_fsdp_expt_group = parallel_state.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=False
+                )
+                ep_group = parallel_state.get_expert_model_parallel_group()
             else:
                 dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
@@ -223,6 +389,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_cp_group = pg_collection.intra_dp_cp
                 outer_fsdp_group = pg_collection.inter_dist_opt
                 hybrid_fsdp_group = pg_collection.dp_cp
+                # This has not been tested yet.
+                expt_dp_group = getattr(pg_collection, 'intra_expt_dp', None)
+                hybrid_fsdp_expt_group = getattr(pg_collection, 'expt_dp', None)
+                ep_group = getattr(pg_collection, 'ep', None)
             else:
                 dp_cp_group = pg_collection.dp_cp
                 outer_fsdp_group = None
@@ -238,7 +408,25 @@ class FullyShardedDataParallel(_BaseDataParallel):
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
 
+        # Extract AG groups from pg_collection for explicit passing
+        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
+        expt_dp_ag = (
+            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
+        )
+
         if enable_hsdp:
+            if self.num_moe_experts is not None:
+                expt_mesh = _get_hsdp_tp_mesh(
+                    outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
+                )
+                expt_device_mesh = DeviceMesh.from_group(
+                    [outer_fsdp_group, expt_dp_group, expt_tp_group],
+                    device_type="cuda",
+                    mesh=expt_mesh.tolist(),
+                    mesh_dim_names=["outer_fsdp_dp", "dp_cp", "tp"],
+                )
+            else:
+                expt_device_mesh = None
             mesh = _get_hsdp_tp_mesh(outer_fsdp_group, dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
                 hsdp_outer_dp_shard=self.ddp_config.outer_dp_sharding_strategy != "no_shard",
@@ -252,9 +440,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 hybrid_fsdp_group=hybrid_fsdp_group,
+                hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
+                expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
         else:
-            if ep_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],
@@ -276,6 +468,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
 
         self.tp_group = tp_group
@@ -304,22 +498,286 @@ class FullyShardedDataParallel(_BaseDataParallel):
         _load_rng_state_dict(broadcast_list[0])
 
 
-def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
+class FullyShardedDataParallelV2(_BaseDataParallel):
+    """MFSDP v2 wrapper for the Megatron model."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
+        module: torch.nn.Module,
+        fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
+        disable_bucketing: bool = False,
+        device: Optional[torch.device] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        """Initialize the MFSDP v2 wrapper.
+
+        Args:
+            config: Transformer configuration for the model.
+            ddp_config: Data-parallel and sharding configuration.
+            module: Root model module to shard.
+            fsdp_unit_modules: Module types to shard as child FSDP units. If
+                unspecified, transformer, MoE transformer, and Mamba layers are used.
+            disable_bucketing: Compatibility argument that must remain ``False`` for
+                MFSDP v2.
+            device: Device whose type is used to construct the data-parallel mesh.
+                Defaults to CUDA.
+            pg_collection: Explicit process groups. The ``dp_cp`` group defines the
+                data-parallel mesh.
+
+        Raises:
+            ImportError: If the Megatron FSDP implementation is unavailable.
+            ValueError: If required process groups are missing or the configuration
+                requests a feature unsupported by MFSDP v2.
+        """
+        if not HAVE_MEGATRON_FSDP:
+            raise IMPORT_MEGATRON_FSDP_ERROR
+        if pg_collection is None:
+            raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
+        FullyShardedDataParallelV2._validate_config(
+            config, ddp_config, module, pg_collection, disable_bucketing
+        )
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
+        self.ddp_config = ddp_config
+
+        if fsdp_unit_modules is None:
+            fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+        log_single_rank(
+            logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
+        )
+        self.mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
+            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Setting up Megatron-FSDP MixedPrecisionPolicy with config %s",
+            self.mp_policy,
+        )
+
+        dp_group = pg_collection.dp_cp
+        device_type = device.type if device is not None else "cuda"
+        dp_mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        expert_dp_mesh = None
+        if config.expert_model_parallel_size > 1:
+            expert_dp_mesh = DeviceMesh.from_group(
+                pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
+            )
+        placements = Placements(
+            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+        )
+        # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
+        # without symmetric memory: it uses ncclCommRegister rather than the more performant
+        # ncclCommWindowRegister:
+        # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+            if expert_dp_mesh is not None:
+                # Expert parameters are replicated over expert-DP, not the full DP group.
+                # Their gradients need the EP divisor because the same expert receives
+                # contributions after dispatch from every EP rank.
+                for submodule in module.modules():
+                    if isinstance(submodule, MoELayer):
+                        fully_shard(
+                            submodule.experts,
+                            mesh=expert_dp_mesh,
+                            placements=placements,
+                            mixed_precision_policy=self.mp_policy,
+                            grad_divisor=config.expert_model_parallel_size,
+                        )
+            for submodule in reversed(list(module.modules())):
+                if submodule is module:
+                    # The root is always sharded after selected child units so it is not
+                    # wrapped twice when its type also appears in fsdp_unit_modules.
+                    continue
+                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    fully_shard(
+                        submodule,
+                        mesh=dp_mesh,
+                        placements=placements,
+                        mixed_precision_policy=self.mp_policy,
+                    )
+            fully_shard(
+                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
+            )
+        super().__init__(config=config, module=module)
+
+    @staticmethod
+    def _validate_config(
+        config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
+        module: torch.nn.Module,
+        pg_collection: ProcessGroupCollection,
+        disable_bucketing: bool,
+    ) -> None:
+        """Validate that the model and configuration are supported by MFSDP v2.
+
+        Args:
+            config: Transformer configuration describing the requested model topology.
+            ddp_config: Data-parallel and sharding configuration to validate.
+            module: Model whose parameters are checked for expert parallelism.
+            pg_collection: Materialized process groups whose topology must match the
+                supported MFSDP v2 topology.
+            disable_bucketing: Whether parameter bucketing is disabled.
+
+        Raises:
+            ValueError: If a required process group is missing or the model,
+                topology, or data-parallel configuration uses an unsupported feature.
+        """
+        if disable_bucketing:
+            raise ValueError("MFSDP v2 does not support disabling bucketing.")
+        if not hasattr(pg_collection, 'dp_cp'):
+            raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
+
+        unsupported_parallelisms = [
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+        ]
+        if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
+            raise ValueError(
+                "MFSDP v2 does not currently support: "
+                + ", ".join(
+                    f"{parallelism}={getattr(config, parallelism)}"
+                    for parallelism in unsupported_parallelisms
+                )
+            )
+
+        # The config validates the requested topology, while these checks validate the
+        # materialized topology supplied by the caller's process-group collection.
+        for group_name in ("tp", "pp", "cp"):
+            group = getattr(pg_collection, group_name, None)
+            if group is not None and group.size() != 1:
+                raise ValueError(
+                    f"MFSDP v2 currently requires {group_name.upper()} process-group size 1, "
+                    f"got {group.size()}."
+                )
+
+        if config.expert_model_parallel_size > 1:
+            if (
+                pg_collection.ep is None
+                or pg_collection.ep.size() != config.expert_model_parallel_size
+            ):
+                actual_ep_size = None if pg_collection.ep is None else pg_collection.ep.size()
+                raise ValueError(
+                    "MFSDP v2 requires an EP process group matching "
+                    f"expert_model_parallel_size={config.expert_model_parallel_size}, "
+                    f"got {actual_ep_size}."
+                )
+            if pg_collection.expt_dp is None:
+                raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
+            if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
+                raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
+        if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            raise ValueError(
+                "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
+            )
+        if ddp_config.outer_dp_sharding_strategy != "no_shard":
+            raise ValueError("MFSDP v2 does not currently support outer DP sharding.")
+        if config.gradient_accumulation_fusion:
+            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+        if config.calculate_per_token_loss:
+            raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
+        if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
+            raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
+        if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
+            raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
+
+        if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
+            raise ValueError(
+                "MFSDP v2 does not support fsdp_db_use_persist_buf_on_alloc_fail: "
+                "it allocates communication buffers from PyTorch memory pools."
+            )
+        if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
+            raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
+        if ddp_config.fsdp_manual_registration:
+            raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
+        if ddp_config.delay_wgrad_compute:
+            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if ddp_config.suggested_communication_unit_size is not None:
+            raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
+        if ddp_config.num_buckets is not None:
+            raise ValueError("MFSDP v2 does not support num_buckets.")
+        if ddp_config.megatron_fsdp_use_decoupled_grad:
+            raise ValueError("MFSDP v2 does not support megatron_fsdp_use_decoupled_grad.")
+        if ddp_config.megatron_fsdp_enable_fine_grained_param_gather:
+            raise ValueError(
+                "MFSDP v2 does not support megatron_fsdp_enable_fine_grained_param_gather."
+            )
+        if ddp_config.megatron_fsdp_max_pool_double_buffer:
+            raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+
+    def start_param_sync(self, *unused, **unused_kwargs) -> None:
+        """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
+
+    def start_grad_sync(self, *unused, **unused_kwargs) -> None:
+        """MFSDP v2 reduces gradients during backward."""
+
+    def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
+        """MFSDP v2 gradient reduction is complete when backward returns."""
+
+    def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
+        """MFSDP v2 parameter gathers complete inside module hooks."""
+
+    def broadcast_params(self) -> None:
+        """Reject parameter broadcast, which is unsupported by MFSDP v2."""
+        raise NotImplementedError(
+            "MFSDP v2 does not support parameter broadcast/data-parallel random initialization."
+        )
+
+    def stop_communication(self) -> None:
+        """MFSDP v2 communication is complete when backward returns."""
+
+
+def FullyShardedDataParallel(
+    config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    module: torch.nn.Module,
+    fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
+    disable_bucketing: bool = False,
+    device: Optional[torch.device] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> _BaseDataParallel:
+    """Construct the configured Megatron-FSDP implementation.
+
+    This is a factory function, not a wrapper type. Use the explicit V1 or V2
+    implementation classes for type checks.
+    """
+    fsdp_class = (
+        FullyShardedDataParallelV2
+        if ddp_config.megatron_fsdp_version == 2
+        else FullyShardedDataParallelV1
+    )
+    return fsdp_class(
+        config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
+    )
+
+
+def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
     mesh = einops.rearrange(
         torch.arange(world_size),
-        "(outer_fsdp_dp fsdp tp) -> outer_fsdp_dp fsdp tp",
+        "(outer_fsdp_dp fsdp ep tp) -> ep outer_fsdp_dp fsdp tp",
         outer_fsdp_dp=outer_fsdp_dp_group.size(),
         tp=tp_group.size(),
+        ep=ep_size,
     )
 
     mesh_fsdp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp tp) fsdp',
+        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp ep tp) fsdp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
+        ep=ep_size,
     )
     fsdp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_fsdp_ranks, fsdp_group_ranks), (
@@ -329,7 +787,7 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
 
     mesh_tp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp) tp',
+        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp ep) tp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
@@ -341,9 +799,10 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
 
     mesh_outer_fsdp_dp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (fsdp tp) outer_fsdp_dp',
+        'ep outer_fsdp_dp fsdp tp -> (fsdp ep tp) outer_fsdp_dp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
+        ep=ep_size,
     )
     outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(
@@ -353,7 +812,21 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
         f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
     )
 
-    return mesh
+    # Exclude the expert parallel dimension
+    rank = dist.get_rank()
+    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    assert (
+        len(dp_tp_meshes) == 1
+    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    assert (
+        len(dp_tp_meshes[0].reshape(-1).tolist())
+        == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
+    ), (
+        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
+        f"does not match the expected size"
+        f"{outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
+    )
+    return dp_tp_meshes[0]
 
 
 def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):

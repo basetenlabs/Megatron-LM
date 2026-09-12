@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,22 +24,28 @@ import sys
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = "Megatron-LM"
-copyright = "2025, NVIDIA Corporation"
+project = "Megatron Core"
+copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "nightly"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
     "myst_parser",  # For our markdown docs
-    "autodoc2",  # Generates API docs
     "sphinx.ext.viewcode",  # For adding a link to view source code in docs
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
     "sphinx_copybutton",  # For copy button in code blocks
 ]
+
+# Check if we should skip autodoc generation
+# usage: SKIP_AUTODOC=true
+skip_autodoc = os.environ.get("SKIP_AUTODOC", "false").lower() == "true"
+
+if not skip_autodoc:
+    extensions.append("autodoc2")  # Generates API docs
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
@@ -57,23 +63,35 @@ myst_enable_extensions = [
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
 
+# Suppress "more than one target found for cross-reference" warnings for Python symbols
+# that have the same name across multiple modules (e.g. DistributedDataParallelConfig,
+# ModelType). These are structural ambiguities in the codebase – the cross-reference
+# still resolves; Sphinx just cannot pick the unique target automatically.
+suppress_warnings = ["ref.python"]
+
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))
 
-autodoc2_packages = [
-    {
-        "path": "../megatron/core",  # Path to your package relative to conf.py
-        "exclude_dirs": ["converters"],  # list of directory names to exclude
-    }
-]
-autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
-autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
-# This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
-# render google style docstrings.
-# Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
-autodoc2_docstring_parser_regexes = [
-    (r".*", "docs.autodoc2_docstrings_parser"),
-]
+if not skip_autodoc:
+    autodoc2_packages = [
+        {
+            "path": "../megatron/core",  # Path to your package relative to conf.py
+            "exclude_dirs": ["converters"],  # list of directory names to exclude
+        }
+    ]
+    autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
+    autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
+    # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
+    # render google style docstrings.
+    # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
+    autodoc2_docstring_parser_regexes = [
+        (r".*", "docs.autodoc2_docstrings_parser"),
+    ]
+    # Regex patterns whose values contain raw regex syntax (e.g. \p{L}) that docutils
+    # mis-parses as footnote/reference markup. Exclude them from the generated docs.
+    autodoc2_hidden_regexes = [
+        r".*\._PATTERN_TIKTOKEN.*",
+    ]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
@@ -81,7 +99,7 @@ autodoc2_docstring_parser_regexes = [
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
     "switcher": {
-        "json_url": "versions1.json",
+        "json_url": "../versions1.json",
         "version_match": release,
     },
     "icon_links": [
@@ -91,16 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "extra_head": {
-        """
-    <script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js" ></script>
-    """
-    },
-    "extra_footer": {
-        """
-    <script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
-    """
-    },
+    "public_docs_features": os.environ.get("SKIP_PUBLIC_DOCS_FEATURES", "false").lower() != "true",
 }
 html_extra_path = ["project.json", "versions1.json"]
 
@@ -108,4 +117,20 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "http://localhost.*",
+]
+linkcheck_retries = 10
+linkcheck_rate_limit_timeout = 600
+linkcheck_workers = 1
+
+# PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
+# and are not present in the static HTML that linkcheck fetches.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+]
+
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
 ]

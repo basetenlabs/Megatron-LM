@@ -1,9 +1,29 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from typing import Protocol
+
 import torch
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+
+
+class LayerNormInterface(Protocol):
+    """Interface that all LayerNorm implementations should follow."""
+
+    returns_residual: bool
+
+    def forward(self, x: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for a LayerNorm implementation."""
+        ...
+
+
+class LayerNormBuilder(Protocol):
+    """A protocol showing how Modules are expected to construct LayerNorms."""
+
+    def __call__(
+        self, *, config: TransformerConfig, hidden_size: int, eps: float
+    ) -> LayerNormInterface: ...
 
 
 class WrappedTorchNorm:
@@ -22,7 +42,7 @@ class WrappedTorchNorm:
         persist_layer_norm: bool = False,
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
-    ):
+    ) -> LayerNormInterface:
         assert (
             not config.layernorm_zero_centered_gamma
         ), f"zero_centered_gamma not supported by torch LayerNorm"
@@ -48,10 +68,12 @@ class WrappedTorchNorm:
         else:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
-        return norm_cls(normalized_shape=hidden_size, eps=eps)
+        instance = norm_cls(normalized_shape=hidden_size, eps=eps)
+        instance.returns_residual = False
+        return instance
 
 
-class L2Norm(torch.nn.Module):
+class L2Norm(torch.nn.Module, LayerNormInterface):
     """
     Applies L2 normalization to the input tensor along the last dimension.
 
@@ -70,7 +92,7 @@ class L2Norm(torch.nn.Module):
         self.eps = eps
 
     @jit_fuser
-    def _norm(self, x):
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
         """
         Performs the actual L2 normalization.
 
@@ -83,7 +105,7 @@ class L2Norm(torch.nn.Module):
         x_float = x.float()
         return (x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the L2Norm module.
 

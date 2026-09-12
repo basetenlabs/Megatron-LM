@@ -14,6 +14,8 @@ from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -21,16 +23,9 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params
-from megatron.core.utils import get_te_version as _get_te_version
-from megatron.core.utils import is_te_min_version
-
-
-def get_te_version():
-    """Included for backwards compatibility."""
-    warnings.warn("`get_te_version` will be deprecated in a future release")
-    return _get_te_version()
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
 
 class BertModel(LanguageModule):
@@ -54,6 +49,13 @@ class BertModel(LanguageModule):
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
         vp_stage (int): Virtual pipeline stage.
+        apply_lm_head (bool): Whether to transform the encoder's final hidden states with
+            ``BertLMHead`` (dense + GeLU + LayerNorm) before the vocabulary projection.
+            Defaults to True. Set to False for architectures whose output projection is
+            applied directly to the encoder output (e.g. models with their own final norm),
+            bypassing BERT's dense+GeLU+LayerNorm transform.
+        output_layer_bias (bool): Whether to include a bias in the vocabulary projection.
+            Defaults to True for backward compatibility.
     """
 
     def __init__(
@@ -74,8 +76,11 @@ class BertModel(LanguageModule):
         add_binary_head=True,
         return_embeddings=False,
         vp_stage: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        apply_lm_head: bool = True,
+        output_layer_bias: bool = True,
     ):
-        super(BertModel, self).__init__(config=config)
+        super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -96,6 +101,8 @@ class BertModel(LanguageModule):
         self.add_binary_head = add_binary_head
         self.return_embeddings = return_embeddings
         self.vp_stage = vp_stage
+        self.apply_lm_head = apply_lm_head
+        self.output_layer_bias = output_layer_bias
 
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
@@ -133,14 +140,18 @@ class BertModel(LanguageModule):
         # Output
         if post_process:
             # TODO: Make sure you are passing in the mpu_vocab_size properly
-            self.lm_head = BertLMHead(config.hidden_size, config)
+            self.lm_head = BertLMHead(config.hidden_size, config) if self.apply_lm_head else None
 
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
-                bias=True,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
+                bias=self.output_layer_bias,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
@@ -185,6 +196,11 @@ class BertModel(LanguageModule):
         """
         attention_backend = self.config.attention_backend
         attn_mask_dimensions = None
+        assert isinstance(self.transformer_layer_spec.submodules, TransformerLayerSubmodules)
+        assert isinstance(
+            self.transformer_layer_spec.submodules.self_attention.submodules,
+            SelfAttentionSubmodules,
+        )
         # For local layer spec we just use b1ss
         if (
             self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
@@ -370,7 +386,9 @@ class BertModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        hidden_states_after_lm_head = self.lm_head(hidden_states=hidden_states)
+        hidden_states_after_lm_head = (
+            self.lm_head(hidden_states=hidden_states) if self.lm_head is not None else hidden_states
+        )
         logits, _ = self.output_layer(hidden_states_after_lm_head, weight=output_weight)
 
         binary_logits = None

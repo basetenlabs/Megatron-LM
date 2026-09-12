@@ -8,6 +8,23 @@
 
 set -euxo pipefail
 
+is_sensitive_env_name() {
+    local name="${1^^}"
+    [[ "$name" == *KEY* || "$name" == *TOKEN* || "$name" == *API* ]]
+}
+
+export_env_assignment() {
+    local key="$1"
+    local value="$2"
+
+    export "$key"="$value"
+    if is_sensitive_env_name "$key"; then
+        printf '%s=<redacted>\n' "$key"
+    else
+        printf '%s=%s\n' "$key" "$value"
+    fi
+}
+
 set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
@@ -15,8 +32,7 @@ for ARGUMENT in "$@"; do
     KEY_LENGTH=${#KEY}
     VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
+    export_env_assignment "$KEY" "$VALUE"
 done
 set -x
 
@@ -39,6 +55,16 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+export NCCL_PROTO="${NCCL_PROTO:-simple}"
+export NCCL_ALGO="${NCCL_ALGO:-Ring}"
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+# Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are actually respected instead of being overridden at runtime.
+export NCCL_TUNER_PLUGIN="${NCCL_TUNER_PLUGIN:-}"
+# Match the NCCL default (4 MB) so buffer-chunking behaviour is the same as on Slurm nodes.
+export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-4194304}"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
+
 set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
@@ -46,6 +72,7 @@ TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 set -x
 
 # Pull env vars to export
+set +x
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
 while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
@@ -53,9 +80,9 @@ while IFS= read -r ARGUMENT; do
     KEY_LENGTH=${#KEY}
     VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
+    export_env_assignment "$KEY" "$VALUE"
 done <<<"$ENV_VARS"
+set -x
 
 # Run before script
 BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
@@ -124,8 +151,8 @@ else
                 value=$(echo "$value" | sed 's/^\[//;s/\]$//')
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
-            # Case: contains spaces
-            elif [[ "$value" == *" "* ]]; then
+            # Case: contains spaces or shell metacharacters
+            elif [[ "$value" == *" "* || "$value" == *"|"* || "$value" == *"("* || "$value" == *")"* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
             # Case: default
             else
@@ -138,9 +165,22 @@ else
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
     if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        # Leave a buffer before SLURM kills the job so training can exit
+        # gracefully. For normal (long) windows this is window - 15 min. For
+        # short windows (e.g. L0-smoke with a tight --time-limit) a flat 15 min
+        # buffer would go negative and make training exit after a single step,
+        # so fall back to 80% of the window with a 1-minute floor.
+        WINDOW_MIN=$((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60))
+        BUFFER_MIN=15
+        if ((WINDOW_MIN > BUFFER_MIN)); then
+            EXIT_DURATION_MIN=$((WINDOW_MIN - BUFFER_MIN))
+        else
+            EXIT_DURATION_MIN=$((WINDOW_MIN * 4 / 5))
+            ((EXIT_DURATION_MIN < 1)) && EXIT_DURATION_MIN=1
+        fi
         PARAMS=(
             "--exit-duration-in-mins"
-            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+            "$EXIT_DURATION_MIN"
         )
     fi
 fi
@@ -150,18 +190,23 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-LAST_RANK=7
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
+LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
+
+# Read launcher type from model config (default: torchrun)
+LAUNCHER=$(/usr/local/bin/yq '.LAUNCHER // "torchrun"' "$TRAINING_PARAMS_PATH")
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -170,24 +215,38 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $NODE_RANK
     --log-dir $LOG_DIR
-    --tee "0:3,7:3"
+    --tee "0:3,$LAST_RANK:3"
     --redirects "3"
+)
+
+FT_LAUNCHER_ARGS=(
+    --max-restarts=3
 )
 
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
-        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
 fi
 
 # Run after script
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi 
+fi
 
 # Set permissions
 chmod -R g+w $OUTPUT_PATH

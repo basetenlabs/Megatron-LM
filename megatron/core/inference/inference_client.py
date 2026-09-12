@@ -1,12 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import functools
 import logging
-import os
 import time
-from typing import Awaitable, List, Optional, Union
+from typing import List, Optional, Union
 
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -25,8 +26,6 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
-
-from .headers import Headers
 
 
 class InferenceClient:
@@ -54,13 +53,16 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_port: int):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
         Args:
-            inference_coordinator_port (int): The port number on which the
+            inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
+            deserialize (bool): If True, deserialize completed requests
+                into DynamicInferenceRequest objects. If False (default), return
+                the raw serialized dict for lower overhead.
         """
         assert (
             HAVE_ZMQ
@@ -70,18 +72,21 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
-        inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
-        socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
+
+        # Prevent socket.send() from thread-blocking at >1000 concurrent requests
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0)
+
+        socket.connect(inference_coordinator_address)
 
         self._loop = None
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
-
         self.socket = socket
+        self.deserialize = deserialize
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        self.streams: dict[int, AsyncStream[dict]] = {}
+        self.aborted_request_ids: set[int] = set()
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -101,19 +106,159 @@ class InferenceClient:
 
         Returns:
             asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequestRecord` object containing the completed result.
+            `DynamicInferenceRequest` object (if deserialize=True) or a raw
+            serialized dict (if deserialize=False) containing the completed result.
         """
-        if not self.running.is_set():
-            raise RuntimeError("InferenceClient is not currently running.")
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        return self._submit_request(payload, request_id)
+
+    def _make_kv_handoff_request(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> tuple[int, list]:
+        """Allocate an ID and build a decode request carrying remote KV metadata."""
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            list(src_block_ids),
+        ]
+        return request_id, payload
+
+    def add_request_with_kv_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> asyncio.Future:
+        """Submit a request with remote KV metadata.
+
+        The decode engine allocates local blocks, pulls the KV from the
+        prefill peer described by ``kv_meta``, then begins generation.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            asyncio.Future: A future that resolves to the completed request.
+        """
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
+        )
+        return self._submit_request(payload, request_id)
+
+    def add_request_with_kv_handoff_streaming(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> AsyncStream[dict]:
+        """Submit a streaming request with remote KV metadata.
+
+        Returns the same per-step partial/final iterator as
+        :meth:`add_request_streaming`.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            AsyncStream[dict]: Per-step partial and final reply frames.
+        """
+        sampling_params.streaming = True
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
+        )
+        return self._submit_stream(payload, request_id)
+
+    def release_handoff(self, request_id: int) -> None:
+        """Tell the coordinator to release the KV blocks pinned for `request_id`.
+
+        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
+        engines without that request_id ignore the message.
+        """
+        payload = [Headers.RELEASE_KV.value, int(request_id)]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
+    def abort_request(self, request_id: int) -> None:
+        """Cancel an in-flight request and close its local response stream."""
+        request_id = int(request_id)
+        self.aborted_request_ids.add(request_id)
+        stream = self.streams.pop(request_id, None)
+        if stream is not None:
+            stream.finish()
+        future = self.completion_futures.pop(request_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self.request_submission_times.pop(request_id, None)
+        payload = [Headers.ABORT_REQUEST.value, request_id]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
+    def add_request_streaming(
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+    ) -> AsyncStream[dict]:
+        """Submit a streaming inference request.
+
+        Used by Dynamo directly and by the OpenAI-compatible HTTP frontend.
+
+        Returns an async iterator that yields incremental output dictionaries:
+
+        - ``{"partial": {"request_id": int, "new_tokens": list[int]}}`` whenever
+          the request's streaming interval is reached, in order.
+        - ``{"final": <full reply dict or DynamicInferenceRequest>}`` exactly once
+          at the end. The iterator then stops.
+
+        ``sampling_params.streaming`` is forced to True before submission so the
+        engine knows to emit ENGINE_REPLY_PARTIAL frames for this request.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters. ``streaming`` is set to True
+                in-place.
+
+        Returns:
+            AsyncStream[dict]: Per-step partial and final reply frames.
+        """
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        return self._submit_stream(payload, request_id)
+
+    def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
+        """Send a prepared request and register its completion future."""
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = self._loop.create_future()
+        future = asyncio.get_running_loop().create_future()
+        self.completion_futures[request_id] = future
         self.request_submission_times[request_id] = time.perf_counter()
-        return self.completion_futures[request_id]
+        return future
+
+    def _submit_stream(self, payload: list, request_id: int) -> AsyncStream[dict]:
+        """Send a prepared streaming request and register its response stream."""
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        stream = AsyncStream(
+            request_id, functools.partial(self.abort_request, request_id), loop=self._loop
+        )
+        self.streams[request_id] = stream
+        self.request_submission_times[request_id] = time.perf_counter()
+        return stream
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -134,25 +279,43 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
-                    reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
-                        request_id
-                    )
+                    if request_id in self.aborted_request_ids:
+                        self.aborted_request_ids.discard(request_id)
+                        continue
+                    submitted = self.request_submission_times.pop(request_id, None)
+                    if submitted is not None:
+                        reply['latency'] = time.perf_counter() - submitted
+                    # Streaming path: deliver final reply + sentinel and stop.
+                    if request_id in self.streams:
+                        stream = self.streams.pop(request_id)
+                        completed_request = (
+                            DynamicInferenceRequest.deserialize(reply)
+                            if self.deserialize
+                            else reply
+                        )
+                        stream.put({"final": completed_request})
+                        stream.finish()
+                        continue
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
-                    completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
-                elif header == Headers.PAUSE_ACK:
-                    self.paused.set()
-                elif header == Headers.STOP_ACK:
-                    self.stopped.set()
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+                    )
+                    completion_future.set_result(completed_request)
+                elif header == Headers.ENGINE_REPLY_PARTIAL:
+                    request_id, partial = data[1:]
+                    stream = self.streams.get(request_id)
+                    if stream is not None:
+                        stream.put({"partial": partial})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
             except KeyboardInterrupt:
                 break
 
-    def _connect_with_inference_coordinator(self):
+    def _connect_with_inference_coordinator(self, timeout_seconds: Optional[float] = None):
         """
         Performs the initial handshake with the inference coordinator.
 
@@ -161,82 +324,104 @@ class InferenceClient:
         """
         payload = [Headers.CONNECT.value]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        assert Headers(reply) == Headers.CONNECT_ACK
+        if timeout_seconds is not None and not self.socket.poll(
+            timeout=max(0, int(timeout_seconds * 1000))
+        ):
+            raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
+        reply = msgpack.unpackb(self.socket.recv(), raw=False)
+        assert Headers(reply[0]) == Headers.CONNECT_ACK
 
-    async def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def start(
+        self,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        connect_timeout_seconds: Optional[float] = None,
+    ):
         """
         Connects to the coordinator and starts the background listener task.
 
-        This method must be awaited before submitting any requests. It handles
+        This must be called before submitting any requests. It handles
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
-        self.running.set()
-        self.paused.clear()
-        self.stopped.clear()
-        self._connect_with_inference_coordinator()
+        self._connect_with_inference_coordinator(connect_timeout_seconds)
         self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
+    def _send_signal_to_engines(self, signal, *args):
         """
         Sends a generic control signal to the inference coordinator.
 
         Args:
             signal: The signal to send, typically a value from the `Headers` enum.
+            *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value]
+        payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self) -> Awaitable:
-        """Sends a signal to pause all inference engines.
+    def pause_engines(self):
+        """Sends PAUSE to all engines via coordinator.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `paused` flags upon seeing the ACK.
-
-        Returns:
-            Awaitable: An awaitable that resolves when all engines have paused.
+        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
+        then synchronizes via a world-wide barrier before transitioning to
+        PAUSED. Callers should await engine.paused for confirmation.
         """
         self._send_signal_to_engines(Headers.PAUSE)
-        return self.paused.wait()
 
     def unpause_engines(self) -> None:
-        """Sends a signal to unpause all inference engines."""
-        self.paused.clear()
-        self.running.set()
+        """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def start_cuda_profiler(self) -> None:
+        """Sends START_CUDA_PROFILER to all engines via coordinator.
+
+        Each engine calls ``torch.cuda.profiler.start()`` (cudaProfilerStart) on
+        its next loop iteration, so an outer ``nsys profile --capture-range=
+        cudaProfilerApi`` begins recording. No synchronization needed.
+        """
+        self._send_signal_to_engines(Headers.START_CUDA_PROFILER)
+
+    def stop_cuda_profiler(self) -> None:
+        """Sends STOP_CUDA_PROFILER to all engines (cudaProfilerStop)."""
+        self._send_signal_to_engines(Headers.STOP_CUDA_PROFILER)
+
+    def set_generation_epoch(self, generation_epoch: int):
+        """Sends a signal to stamp all in-flight requests with the given generation epoch.
+
+        Args:
+            generation_epoch: The current generation epoch number.
+        """
+        self._send_signal_to_engines(Headers.SET_GENERATION_EPOCH, generation_epoch)
+
     def suspend_engines(self):
-        """Sends a signal to pause all inference engines."""
-        self._send_signal_to_engines(Headers.PAUSE)
+        """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
+
+        Callers should await engine.suspended for confirmation.
+        """
         self._send_signal_to_engines(Headers.SUSPEND)
 
     def resume_engines(self):
-        """Sends a signal to unpause all inference engines."""
+        """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
+
+        Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
+        """
         self._send_signal_to_engines(Headers.RESUME)
-        self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def stop_engines(self) -> Awaitable:
-        """Sends a signal to gracefully stop all inference engines.
+    def stop_engines(self):
+        """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `stopped` flags upon seeing the ACK.
-
-        Returns:
-            Awaitable: An awaitable that resolves when all engines have stopped.
+        Callers should await engine.stopped for confirmation.
+        Does not affect the coordinator.
         """
         self._send_signal_to_engines(Headers.STOP)
-        self.running.clear()
-        return self.stopped.wait()
+
+    def shutdown_coordinator(self):
+        """Tells the coordinator process to exit its main loop.
+
+        Does not affect the engines.
+        """
+        self._send_signal_to_engines(Headers.SHUTDOWN)
 
     def stop(self):
         """
@@ -246,6 +431,17 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        self.listener_task.cancel()
-        self.socket.close()
+        if hasattr(self, 'listener_task') and not self.listener_task.done():
+            self.listener_task.cancel()
+        # Wake up any listeners.
+        for future in self.completion_futures.values():
+            if not future.done():
+                future.cancel()
+        self.completion_futures.clear()
+        # Terminate any open streaming iterators.
+        for stream in self.streams.values():
+            stream.finish()
+        self.streams.clear()
+        self.aborted_request_ids.clear()
+        self.socket.close(linger=0)
         self.context.term()

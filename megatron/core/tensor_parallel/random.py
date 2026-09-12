@@ -1,24 +1,83 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, TypeVar, Union
 
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
+from torch.utils.cpp_extension import load_inline
+from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
+    get_expert_gtp_weight_remat_rank,
+    get_expert_gtp_weight_remat_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
+    get_gtp_weight_remat_rank,
+    get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+
+# ---------------------------------------------------------------------------
+# C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
+# ---------------------------------------------------------------------------
+# Makes dst's UntypedStorage point to src's data WITHOUT copying bytes.
+# Holds a refcounted reference to src's StorageImpl so the memory stays alive.
+# Operates below the Tensor / autograd layer → no version-counter bump,
+# and ALL TensorImpls that reference dst's StorageImpl (including views
+# created by reshape / split / etc. inside TE GroupedLinear) see the data.
+# ---------------------------------------------------------------------------
+
+_SHARE_STORAGE_SRC = r"""
+#include <torch/extension.h>
+
+void share_storage(at::Tensor dst, at::Tensor src) {
+    auto* dst_impl = dst.storage().unsafeGetStorageImpl();
+
+    // Copy src's c10::Storage (increments StorageImpl refcount).
+    auto* src_storage_ref = new c10::Storage(src.storage());
+
+    void*       data   = src_storage_ref->data_ptr().get();
+    size_t      nbytes = src_storage_ref->nbytes();
+    c10::Device device = src_storage_ref->device();
+
+    // Build a DataPtr whose deleter releases our StorageImpl reference.
+    c10::DataPtr shared(
+        data,
+        static_cast<void*>(src_storage_ref),
+        [](void* ctx) { delete static_cast<c10::Storage*>(ctx); },
+        device);
+
+    dst_impl->set_data_ptr(std::move(shared));
+    dst_impl->set_nbytes(nbytes);
+}
+"""
+
+_share_storage_ext = None
+
+
+def _get_share_storage():
+    """Lazily compile & cache the share_storage extension."""
+    global _share_storage_ext
+    if _share_storage_ext is None:
+        _share_storage_ext = load_inline(
+            name="share_storage_ext",
+            cpp_sources=_SHARE_STORAGE_SRC,
+            functions=["share_storage"],
+            verbose=False,
+        )
+    return _share_storage_ext.share_storage
+
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
@@ -36,6 +95,10 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+# GTP_remat weight-init trackers: shards init per-rank, so each peer must draw DIFFERENT values;
+# registered only when the axis is active (see model_parallel_cuda_manual_seed).
+_GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
+_EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
 
 
 def _get_cuda_rng_state(
@@ -111,6 +174,41 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: b
     _lazy_call(cb)
 
 
+def convert_cuda_rng_state(
+    state: Union[torch.Tensor, torch.Generator], to_graphable: bool = False
+) -> Union[torch.Tensor, torch.Generator]:
+    """
+    Convert the cuda rng state tensor to the graphable version,
+    or from the graphable version to the non-graphable tensor version.
+    """
+    if to_graphable:
+        if isinstance(state, torch.Tensor):
+            # Convert to the graphable version.
+            # Store current rng state.
+            orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=False)
+            # Set rng state to the desired one
+            _set_cuda_rng_state(state, graph_safe=False)
+            # Get the graphable state
+            graphable_state = _get_cuda_rng_state(clone=True, graph_safe=True)
+            # And set the state to the original state we started with.
+            _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=False)
+            return graphable_state
+        elif isinstance(state, torch.Generator):
+            # already graphable, just return it.
+            return state
+        else:
+            raise ValueError(f"Invalid state type: {type(state)}")
+    else:
+        if isinstance(state, torch.Tensor):
+            # already non-graphable, just return it.
+            return state
+        elif isinstance(state, torch.Generator):
+            # Convert to the non-graphable tensor version.
+            return state.get_state()
+        else:
+            raise ValueError(f"Invalid state type: {type(state)}")
+
+
 def get_expert_parallel_rng_tracker_name():
     """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
@@ -121,6 +219,11 @@ def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_gtp_remat_rng_tracker_name(is_expert=False):
+    """Get the (E)GTP_remat weight-init rng tracker name (per-(E)GTP-rank distinct draws)."""
+    return _EXPERT_GTP_REMAT_RNG_TRACKER_NAME if is_expert else _GTP_REMAT_RNG_TRACKER_NAME
 
 
 class CudaRNGStatesTracker:
@@ -160,6 +263,10 @@ class CudaRNGStatesTracker:
 
         # Seeds are just for book keeping and ensure no seed is set twice.
         self.seeds_ = set()
+
+        # Name of the rng state currently being used in the generator.
+        # The default one is "default-rng" and won't be pushed to the self.states_ dictionary.
+        self._current_state_name = "default-rng"
 
     def get_states(self):
         """Get rng states. Copy the dictionary so we have direct
@@ -207,10 +314,14 @@ class CudaRNGStatesTracker:
         # Check if we have added the state
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
-        # Store current rng state.
+        # Store current rng state and name. Store in self.states_ if it's not the default state.
         orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
-        # Set rng state to the desired one
+        orig_state_name = self._current_state_name
+        if orig_state_name != "default-rng":
+            self.states_[orig_state_name] = orig_cuda_rng_state
+        # Set rng state and name to the desired one.
         _set_cuda_rng_state(self.states_[name], graph_safe=self.use_cudagraphable_rng)
+        self._current_state_name = name
         # Record cpu RNG state
         cpu_rng_state = torch.get_rng_state()
         # Do the stuff we wanted to do.
@@ -220,10 +331,19 @@ class CudaRNGStatesTracker:
             # Throw a warning if cpu RNG state changed
             if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
                 logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
+            # Check if the current state name is the same as the desired state name.
+            if self._current_state_name != name:
+                raise Exception(
+                    f'current state name {self._current_state_name} is not the same as the desired '
+                    f'state name {name}.'
+                )
             # Update the current rng state for later use.
             self.states_[name] = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
-            # And set the state to the original state we started with.
+            # And set the state and name to the original state we started with.
+            if orig_state_name != "default-rng":
+                orig_cuda_rng_state = self.states_[orig_state_name]
             _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=self.use_cudagraphable_rng)
+            self._current_state_name = orig_state_name
 
 
 # RNG tracker object.
@@ -331,7 +451,11 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    gtp_remat_rank: Optional[int] = None,
+    egtp_remat_rank: Optional[int] = None,
     force_reset_rng: bool = False,
+    gtp_remat_world_size: Optional[int] = None,
+    egtp_remat_world_size: Optional[int] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -356,6 +480,14 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
+    if gtp_remat_rank is None:
+        gtp_remat_rank = get_gtp_weight_remat_rank()
+    if egtp_remat_rank is None:
+        egtp_remat_rank = get_expert_gtp_weight_remat_rank()
+    if gtp_remat_world_size is None:
+        gtp_remat_world_size = get_gtp_weight_remat_world_size()
+    if egtp_remat_world_size is None:
+        egtp_remat_world_size = get_expert_gtp_weight_remat_world_size()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -376,11 +508,36 @@ def model_parallel_cuda_manual_seed(
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
+    # GTP_remat weight-init states: shards are initialized per-rank (GTP-agnostic init), so peers
+    # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
+    # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
+    # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
+    if gtp_remat_world_size > 1:
+        gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
+    if egtp_remat_world_size > 1:
+        egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
+
+
+def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
+    """Check if the cuda rng tracker is graph safe version."""
+    if HAVE_TE and is_te_min_version("1.5.0"):
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+
+        if isinstance(cuda_rng_tracker, TECudaRNGStatesTracker):
+            return True
+    if getattr(cuda_rng_tracker, "use_cudagraphable_rng", False):
+        return True
+    return False
+
 
 def _get_all_rng_states():
     """Get all the rng states."""
     cpu_rng_state = torch.get_rng_state()
-    cuda_rng_state = _get_cuda_rng_state()
+    cuda_rng_state = _get_cuda_rng_state(
+        graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+    )
     cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
@@ -388,7 +545,9 @@ def _get_all_rng_states():
 def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
     """Set all the rng states."""
     torch.set_rng_state(cpu_rng_state)
-    _set_cuda_rng_state(cuda_rng_state)
+    _set_cuda_rng_state(
+        cuda_rng_state, graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+    )
     get_cuda_rng_tracker().set_states(cuda_rng_state_tracker)
 
 
@@ -404,6 +563,31 @@ def _fork_rng():
         _set_all_rng_states(*current_states)
 
 
+# Global flag that's toggled whenever inside a checkpointing context
+IS_CHECKPOINTING = False
+
+
+def _set_checkpointing():
+    """Set state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = True
+
+
+def _unset_checkpointing():
+    """Unset state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = False
+
+
+def is_checkpointing():
+    """Check if currently in a checkpoint context."""
+    return IS_CHECKPOINTING
+
+
+_R = TypeVar('_R')
+_Ts = TypeVarTuple('_Ts')
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -414,8 +598,15 @@ class CheckpointFunction(torch.autograd.Function):
 
     # pylint: disable=missing-function-docstring
     @staticmethod
-    def forward(ctx, run_function, distribute_saved_activations, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        distribute_saved_activations: bool,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
+        _set_checkpointing()
+
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
@@ -436,17 +627,22 @@ class CheckpointFunction(torch.autograd.Function):
         # Store everything.
         ctx.save_for_backward(*args)
 
+        _unset_checkpointing()
         return outputs
 
     # pylint: disable=missing-function-docstring
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        if not torch.autograd._is_checkpoint_valid():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
+        _set_checkpointing()
+
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
@@ -471,23 +667,102 @@ class CheckpointFunction(torch.autograd.Function):
         )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
+
+        _unset_checkpointing()
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+    # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
+    # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot
+    # run inside a captured graph.
+    if is_graph_warmup() or is_graph_capturing():
+        return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+
+
+def _save_args_to_ctx(ctx, args):
+    """Save mixed tensor/non-tensor arguments into autograd ctx.
+
+    Since save_for_backward only supports tensors, this function separates
+    tensor and non-tensor arguments, saving tensors via save_for_backward
+    and storing non-tensor metadata (indices and values) as ctx attributes.
+
+    Use _load_args_from_ctx to reconstruct the original args.
+    """
+    tensor_args = []
+    non_tensor_entries = []
+
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+            continue
+        non_tensor_entries.append((index, arg))
+
+    # Save the raw tensors (as torch.utils.checkpoint does) rather than
+    # detach_variable()-ed copies: detaching here creates leaf tensors that require
+    # grad, and autograd's SavedVariable keeps such leaves alive until backward even
+    # when saved-tensor hooks (e.g. fine-grained activation offload) pack them away,
+    # pinning the input storage on GPU for the whole forward-backward interval.
+    # _load_args_from_ctx() detaches the unpacked tensors before they are reused.
+    ctx.save_for_backward(*tensor_args)
+    ctx._non_tensor_entries = tuple(non_tensor_entries)
+    ctx._total_args_count = len(args)
+
+
+def _load_args_from_ctx(ctx):
+    """Load and reconstruct mixed tensor/non-tensor arguments from autograd ctx.
+
+    This is the inverse of _save_args_to_ctx. It retrieves tensors from
+    ctx.saved_tensors and merges them with stored non-tensor arguments
+    to reconstruct the original args in their original order.
+
+    Returns:
+        tuple of reconstructed arguments in their original order.
+    """
+
+    def _detach_with_grad(tensor):
+        detached = tensor.detach()
+        detached.requires_grad_(tensor.requires_grad)
+        return detached
+
+    tensor_iter = iter(_detach_with_grad(t) for t in ctx.saved_tensors)
+    total_args_count = ctx._total_args_count
+    non_tensor_map = dict(ctx._non_tensor_entries)
+
+    reconstructed_args = []
+    for index in range(total_args_count):
+        if index in non_tensor_map:
+            reconstructed_args.append(non_tensor_map[index])
+        else:
+            reconstructed_args.append(next(tensor_iter))
+    return tuple(reconstructed_args)
 
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
-    Checkpoint Function Helper for CheckpointWithouOutput.
+    Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
+
+    Handles both tensor and non-tensor arguments:
+    - Tensor arguments are saved via save_for_backward
+    - Non-tensor arguments (int, float, bool, None, etc.) are stored separately
+      in ctx attributes and reconstructed during recomputation
     """
 
     @staticmethod
-    def forward(ctx, run_function, checkpoint_without_output_obj, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        checkpoint_without_output_obj: CheckpointWithoutOutput,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
         if checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
@@ -501,7 +776,10 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+
+        # Save tensor and non-tensor arguments into ctx for recomputation
+        _save_args_to_ctx(ctx, args)
+
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -510,12 +788,76 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        inputs = ctx.saved_tensors
+        # Get the inputs from the context instead of the saved tensors
+        # because the saved tensors are already cached by the recomputation.
+        # This is to avoid double-reloading the inputs in CPU offloading scenario.
+        inputs = ctx.inputs
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        # A checkpointed function may return auxiliary tensors that are not
+        # connected to its inputs (for example a bias/metadata output). The
+        # custom Function's outward-facing tensors participate in autograd, but
+        # their recomputed counterparts correctly have requires_grad=False.
+        # Passing those counterparts to torch.autograd.backward raises instead
+        # of treating them as zero-gradient outputs, so filter them here.
+        differentiable = [
+            (output, grad)
+            for output, grad in zip(outputs, args)
+            if isinstance(output, torch.Tensor) and output.requires_grad
+        ]
+        if differentiable:
+            torch.autograd.backward(
+                tuple(output for output, _ in differentiable),
+                tuple(grad for _, grad in differentiable),
+            )
         ctx.outputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+        ctx.inputs = None
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
         return (None, None) + grads
+
+
+class CheckpointWithoutOutputManager:
+    """
+    Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
+    within a TransformerBlock, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+
+    Usage:
+        manager = CheckpointWithoutOutputManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
+        ckpt_function.checkpoint(run_function, *args)
+        # other checkpointed operations
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+    """
+
+    def __init__(self):
+        self.checkpoints = []
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        for ckpt in self.checkpoints:
+            ckpt._discard_outputs()
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        for ckpt in self.checkpoints:
+            # Call _recompute for each checkpoint in forward order
+            # The _recompute method will restore the output tensor storage
+            ckpt._recompute(None)
 
 
 class CheckpointWithoutOutput(object):
@@ -532,8 +874,30 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
+    def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
+        """
+        Initialize CheckpointWithoutOutput.
+
+        Args:
+            fp8: Quantization recipe, or a bool. Note that the default `fp8=False`
+                 still evaluates to `self.fp8 = True`; every caller that constructs
+                 `CheckpointWithoutOutput()` with no arguments therefore takes the
+                 TE `activation_recompute_forward` path. That is long-standing
+                 behavior which several selective-recompute modules ("layernorm",
+                 "moe_act", "gdn_norm_out") depend on for correct FP8 amax
+                 bookkeeping, so do NOT "fix" this to `bool(fp8)` here — tightening
+                 it changes FP8 numerics and needs its own PR with FP8
+                 functional-test evidence.
+            ckpt_manager: Optional CheckpointWithoutOutputManager instance. When provided,
+                         checkpoint() will auto-register to the manager, and
+                         discard_output_and_register_recompute() will only discard
+                         output without registering individual hooks.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
+        """
         self.fp8 = fp8 is not None
+        self.ckpt_manager = ckpt_manager
+        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -541,21 +905,52 @@ class CheckpointWithoutOutput(object):
         self.ctx = None
         self.outputs = None
 
-    def checkpoint(self, run_function, *args):
-        """Checkpoint function."""
+    def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
+        """
+        Checkpoint function.
+
+        If ckpt_manager was provided during initialization, this checkpoint
+        will be automatically registered to the manager after execution.
+        """
+
+        # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
+        # may be called in a separate graph warmup.
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if is_graph_warmup():
+            return run_function(*args)
+
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
+
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        # Auto-register to manager if provided
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.add_checkpoint(self)
+
         return outputs
 
     def _recompute(self, _):
         """Used as a hook to recompute the output."""
-        if not torch.autograd._is_checkpoint_valid():
+
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        # The recomputation has been triggered already. Just return.
+        # Handle cudagraphs: do nothing if currently in graph warmup
+        if self.ctx is None or is_graph_warmup():
+            return
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -573,8 +968,10 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
+            # Reconstruct full args list from saved ctx
+            inputs = _load_args_from_ctx(self.ctx)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
-                outputs = self.run_function(*self.ctx.saved_tensors)
+                outputs = self.run_function(*inputs)
 
         self.run_function = None
         self.rng_states = None
@@ -582,16 +979,36 @@ class CheckpointWithoutOutput(object):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
 
-        # restore the recomputed memory without changing the metadata
-        with torch.no_grad():
-            for output, recomputation_output in zip(self.outputs, outputs):
-                output_size = recomputation_output.untyped_storage().size()
-                output.untyped_storage().resize_(output_size)
-                output.untyped_storage().copy_(recomputation_output.untyped_storage())
+        # Zero-copy: make output's StorageImpl point to recomputation_output's data.
+        # This operates at the UntypedStorage level (below TensorImpl), so:
+        #   - ALL views / reshapes that reference output's StorageImpl see the data
+        #     (e.g. TE GroupedLinear's inp.reshape() + torch.split() saved for backward)
+        #   - No tensor version-counter bump (no autograd complaint)
+        share_storage = _get_share_storage()
+        for output, recomputation_output in zip(self.outputs, outputs):
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
+                share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
+        self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
+
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
 
     def discard_output_and_register_recompute(self, hook_tensor):
         """
@@ -602,10 +1019,15 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # When ckpt_manager is set, this is a no-op.
+        # Manager handles all discarding and hook registration uniformly.
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if self.ckpt_manager is not None or is_graph_warmup():
+            return
+
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected

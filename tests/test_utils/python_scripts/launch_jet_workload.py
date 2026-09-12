@@ -8,6 +8,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 import zipfile
 from typing import Dict, List, Optional
 
@@ -40,6 +41,79 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
 
     signal.signal(signal.SIGINT, sigterm_handler)
     signal.signal(signal.SIGTERM, sigterm_handler)
+
+
+TERMINAL_PIPELINE_STATUSES = frozenset(
+    {
+        PipelineStatus.SUCCESS,
+        PipelineStatus.FAILED,
+        PipelineStatus.CANCELED,
+        PipelineStatus.SUBMISSION_FAILED,
+    }
+)
+
+
+class StatusPollTimeout(Exception):
+    """Raised by the watchdog when a single pipeline status poll exceeds its budget."""
+
+
+def wait_for_pipeline_completion(
+    pipeline: jetclient.JETPipeline,
+    max_wait_time: int = 60 * 60 * 12,
+    interval: int = 60,
+    poll_timeout: int = 60 * 3,
+) -> PipelineStatus:
+    """Block until a downstream JET pipeline reaches a terminal status.
+
+    jetclient's own ``pipeline.wait`` polls the GitLab API with no socket read
+    timeout and only re-checks ``max_wait_time`` between polls, so a silently
+    dropped TCP connection wedges ``recv`` forever and the wait never returns
+    (observed: a release job hung ~28h after its downstream had already
+    finished). This drives the status poll directly and guards each individual
+    poll with a SIGALRM watchdog, so a hung connection is interrupted and
+    retried, while a wall-clock deadline bounds the total wait.
+
+    Args:
+        pipeline: The submitted downstream JET pipeline to watch.
+        max_wait_time: Wall-clock budget in seconds before giving up.
+        interval: Seconds to sleep between status polls.
+        poll_timeout: Per-poll watchdog budget in seconds.
+
+    Returns:
+        The terminal status reached by the pipeline.
+
+    Raises:
+        jetclient.facades.objects.util.WaitTimeExceeded: If the pipeline does
+            not reach a terminal status within ``max_wait_time`` seconds.
+    """
+
+    def raise_poll_timeout(_signo, _stack_frame):
+        raise StatusPollTimeout
+
+    deadline = time.monotonic() + max_wait_time
+    previous_handler = signal.signal(signal.SIGALRM, raise_poll_timeout)
+    try:
+        while time.monotonic() < deadline:
+            signal.alarm(poll_timeout)
+            try:
+                status = pipeline.get_status()
+            except (StatusPollTimeout, jetclient.clients.gitlab.GitlabAPIError) as e:
+                logger.warning("Pipeline status poll failed (%s); retrying", type(e).__name__)
+                status = None
+            finally:
+                signal.alarm(0)
+
+            if status in TERMINAL_PIPELINE_STATUSES:
+                return status
+
+            time.sleep(interval)
+
+        raise jetclient.facades.objects.util.WaitTimeExceeded(
+            f"Pipeline {pipeline.jet_id} did not reach a terminal status "
+            f"within {max_wait_time} seconds"
+        )
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def launch_and_wait_for_completion(
@@ -93,6 +167,7 @@ def launch_and_wait_for_completion(
                             "environments": {
                                 cluster: {
                                     "variables": {
+                                        "PYTHONUNBUFFERED": "1",
                                         "RUN_NAME": run_name or "",
                                         "ENABLE_LIGHTWEIGHT_MODE": str(
                                             enable_lightweight_mode
@@ -108,17 +183,15 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
-                                        "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
+                                        "HF_HUB_CACHE": "/mnt/artifacts/hf_home/hub",
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
+                                        "RUN_ID": str(uuid.uuid4()),
+                                        "CLEANUP_PATHS": os.getenv("CLEANUP_PATHS") or "",
                                     }
                                 }
                             }
                         }
-                    },
-                    "outputs": {
-                        "enabled": True,
-                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
@@ -149,9 +222,19 @@ def launch_and_wait_for_completion(
         pipeline.jet_id,
     )
 
-    pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 1, retries_on_error=3)
+    try:
+        status = wait_for_pipeline_completion(pipeline)
+        logger.info(f"Pipeline terminated; status: {status}")
+    except jetclient.facades.objects.util.WaitTimeExceeded:
+        logger.error(
+            "Pipeline %s exceeded the wall-clock budget; cancelling so the iteration retries.",
+            pipeline.jet_id,
+        )
+        try:
+            pipeline.cancel()
+        except jetclient.clients.gitlab.GitlabAPIError:
+            logger.exception("Failed to cancel pipeline %s", pipeline.jet_id)
 
-    logger.info(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
 
 
@@ -255,16 +338,16 @@ def telemetrics_and_exit(
         logger.info("No dashboard endpoint found, skipping telemetrics")
         return
 
-    res = requests.post(
-        DASHBOARD_ENDPOINT,
-        data=payload,
-        headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
-    )
-
-    if not res.ok:
-        raise requests.exceptions.HTTPError(
-            f"Failed to make POST request. Received response: {res.status_code}"
+    try:
+        res = requests.post(
+            DASHBOARD_ENDPOINT,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
         )
+        if not res.ok:
+            logger.warning(f"Failed to make POST request. Received response: {res.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to post telemetry: {e}")
     sys.exit(int(not success))
 
 
@@ -292,6 +375,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
     )
 
 
@@ -449,7 +534,7 @@ def main(
             ["\n".join(log_lines) for log_lines in allranks_logs.values()]
         )
         concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "":
+        if concat_allranks_logs.strip() == "" and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
@@ -524,7 +609,8 @@ def main(
                 logger.info("Release training finished")
                 sys.exit(int(not success))  # invert for exit 0
 
-            if parse_failed_job(logs=mainrank_log):
+            if not success or parse_failed_job(logs=mainrank_log):
+                logger.error("Release pipeline finished with status %s, retrying.", status.name)
                 n_attempts += 1
                 continue
 

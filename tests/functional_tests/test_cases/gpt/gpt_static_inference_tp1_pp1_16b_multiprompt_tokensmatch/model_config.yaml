@@ -1,5 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -75,9 +76,12 @@ MODEL_ARGS:
   --num-tokens-to-generate: 80
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
-  --output-path: ${TENSORBOARD_PATH}
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+  --use-legacy-static-engine: true
   --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/test_prompts.jsonl
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-logging-step-interval: 1
+  --inference-dynamic-batching-buffer-size-gb: 20
 METRICS:
   - "generated_text"
+LAUNCHER: ft_launcher

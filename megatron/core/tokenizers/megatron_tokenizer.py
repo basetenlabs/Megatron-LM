@@ -1,25 +1,23 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import importlib
 import json
 import logging
 import os
-from collections import OrderedDict
 from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
-TOKENIZER_MAPPING_NAMES = OrderedDict(
-    [
-        ("default", "DefaultTokenizerText"),
-        ("gpt", "GPTTokenizer"),
-        ("mamba", "MambaTokenizer"),
-        ("bert", "BertTokenizer"),
-        ("t5", "T5Tokenizer"),
-        ("retro", "RetroTokenizer"),
-    ]
-)
-
-TOKENIZER_LIBRARIES = ["sentencepiece", "huggingface", "megatron", "tiktoken", "byte-level", "null"]
+TEXT_LIBRARIES = [
+    "sentencepiece",
+    "huggingface",
+    "megatron",
+    "tiktoken",
+    "byte-level",
+    "null-text",
+    "sft",
+]
+VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +68,22 @@ class MegatronTokenizer:
                 f"Expected metadata_path to be str or dict, but got {type(metadata_path)}."
             )
 
-        if metadata.get('library', None) not in ['byte-level', 'null']:
+        tokenizer_library = metadata.get('library', None)
+        if tokenizer_library not in ['byte-level', 'null-text', 'null-multimodal']:
             assert tokenizer_path, "Tokenizer path must be specified."
 
-        # Initialize tokenizer object
-        if metadata.get('tokenizer_class', None):
-            tokenizer_cls = getattr(
-                metadata['tokenizer_class_path'], metadata['tokenizer_class_name']
-            )
-        else:
-            import megatron.core.tokenizers.text.models as models
+        if tokenizer_library in ['multimodal']:
+            assert 'prompt_format' in kwargs, "Prompt format (`prompt_format`) must be specified."
+            assert (
+                'special_tokens' in kwargs
+            ), "Special tokens (`special_tokens`) must be specified."
+            assert (
+                'image_tag_type' in kwargs
+            ), "Image tag type (`image_tag_type`) must be specified."
 
-            model_type = metadata.get('model_type', 'default')
-            tokenizer_cls = getattr(models, TOKENIZER_MAPPING_NAMES[model_type])
+        # Initialize tokenizer object
+        tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata)
+
         metadata['metadata_path'] = metadata_path
         tokenizer = tokenizer_cls(path=tokenizer_path, config=metadata, **kwargs)
 
@@ -91,7 +92,6 @@ class MegatronTokenizer:
     def write_metadata(
         tokenizer_path: str,
         tokenizer_library: str,
-        model_type: Optional[str] = None,
         tokenizer_class: Optional[MegatronTokenizerBase] = None,
         chat_template: Optional[str] = None,
         overwrite: Optional[bool] = False,
@@ -103,9 +103,6 @@ class MegatronTokenizer:
         Args:
             tokenizer_path (str): path to tokenizer model.
             tokenizer_library (str): tokenizer model library.
-            model_type (str): type of the model to be used with tokenizer.
-                list of available model types: [gpt, bert, t5, mamba, retro, default].
-                `DefaultTokenizerText` will be used if model_type is not specified.
             tokenizer_class (MegatronTokenizerBase): pre-defined tokenizer class.
             chat_template (str): tokenizer chat template in jinja format.
             overwrite (bool): overwrites existing metadata file if set to True.
@@ -116,19 +113,20 @@ class MegatronTokenizer:
             MegatronTokenizer.write_metadata(
                 tokenizer_path='/path/to/tokenzier/model',
                 tokenizer_library='sentencepiece',
-                model_type='llama',
             )
         """
 
         assert os.path.exists(
             tokenizer_path
         ), "Tokenizer path doesn't exist. Please, provide the correct path to the tokenizer."
-        assert tokenizer_library in TOKENIZER_LIBRARIES, (
+        assert tokenizer_library in TEXT_LIBRARIES or tokenizer_library in VISION_LIBRARIES, (
             "Tokenizer library is not supported. Please, see the list of available "
-            f"tokenizer libraries: {TOKENIZER_LIBRARIES}."
+            f"tokenizer libraries: text: {TEXT_LIBRARIES}, vision: {VISION_LIBRARIES}."
         )
-        if model_type is None and tokenizer_class is None:
-            model_type = "default"
+        tokenizer_type = 'text' if tokenizer_library in TEXT_LIBRARIES else 'vision'
+
+        if tokenizer_class is None:
+            tokenizer_class = _get_tokenizer_model_class(tokenizer_library, {})
 
         # Write metadata
         if not metadata_path:
@@ -141,9 +139,8 @@ class MegatronTokenizer:
         else:
             metadata = {
                 'library': tokenizer_library,
-                'class_name': tokenizer_class.__name__ if tokenizer_class else None,
-                'class_path': tokenizer_class.__module__ if tokenizer_class else None,
-                'model_type': model_type,
+                'class_name': tokenizer_class.__name__,
+                'class_path': tokenizer_class.__module__,
                 'chat_template': chat_template,
             }
 
@@ -169,3 +166,29 @@ def _get_metadata_path(tokenizer_path: str) -> str:
     metadata_path = f'{dir_path}/tokenizer_metadata.json'
 
     return metadata_path
+
+
+def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
+    """
+    Returns a class which corresponds to choosen tokenizer model type.
+
+    Args:
+        library (str): tokenizer library.
+        metadata (dict): tokenizer metadata.
+
+    Returns:
+        MegatronTokenizerBase: class for choosen tokenizer model type.
+    """
+    # Return tokenizer class if it was specified in metadata.
+    if metadata.get('class_name', None):
+        module = importlib.import_module(metadata['class_path'])
+        return getattr(module, metadata['class_name'])
+
+    # Define tokenizer type
+    tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'
+    module = importlib.import_module(f"megatron.core.tokenizers.{tokenizer_type}")
+    class_name = f"MegatronTokenizer{tokenizer_type.capitalize()}"
+
+    tokenizer_cls = getattr(module, class_name)
+
+    return tokenizer_cls

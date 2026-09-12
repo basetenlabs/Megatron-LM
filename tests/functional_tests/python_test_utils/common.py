@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import enum
 import glob
 import json
@@ -79,6 +80,30 @@ class GoldenValues(pydantic.RootModel):
     root: Dict[str, GoldenValueMetric]
 
 
+def _remove_leading_nan_iteration_times(
+    golden_values: Dict[str, GoldenValueMetric],
+) -> Dict[str, GoldenValueMetric]:
+    """Remove leading synthetic NaNs from iteration-time values.
+
+    Internal NaNs are preserved, and an all-NaN metric is left unchanged so
+    missing iteration-time telemetry remains visible.
+    """
+    iteration_time = golden_values.get("iteration-time")
+    if iteration_time is None:
+        return golden_values
+
+    values = list(iteration_time.values.items())
+    first_valid_index = next(
+        (index for index, (_, value) in enumerate(values) if value != "nan"), None
+    )
+    if first_valid_index in (None, 0):
+        return golden_values
+
+    iteration_time.values = dict(values[first_valid_index:])
+    iteration_time.start_step = values[first_valid_index][0]
+    return golden_values
+
+
 class MissingTensorboardLogsError(Exception):
     """Raised if TensorboardLogs not found"""
 
@@ -89,6 +114,32 @@ class UndefinedMetricError(Exception):
 
 class SkipMetricError(Exception):
     """Raised if metric shall be skipped"""
+
+
+def _load_event_accumulators_with_scalars(
+    files: List[str],
+) -> List[event_accumulator.EventAccumulator]:
+    """Loads event-file accumulators that contain scalar data, preserving order.
+
+    A resumed training phase can emit a header-only TensorBoard event file with
+    zero scalars before the file that holds the actual metrics (for example when
+    the fault-tolerance launcher initializes a SummaryWriter ahead of logging).
+    Dropping scalar-less files keeps positional ``index`` selection aligned with
+    real run data instead of latching onto an empty file and yielding no metrics.
+
+    Args:
+        files: Event-file paths, ordered oldest-first.
+
+    Returns:
+        Reloaded accumulators that expose at least one scalar tag, in input order.
+    """
+    accumulators = []
+    for event_file in files:
+        ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
+        ea.Reload()
+        if ea.Tags()["scalars"]:
+            accumulators.append(ea)
+    return accumulators
 
 
 def read_tb_logs_as_list(
@@ -112,18 +163,21 @@ def read_tb_logs_as_list(
         return None
 
     files.sort(key=lambda x: os.path.getmtime(os.path.join(path, pathlib.Path(x).name)))
-    accumulators = []
 
-    if index == -1:
-        for event_file in files:
-            ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
-            ea.Reload()
-            accumulators.append(ea)
-    else:
-        event_file = files[index]
-        ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
-        ea.Reload()
-        accumulators.append(ea)
+    accumulators = _load_event_accumulators_with_scalars(files)
+
+    if not accumulators:
+        logger.error(f"No event file with scalar data found at: {path}")
+        return None
+
+    if index != -1:
+        if index >= len(accumulators):
+            logger.error(
+                f"Requested event-file index {index} but only {len(accumulators)} "
+                f"event file(s) with scalar data found at: {path}"
+            )
+            return None
+        accumulators = [accumulators[index]]
 
     summaries = {}
     for ea in accumulators:
@@ -155,11 +209,11 @@ def read_tb_logs_as_list(
             values=values,
         )
 
-    return golden_values
+    return _remove_leading_nan_iteration_times(golden_values)
 
 
 def read_golden_values_from_json(
-    golden_values_path: Union[str, pathlib.Path]
+    golden_values_path: Union[str, pathlib.Path],
 ) -> Dict[str, GoldenValueMetric]:
     with open(golden_values_path) as f:
         if os.path.exists(golden_values_path):
@@ -207,6 +261,18 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
+                    max_golden_step = max(golden_value.values.keys()) if golden_value.values else 0
+                    steady_window = range(5, 21) if max_golden_step <= 25 else range(30, 46)
+                    actual_value_list = [
+                        value
+                        for value_step, value in actual_values[metric_name].values.items()
+                        if value_step in golden_value.values.keys() and value_step in steady_window
+                    ]
+                    golden_value_list = [
+                        value
+                        for value_step, value in golden_value.values.items()
+                        if value_step in steady_window
+                    ]
                     actual_value_list = [
                         np.median([np.inf if type(v) is str else v for v in actual_value_list])
                     ]
@@ -215,7 +281,9 @@ def pipeline(
                     ]
                     total_steps_evaluated = 1
                 else:
-                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+                    total_steps_evaluated = (
+                        golden_value.end_step - golden_value.start_step
+                    ) / golden_value.step_interval + 1
 
                     actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
                     golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
@@ -226,8 +294,16 @@ def pipeline(
                 # Tolerance check
                 is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
-                num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
-                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
+                if (
+                    test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
+                    or total_steps_evaluated == 1
+                ):
+                    passing = bool(np.all(is_close))
+                else:
+                    num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                    passing = np.mean(is_close) >= 1 - (
+                        num_failing_steps_allowed / total_steps_evaluated
+                    )
 
                 if not passing:
                     logger.info(

@@ -1,13 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from .cross_entropy import vocab_parallel_cross_entropy
 from .data import broadcast_data
-from .inference_layers import InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
+from .inference_layers import (
+    InferenceColumnParallelLinear,
+    InferenceLayerNormColumnParallelLinear,
+    InferenceRowParallelLinear,
+)
 from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    copy_gtp_attributes,
     copy_tensor_model_parallel_attributes,
     linear_with_grad_accumulation_and_async_allreduce,
+    param_is_not_gtp_duplicate,
     param_is_not_tensor_parallel_duplicate,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
@@ -29,9 +35,11 @@ from .mappings import (
 from .random import (
     CheckpointWithoutOutput,
     checkpoint,
+    convert_cuda_rng_state,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
+    is_graph_safe_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from .utils import (
@@ -52,7 +60,9 @@ __all__ = [
     "set_tensor_model_parallel_attributes",
     "set_defaults_if_not_set_tensor_model_parallel_attributes",
     "copy_tensor_model_parallel_attributes",
+    "copy_gtp_attributes",
     "param_is_not_tensor_parallel_duplicate",
+    "param_is_not_gtp_duplicate",
     "linear_with_grad_accumulation_and_async_allreduce",
     # mappings.py
     "copy_to_tensor_model_parallel_region",
@@ -64,9 +74,11 @@ __all__ = [
     "scatter_to_sequence_parallel_region",
     # random.py
     "checkpoint",
+    "convert_cuda_rng_state",
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
     "get_expert_parallel_rng_tracker_name",
+    "is_graph_safe_cuda_rng_tracker",
     "CheckpointWithoutOutput",
     # utils.py
     "split_tensor_along_last_dim",

@@ -6,12 +6,15 @@ import logging
 import os
 import warnings
 from datetime import timedelta
+from math import log2
 from typing import Callable, List, Optional
 
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +25,11 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-logger = logging.getLogger(__name__)
-
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
+# Generalized tensor parallelism group that the current rank belongs to.
+_GTP_WEIGHT_REMAT_GROUP = None
+_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -49,6 +53,9 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # _EXPERT_TENSOR denotes tensor parallelism of expert which splits tensor across the group.
 # _EXPERT_DATA denotes data parallelism of expert which replicates weight across the group.
 
+# Expert generalized tensor parallelism group that current rank belongs to.
+_EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+_EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
@@ -57,12 +64,18 @@ _EXPERT_TENSOR_PARALLEL_GROUP = None
 _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = None
 # Expert tensor, model, pipeline combined parallel group
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
+# Same as above, but additionally merged across EGTP peers (analog of dense _MODEL_PARALLEL_GROUP
+# under GTP_remat). Identical to the above when EGTP_remat_size=1.
+_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+# Full expert data-parallel groups: span the egtp_remat axis, for data distribution.
+_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
+_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 # Parallel state values changed on the fly
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
@@ -99,6 +112,10 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
+# A list of global ranks for each expert model parallel group to ease calculation of
+# the first local rank in the expert model parallel group
+_EXPERT_MODEL_PARALLEL_RANKS = None
+
 # A list of global ranks for each model parallel group to ease calculation of
 # the first local rank in the model parallel group
 _MODEL_PARALLEL_GLOBAL_RANKS = None
@@ -110,6 +127,15 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
+# Hybrid context parallel groups
+_HYBRID_DP_CP_GROUPS = {}
+
+# Full data-parallel groups: span every distinct-data rank
+# (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
+# gradient scaling) and reductions covering all distinct-data ranks.
+_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
+_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
+_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -123,7 +149,7 @@ _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 
-# combined parallel group of TP, DP, and CP used for fp8
+# combined parallel group of TP, DP, and CP used for fp8 (spans gtp_remat, like dp)
 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Paralel group of all GPUs in a distributed optimizer instance
@@ -132,8 +158,6 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# Global symmetric memory buffer for inference
-_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -413,11 +437,44 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
+def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+    """
+    Creates groups required for hybrid DPxCP.
+    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Returns a dictionary indexed by group size.
+    """
+    hybrid_dp_cp_groups = {}
+    # Generate group for every power of 2 up to the number of CP ranks
+    # We limit the allowed group sizes in order to avoid excessive overhead.
+    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    for group_size in group_sizes:
+        for i in range(0, len(ranks), group_size):
+            group = create_group(
+                ranks[i : i + group_size],
+                pg_options=pg_options,
+                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+            )
+            if rank in ranks[i : i + group_size]:
+                assert (
+                    group_size not in hybrid_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
+                hybrid_dp_cp_groups[group_size] = group
+    return hybrid_dp_cp_groups
+
+
 class RankGenerator(object):
     """A class for generating rank groups for different modes of parallelism."""
 
     def __init__(
-        self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
+        self,
+        tp: int,
+        ep: int,
+        dp: int,
+        pp: int,
+        cp: int,
+        order: str,
+        rank_offset: int = 0,
+        gtp_remat: int = 1,
     ) -> None:
         assert (
             ep == 1 or cp == 1
@@ -429,8 +486,9 @@ class RankGenerator(object):
         self.dp = dp
         self.pp = pp
         self.cp = cp
+        self.gtp_remat = gtp_remat
         self.rank_offset = rank_offset
-        self.world_size = tp * dp * pp * cp * ep
+        self.world_size = tp * dp * pp * cp * ep * gtp_remat
 
         self.name_to_size = {
             "tp": self.tp,
@@ -438,6 +496,7 @@ class RankGenerator(object):
             "dp": self.dp,
             "ep": self.ep,
             "cp": self.cp,
+            "gtp_remat": self.gtp_remat,
         }
         self.order = order
         order = order.lower()
@@ -490,6 +549,13 @@ class RankGenerator(object):
                     rank_group[i] += self.rank_offset
         return ranks
 
+    def get_gtp_ranks(self, gtp_remat_size: int):
+        """Get the GTP weight-sharding groups (singletons when ``gtp_remat_size == 1``)."""
+        assert (
+            self.gtp_remat == gtp_remat_size
+        ), f"gtp_remat axis size ({self.gtp_remat}) != requested gtp_remat_size ({gtp_remat_size})"
+        return self.get_ranks('gtp_remat')
+
 
 def default_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the word embeddings live.
@@ -513,6 +579,24 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
+def _inject_gtp_remat_axis(order_str: str, after: str = "tp") -> str:
+    """Inject the 'gtp_remat' axis into a RankGenerator order string for NCCL locality.
+
+    Position controls locality (leftmost token = smallest stride = most adjacent ranks):
+      - dense/decoder: inject after 'tp' -> 'tp-gtp_remat-cp-ep-dp-pp' (GTP_remat local).
+      - expert: inject after 'ep' -> 'tp-cp-ep-gtp_remat-dp-pp' so EP keeps more-local placement
+        than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
+    When gtp_remat/egtp_remat size is 1 the injected axis is a no-op (singleton groups).
+    """
+    toks = order_str.split("-")
+    if "gtp_remat" in toks:
+        return order_str
+    anchor = after if after in toks else "tp"
+    pos = (toks.index(anchor) + 1) if anchor in toks else 0
+    toks.insert(pos, "gtp_remat")
+    return "-".join(toks)
+
+
 # pylint: disable=C0301
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
@@ -522,7 +606,10 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
+    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
+    gtp_remat_size: int = 1,
+    expert_gtp_remat_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
     nccl_communicator_config_path: Optional[str] = None,
@@ -533,6 +620,8 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    rank_offset: int = 0,
+    local_world_size: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -599,6 +688,22 @@ def initialize_model_parallel(
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
+
+        gtp_remat_size (int, default = 1):
+            Generalized tensor parallelism with weight rematerialization (GTP).
+            Shards model weights along ``out_features`` across this many ranks;
+            each weight is rematerialized independently (per-weight, not per-
+            layer) via async all-gather on every forward AND backward pass. A
+            first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
+            dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
+            NOTE: "remat" here is NOT activation recomputation/checkpointing.
+
+        expert_gtp_remat_size (int, default = 1):
+            Expert-side counterpart of ``gtp_remat_size`` — shards routed-expert
+            weights along ``out_features`` and rematerializes per-weight on
+            every forward AND backward pass. A first-class orthogonal axis on the
+            expert grid. Independent from ``gtp_remat_size``. Maps to
+            ``ModelParallelConfig.expert_gtp_weight_remat_size``.
 
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
@@ -693,9 +798,26 @@ def initialize_model_parallel(
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
+    world_size: int = (
+        local_world_size if local_world_size is not None else torch.distributed.get_world_size()
+    )
 
-    model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+    # GTP_remat requires a single distributed-optimizer instance: partial-distopt sharding of the
+    # data domain would need gtp_remat-aware sizing. Assert early so all group builds below can
+    # assume one instance when GTP_remat/EGTP is active.
+    assert not (
+        (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
+        and num_distributed_optimizer_instances > 1
+    ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
+
+    # gtp_remat counts toward model_size (it consumes its own ranks and carries distinct data),
+    # so data_parallel_size becomes the replicate degree.
+    model_size = (
+        tensor_model_parallel_size
+        * pipeline_model_parallel_size
+        * context_parallel_size
+        * gtp_remat_size
+    )
 
     if world_size % model_size != 0:
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
@@ -732,21 +854,28 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
+    decoder_order = _inject_gtp_remat_axis(order, after="tp")
+
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
         ep=1,
         dp=data_parallel_size,
         pp=pipeline_model_parallel_size,
         cp=context_parallel_size,
-        order=order,
-        rank_offset=0,
+        order=decoder_order,
+        rank_offset=rank_offset,
+        gtp_remat=gtp_remat_size,
     )
 
     # Build expert rank generator
     if expert_tensor_parallel_size is None:
         expert_tensor_parallel_size = tensor_model_parallel_size
+    # EGTP is a world-size factor for the expert grid too (mirrors gtp_remat on the dense grid).
     expert_tensor_model_pipeline_parallel_size = (
-        expert_tensor_parallel_size * expert_model_parallel_size * pipeline_model_parallel_size
+        expert_tensor_parallel_size
+        * expert_model_parallel_size
+        * pipeline_model_parallel_size
+        * expert_gtp_remat_size
     )
     expert_data_parallel_size = world_size // expert_tensor_model_pipeline_parallel_size
     if world_size % expert_tensor_model_pipeline_parallel_size != 0:
@@ -754,15 +883,16 @@ def initialize_model_parallel(
             f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
         )
 
-    # TODO: support expert specific ordering
+    expert_order = _inject_gtp_remat_axis(order, after="ep")
     expert_decoder_rank_generator = RankGenerator(
         tp=expert_tensor_parallel_size,
         ep=expert_model_parallel_size,
         dp=expert_data_parallel_size,
         pp=pipeline_model_parallel_size,
         cp=1,
-        order=order,
-        rank_offset=0,
+        order=expert_order,
+        rank_offset=rank_offset,
+        gtp_remat=expert_gtp_remat_size,
     )
 
     assert (
@@ -798,6 +928,29 @@ def initialize_model_parallel(
         data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
+    # Build the generalized tensor parallel groups.
+    # GTP_remat overlaps with the CP-DP domain because GTP_remat only shards weights
+    # while CP only shards activations — they are independent and can share ranks.
+    global _GTP_WEIGHT_REMAT_GROUP
+    global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    assert (
+        _GTP_WEIGHT_REMAT_GROUP is None
+    ), "generalized tensor parallel group is already initialized"
+    for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+        group = create_group(
+            gtp_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("gtp_remat", nccl_comm_cfgs),
+            group_desc="GTP_WEIGHT_REMAT_GROUP",
+        )
+        if rank in gtp_ranks:
+            _GTP_WEIGHT_REMAT_GROUP = group
+            _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
+
+    # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
+    if gtp_remat_size > 1:
+        create_gloo_process_groups = False
+
     # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
     if sharp_enabled_group == "dp":
         os.environ["NCCL_COLLNET_ENABLE"] = "1"
@@ -807,7 +960,7 @@ def initialize_model_parallel(
     # is eligible for using the NCCL COLLNET feature.
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
-    for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+    for ranks_with_cp in decoder_rank_generator.get_ranks("dp-cp"):
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -884,7 +1037,20 @@ def initialize_model_parallel(
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
 
-    for ranks in decoder_rank_generator.get_ranks('dp'):
+    if hybrid_context_parallel:
+        global _HYBRID_DP_CP_GROUPS
+        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+            assert (
+                len(ranks_with_cp) % 2 == 0
+            ), "Hybrid context parallel requires an even number of ranks"
+            _HYBRID_DP_CP_GROUPS.update(
+                create_hybrid_dp_cp_groups(
+                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+                )
+            )
+        # TODO: Are gloo groups needed for hybrid cp?
+
+    for ranks in decoder_rank_generator.get_ranks("dp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -901,6 +1067,48 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
+    # Full data-distribution groups: span gtp_remat explicitly
+    # ('gtp_remat-dp' / 'gtp_remat-dp-cp'). Used only for batch split, num-microbatches, gradient
+    # scaling, and reductions covering every distinct-data rank. No Gloo (data distribution uses
+    # ranks/sizes only). When GTP_remat is inactive they alias the default groups built above.
+    global _DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+    if gtp_remat_size > 1:
+        # Every rank iterates all groups so each create_group collective is entered by all ranks.
+        for dp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp"):
+            group = create_group(
+                dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp_remat_dp", nccl_comm_cfgs),
+                group_desc="DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
+            )
+            if rank in dp_ranks:
+                _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
+
+        for dp_cp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp-cp"):
+            group = create_group(
+                dp_cp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp_remat_dp_cp", nccl_comm_cfgs),
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+            )
+            if rank in dp_cp_ranks:
+                _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = group
+
+        # GTP_remat requires a single distributed-optimizer instance (asserted above), so the
+        # per-instance partial full group is just the full group.
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
+            _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+        )
+    else:
+        # GTP_remat inactive: the full data-distribution groups coincide with the defaults.
+        _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = _DATA_PARALLEL_GROUP
+        _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = _DATA_PARALLEL_GROUP_WITH_CP
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        )
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
@@ -931,11 +1139,12 @@ def initialize_model_parallel(
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
-    # Build the model-parallel groups.
+    # Model-parallel groups (TP × GTP_remat × PP). gtp_remat is a RankGenerator axis, so the
+    # 'tp-gtp_remat-pp' token spans it directly; with gtp_remat=1 it reduces to plain tp-pp groups.
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-pp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1085,7 +1294,10 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-dp-cp'):
+    # Spans gtp_remat (like dp): gtp_remat peers are distinct-data ranks, so this group serves both
+    # FP8 amax reduction and the MoE router's expert-bias / load-balancing token reduction. The
+    # gtp_remat axis is a no-op when its size is 1.
+    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp-cp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1094,7 +1306,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-dp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1119,8 +1331,28 @@ def initialize_model_parallel(
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
 
     ### Expert-related parallel groups initialization
+    # Build the expert generalized tensor parallel group
+    # Expert GTP_remat overlaps with the expert DP domain (experts don't use CP).
+    global _EXPERT_GTP_WEIGHT_REMAT_GROUP
+    global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    assert (
+        _EXPERT_GTP_WEIGHT_REMAT_GROUP is None
+    ), 'Expert generalized tensor parallel group is already initialized'
+    # EGTP shard groups are get_ranks('gtp_remat') on the expert generator (singletons when
+    # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
+    for egtp_ranks in expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size):
+        group = create_group(
+            egtp_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("expt_gtp_remat", nccl_comm_cfgs),
+            group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
+        )
+        if rank in egtp_ranks:
+            _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
+            _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
+
     # Build the expert model parallel group
-    global _EXPERT_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
@@ -1131,6 +1363,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            _EXPERT_MODEL_PARALLEL_RANKS = ranks
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1177,6 +1410,22 @@ def initialize_model_parallel(
         if rank in ranks:
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
 
+    # Expert+tensor+pipeline group merged across EGTP peers — expert analog of the dense
+    # _MODEL_PARALLEL_GROUP merge (above). The 'tp-ep-gtp_remat-pp' token spans the egtp axis; with
+    # expert_gtp_remat_size=1 it reduces to the plain tp-ep-pp groups. Merging gives EGTP peers
+    # distinct ranks; see docs/api-guide/core/generalized_tensor_parallel.md §3.3
+    # (Optimizer state) for the DCP-collision rationale.
+    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
+    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-gtp_remat-pp'):
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_ep_gtp_remat_pp", nccl_comm_cfgs),
+            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
+        )
+        if rank in ranks:
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = group
+
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
@@ -1202,7 +1451,10 @@ def initialize_model_parallel(
         expert_data_parallel_size // num_distributed_optimizer_instances
     )
 
-    for ranks in expert_decoder_rank_generator.get_ranks('dp'):
+    # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
+    if expert_gtp_remat_size > 1:
+        create_gloo_process_groups = False
+    for ranks in expert_decoder_rank_generator.get_ranks("dp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1258,6 +1510,29 @@ def initialize_model_parallel(
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    # Full expert data-distribution group: spans gtp_remat explicitly. Used only
+    # where distinct-data distribution matters; no Gloo. Aliases the default when EGTP is inactive.
+    global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    if expert_gtp_remat_size > 1:
+        for dp_ranks in expert_decoder_rank_generator.get_ranks("gtp_remat-dp"):
+            group = create_group(
+                dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_gtp_remat_dp", nccl_comm_cfgs),
+                group_desc="EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
+            )
+            if rank in dp_ranks:
+                _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
+            _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+        )
+    else:
+        _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = _EXPERT_DATA_PARALLEL_GROUP
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        )
+
     ### End of expert related parallel groups initialization
 
     # build the intra distributed optimizer instance group
@@ -1266,21 +1541,40 @@ def initialize_model_parallel(
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
     ), "Intra distributed optimizer instance group is already initialized"
 
-    model_parallel_group_id = 0
-    intra_dist_opt_ranks = []
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
-        model_parallel_group_id += 1
-        intra_dist_opt_ranks.extend(ranks)
-        if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
-            intra_dist_opt_instance_group = create_group(
-                intra_dist_opt_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
-                group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
-            )
-            if rank in intra_dist_opt_ranks:
-                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
-            intra_dist_opt_ranks = []
+    if gtp_remat_size > 1 or expert_gtp_remat_size > 1:
+        # GTP_remat requires num_distributed_optimizer_instances == 1 (asserted above); dist-opt
+        # grad-stats group (used only for grad-norm + num_zeros reductions) must span the ENTIRE
+        # world. The per-instance accumulation below would NOT: gtp/egtp are factored out of
+        # expert_data_parallel_size (via expert_gtp_remat_size), so expert-generator groups omit
+        # gtp/egtp axes — under-counting the grad-norm for gtp/egtp-sharded params. Build one
+        # full-world group from all tp-ep-pp groups instead (get_ranks already applies rank_offset).
+        all_ranks = sorted(
+            r for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp') for r in ranks
+        )
+        intra_dist_opt_instance_group = create_group(
+            all_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
+            group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+        )
+        if rank in all_ranks:
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+    else:
+        model_parallel_group_id = 0
+        intra_dist_opt_ranks = []
+        for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
+            model_parallel_group_id += 1
+            intra_dist_opt_ranks.extend(ranks)
+            if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
+                intra_dist_opt_instance_group = create_group(
+                    intra_dist_opt_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
+                    group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+                )
+                if rank in intra_dist_opt_ranks:
+                    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+                intra_dist_opt_ranks = []
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -1289,19 +1583,104 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+    """
+    Helper function to create all-gather process groups for AG/RS overlap.
+
+    Creates separate communicators with the same ranks as data parallel groups
+    to enable overlapping all-gather operations with reduce-scatter operations.
+
+    Args:
+        for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
+        timeout (timedelta): Timeout for distributed collectives.
+        nccl_comm_cfgs (dict): NCCL communicator configurations.
+
+    Returns:
+        tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
+               if for_expert_parallelism=False.
+
+    Example:
+        # After initialize_model_parallel():
+        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+            for_expert_parallelism=True
+        )
+
+        # Add to ProcessGroupCollection:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
+    """
+    if not is_initialized():
+        raise RuntimeError(
+            "create_all_gather_groups() requires parallel state to be initialized. "
+            "Call initialize_model_parallel() first."
+        )
+
+    rank = torch.distributed.get_rank()
+    pp_size = get_pipeline_model_parallel_world_size()
+    cp_size = get_context_parallel_world_size()
+    tp_size = get_tensor_model_parallel_world_size()
+    ep_size = get_expert_model_parallel_world_size()
+    dp_size = get_data_parallel_world_size()
+    gtp_remat_size = get_gtp_weight_remat_world_size() or 1
+
+    # Create regular DP all-gather group
+    dp_cp_ag_group = None
+    decoder_rank_gen = RankGenerator(
+        tp=tp_size,
+        ep=1,
+        dp=dp_size,
+        pp=pp_size,
+        cp=cp_size,
+        gtp_remat=gtp_remat_size,
+        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='tp'),
+        rank_offset=0,
+    )
+
+    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+        group_with_cp_ag = create_group(
+            ranks_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+        )
+        if rank in ranks_with_cp:
+            dp_cp_ag_group = group_with_cp_ag
+
+    # Create expert DP all-gather group if requested
+    expt_dp_ag_group = None
+    if for_expert_parallelism and ep_size > 1:
+        expert_tp_size = get_expert_tensor_parallel_world_size()
+        expert_dp_size = get_expert_data_parallel_world_size()
+        egtp_remat_size = get_expert_gtp_weight_remat_world_size() or 1
+
+        expert_rank_gen = RankGenerator(
+            tp=expert_tp_size,
+            ep=ep_size,
+            dp=expert_dp_size,
+            pp=pp_size,
+            cp=1,
+            gtp_remat=egtp_remat_size,
+            order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='ep'),
+            rank_offset=0,
+        )
+
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+            expert_dp_ag = create_group(
+                expert_dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+            )
+            if rank in expert_dp_ranks:
+                expt_dp_ag_group = expert_dp_ag
+
+    return dp_cp_ag_group, expt_dp_ag_group
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
-
-
-def is_unitialized() -> bool:
-    """Check if parallel state has been initialized
-
-    Deprecated. Use is_initialized instead.
-
-    """
-    warnings.warn("is_unitialized is deprecated, use is_initialized instead", DeprecationWarning)
-    return not is_initialized()
 
 
 def model_parallel_is_initialized():
@@ -1331,6 +1710,42 @@ def get_tensor_model_parallel_group(check_initialized=True):
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
+def get_gtp_weight_remat_group(check_initialized=True):
+    """Get the parameter-sharding group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _GTP_WEIGHT_REMAT_GROUP is not None
+        ), "generalized tensor parallel group is not initialized"
+    return _GTP_WEIGHT_REMAT_GROUP
+
+
+def get_gtp_weight_remat_world_size():
+    """Return world size for the parameter-sharding group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_gtp_weight_remat_group(check_initialized=False)
+        return group.size() if group is not None else 0
+    else:
+        return 0
+
+
+def get_gtp_weight_remat_rank():
+    """Return caller's rank in the parameter-sharding group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_gtp_weight_remat_group(check_initialized=False)
+        return group.rank() if group is not None else 0
+    else:
+        return 0
+
+
+def get_gtp_weight_remat_global_ranks(check_initialized=True):
+    """Get all global ranks of the parameter-sharding group that the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
+        ), "generalized tensor parallel group is not initialized"
+    return _GTP_WEIGHT_REMAT_GLOBAL_RANKS
+
+
 def get_pipeline_model_parallel_group(check_initialized=True):
     """Get the pipeline-model-parallel group the caller rank belongs to."""
     if check_initialized:
@@ -1340,22 +1755,56 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
-    """Get the data-parallel group the caller rank belongs to."""
-    if with_context_parallel:
-        if partial_data_parallel:
-            assert (
-                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
-            ), "Intra partial data parallel group is not initialized"
-            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        assert (
-            _DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), "data parallel group with context parallel combined is not initialized"
-        return _DATA_PARALLEL_GROUP_WITH_CP
+def get_data_parallel_group(
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
+):
+    """Get the data-parallel group the caller rank belongs to.
+
+    GTP_remat is an independent axis layered on DP.
+    DEFAULT (``with_gtp_remat=True``): full data-distribution group (replicate_DP x
+    gtp_remat) — gtp_remat peers hold distinct micro-batches, so use it for batch split,
+    num-microbatches, grad scaling, and reductions over all distinct-data ranks.
+    ``with_gtp_remat=False``: replicate group — grad all-reduce, optimizer-state
+    sharding, checkpoint replicas.
+
+    Args:
+        with_context_parallel: If True, include context-parallel ranks.
+        with_gtp_remat: True (default) = full data-distribution group; False = replicate.
+        partial_data_parallel: If True, return partial DP group (requires with_context_parallel).
+    """
+    assert (
+        with_context_parallel or not partial_data_parallel
+    ), "Partial DP for Optimizer needs to include CP"
+    # (with_cp, partial_data_parallel) -> (group, description). Globals are read at call time
+    # (assigned during initialize_model_parallel). partial requires CP, so the (False, True) row
+    # is unreachable and omitted.
+    if with_gtp_remat:
+        group_table = {
+            (False, False): (
+                _DATA_PARALLEL_GROUP_WITH_GTP_REMAT,
+                "data parallel group (with GTP_remat)",
+            ),
+            (True, False): (
+                _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT,
+                "data parallel group with CP (with GTP_remat)",
+            ),
+            (True, True): (
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT,
+                "intra partial data parallel group with CP (with GTP_remat)",
+            ),
+        }
     else:
-        assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
-        assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
-        return _DATA_PARALLEL_GROUP
+        group_table = {
+            (False, False): (_DATA_PARALLEL_GROUP, "data parallel group"),
+            (True, False): (_DATA_PARALLEL_GROUP_WITH_CP, "data parallel group with CP"),
+            (True, True): (
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP,
+                "intra partial data parallel group with CP",
+            ),
+        }
+    group, description = group_table[(with_context_parallel, partial_data_parallel)]
+    assert group is not None, f"{description} is not initialized"
+    return group
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -1399,6 +1848,18 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
+def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Get the hybrid context parallel groups the caller rank belongs to."""
+    # If the group size is the same as the entire DPxCP group, return the original group
+    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+        if check_initialized:
+            assert _DATA_PARALLEL_GROUP_WITH_CP is not None
+        return _DATA_PARALLEL_GROUP_WITH_CP
+    if check_initialized:
+        assert _HYBRID_DP_CP_GROUPS is not None
+    return _HYBRID_DP_CP_GROUPS[group_size]
+
+
 def get_embedding_group(check_initialized=True):
     """Get the embedding group the caller rank belongs to."""
     if check_initialized:
@@ -1440,7 +1901,11 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
 
 
 def get_tensor_and_data_parallel_group(check_initialized=True, with_context_parallel=False):
-    """Get the tensor- and data-parallel group the caller rank belongs to."""
+    """Get the tensor- and data-parallel group the caller rank belongs to.
+
+    The group spans gtp_remat (like dp), so it serves both FP8 amax reduction and the MoE router's
+    expert-bias / load-balancing token reduction across every distinct-data rank.
+    """
     if with_context_parallel:
         if check_initialized:
             assert (
@@ -1652,14 +2117,22 @@ def get_pipeline_model_parallel_prev_rank():
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
-def get_data_parallel_world_size(with_context_parallel=False, partial_data_parallel=False):
-    """Return world size for the data parallel group."""
+def get_data_parallel_world_size(
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
+):
+    """Return the data-parallel world size.
+
+    DEFAULT (with_gtp_remat=True): full degree (replicate_DP x gtp_remat).
+    with_gtp_remat=False: replicate degree.
+    """
     global _MPU_DATA_PARALLEL_WORLD_SIZE
     if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
         return _MPU_DATA_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_data_parallel_group(
-            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+            with_context_parallel=with_context_parallel,
+            with_gtp_remat=with_gtp_remat,
+            partial_data_parallel=partial_data_parallel,
         ).size()
     else:
         return 0
@@ -1671,14 +2144,22 @@ def set_data_parallel_rank(rank):
     _MPU_DATA_PARALLEL_RANK = rank
 
 
-def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=False):
-    """Return caller's rank in the data-parallel group."""
+def get_data_parallel_rank(
+    with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
+):
+    """Return the caller's data-parallel rank.
+
+    DEFAULT (with_gtp_remat=True): rank in the full group (replicate_DP x gtp_remat).
+    with_gtp_remat=False: rank in the replicate group.
+    """
     global _MPU_DATA_PARALLEL_RANK
     if _MPU_DATA_PARALLEL_RANK is not None:
         return _MPU_DATA_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_data_parallel_group(
-            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+            with_context_parallel=with_context_parallel,
+            with_gtp_remat=with_gtp_remat,
+            partial_data_parallel=partial_data_parallel,
         ).rank()
     else:
         return 0
@@ -1717,6 +2198,42 @@ def get_tensor_and_context_parallel_rank():
 
 
 ### Expert-related parallel states functions
+def get_expert_gtp_weight_remat_group(check_initialized=True):
+    """Get the expert-parameter-sharding group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _EXPERT_GTP_WEIGHT_REMAT_GROUP is not None
+        ), "expert generalized tensor parallel group is not initialized"
+    return _EXPERT_GTP_WEIGHT_REMAT_GROUP
+
+
+def get_expert_gtp_weight_remat_world_size():
+    """Return world size for the expert-parameter-sharding group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_expert_gtp_weight_remat_group(check_initialized=False)
+        return group.size() if group is not None else 0
+    else:
+        return 0
+
+
+def get_expert_gtp_weight_remat_rank():
+    """Return caller's rank in the expert-parameter-sharding group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_expert_gtp_weight_remat_group(check_initialized=False)
+        return group.rank() if group is not None else 0
+    else:
+        return 0
+
+
+def get_expert_gtp_weight_remat_global_ranks(check_initialized=True):
+    """Get all global ranks of the expert-parameter-sharding group that the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
+        ), "expert generalized tensor parallel group is not initialized"
+    return _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
+
+
 def get_expert_model_parallel_group(check_initialized=True):
     """Get the expert-model-parallel group the caller rank belongs to."""
     if check_initialized:
@@ -1724,6 +2241,15 @@ def get_expert_model_parallel_group(check_initialized=True):
             _EXPERT_MODEL_PARALLEL_GROUP is not None
         ), "expert model parallel group is not initialized"
     return _EXPERT_MODEL_PARALLEL_GROUP
+
+
+def get_expert_model_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the expert model parallel group."""
+    assert (
+        _EXPERT_MODEL_PARALLEL_RANKS is not None
+    ), "Expert model parallel group is not initialized"
+    return _EXPERT_MODEL_PARALLEL_RANKS[0]
 
 
 def get_expert_model_parallel_world_size():
@@ -1829,8 +2355,23 @@ def get_expert_tensor_and_model_parallel_rank():
         return 0
 
 
-def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
-    """Get expert tensor-model-pipeline parallel group."""
+def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, with_egtp_remat=False):
+    """Get expert tensor-model-pipeline parallel group.
+
+    Args:
+        check_initialized: If True (default), asserts the group has been created.
+        with_egtp_remat: If True, return the EGTP-merged variant — the analog of dense
+            ``get_model_parallel_group()`` (which merges across GTP peers). Use this when you
+            need a group whose rank uniquely identifies each (ETP, EP, PP, EGTP) position;
+            e.g. for the MoE distributed optimizer's ``data_parallel_group_idx``. Identical
+            to the vanilla group when EGTP_remat_size=1.
+    """
+    if with_egtp_remat:
+        if check_initialized:
+            assert (
+                _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP is not None
+            ), "Expert tensor-model-pipeline parallel group with EGTP is not initialized"
+        return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
     if check_initialized:
         assert (
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
@@ -1838,30 +2379,36 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False):
-    """Get expert data parallel group."""
-    if partial_expert_data_parallel:
-        if check_initialized:
-            assert (
-                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
-            ), "Intra partial expert data parallel group is not initialized"
-        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
-    else:
-        if check_initialized:
-            assert (
-                _EXPERT_DATA_PARALLEL_GROUP is not None
-            ), "Expert data parallel group is not initialized"
-        return _EXPERT_DATA_PARALLEL_GROUP
+def get_expert_data_parallel_group(
+    check_initialized=True, with_gtp_remat=True, partial_expert_data_parallel=False
+):
+    """Get the expert data parallel group.
 
-
-def get_data_modulo_expert_parallel_group(partial_expert_data_parallel=False):
-    """[Deprecated] Get expert data parallel group."""
-    warnings.warn(
-        "get_data_modulo_expert_parallel_group is deprecated, please use "
-        "get_expert_data_parallel_group instead.",
-        DeprecationWarning,
-    )
-    return get_expert_data_parallel_group(partial_expert_data_parallel=partial_expert_data_parallel)
+    DEFAULT (with_gtp_remat=True): full group for data distribution (EGTP_remat peers
+    hold distinct micro-batches).
+    with_gtp_remat=False: replicate group — expert grad all-reduce, optimizer state,
+    checkpoint replicas.
+    """
+    # (with_gtp_remat, partial_expert_data_parallel) -> (group, description). Read at call time.
+    group_table = {
+        (False, False): (_EXPERT_DATA_PARALLEL_GROUP, "Expert data parallel group"),
+        (False, True): (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+            "Intra partial expert data parallel group",
+        ),
+        (True, False): (
+            _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT,
+            "Expert data parallel group (with GTP_remat)",
+        ),
+        (True, True): (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT,
+            "Intra partial expert data parallel group (with GTP_remat)",
+        ),
+    }
+    group, description = group_table[(with_gtp_remat, partial_expert_data_parallel)]
+    if check_initialized:
+        assert group is not None, f"{description} is not initialized"
+    return group
 
 
 def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
@@ -1878,21 +2425,21 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
         return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
-def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
-    """Return caller's rank in the expert data parallel group."""
+def get_expert_data_parallel_rank(with_gtp_remat=True, partial_expert_data_parallel=False):
+    """Return the caller's expert-data-parallel rank (default: EGTP_remat-inclusive)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
-            partial_expert_data_parallel=partial_expert_data_parallel
+            with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel
         ).rank()
     else:
         return 0
 
 
-def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
-    """Return world size for the expert data parallel group."""
+def get_expert_data_parallel_world_size(with_gtp_remat=True, partial_expert_data_parallel=False):
+    """Return the expert-data-parallel world size (default: EGTP_remat-inclusive)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
-            partial_expert_data_parallel=partial_expert_data_parallel
+            with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel
         ).size()
     else:
         return 0
@@ -1930,29 +2477,10 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
-def _set_global_symmetric_memory_buffer():
-    """Initialize global buffer."""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
-
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256,  # todo: set from an argument?
-        process_group=get_tensor_model_parallel_group(),
-    )
-
-
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
-
-
-def get_global_symmetric_memory_buffer():
-    """Return the global GlobalSymmetricMemoryBuffer object"""
-    assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
-    ), "global symmetric memory buffer is not initialized"
-    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
 
 
 def destroy_global_memory_buffer():
@@ -1961,17 +2489,12 @@ def destroy_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = None
 
 
-def destroy_global_symmetric_memory_buffer():
-    """Sets the global symmetric memory buffer to None"""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
-
-
 def get_all_ranks():
     """Get caller's rank in tensor-model-parallel, data-parallel, context-parallel,
     pipeline-model-parallel and expert-model-parallel groups."""
     ranks = [
         get_tensor_model_parallel_rank(),
+        get_gtp_weight_remat_rank(),
         get_data_parallel_rank(),
         get_context_parallel_rank(),
         get_pipeline_model_parallel_rank(),
@@ -1982,11 +2505,28 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
+    # process group's communicator is torn down. TE registers an atexit ep_finalize that would
+    # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
+    # Idempotent and a no-op when NCCL EP was never bootstrapped.
+    try:
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+
+        nccl_ep_finalize()
+    except Exception:  # finalize must never block teardown
+        pass
+
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _GTP_WEIGHT_REMAT_GROUP
+    _GTP_WEIGHT_REMAT_GROUP = None
+
+    global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -1994,8 +2534,17 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
 
+    global _DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
+
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+    _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
@@ -2042,9 +2591,6 @@ def destroy_model_parallel():
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
 
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
-
     global _DATA_PARALLEL_GROUP_GLOO
     if (
         _DATA_PARALLEL_GROUP_GLOO is not None
@@ -2066,6 +2612,12 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     # Destroy parallel state related to expert parallelism.
+    global _EXPERT_GTP_WEIGHT_REMAT_GROUP
+    _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+
+    global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
 
@@ -2090,8 +2642,17 @@ def destroy_model_parallel():
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 
+    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
+    _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
+
     global _EXPERT_DATA_PARALLEL_GROUP
     _EXPERT_DATA_PARALLEL_GROUP = None
+
+    global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
+
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
@@ -2127,3 +2688,5 @@ def destroy_model_parallel():
 
     global _global_process_group_list
     _global_process_group_list = None
+
+    SymmetricMemoryManager.destroy()
