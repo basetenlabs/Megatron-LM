@@ -16,6 +16,27 @@ pytestmark = pytest.mark.skipif(
     reason="TE GroupedLinear is only supported in TE 1.9.0.dev0 and later.",
 )
 
+requires_legacy_grouped_linear = pytest.mark.skipif(
+    not frozen_quantized._supports_grouped_linear_abi(frozen_quantized._TEGroupedLinearAutograd),
+    reason="This optimization uses TE's legacy grouped-linear ABI; newer TE uses the public path.",
+)
+
+
+def test_new_grouped_linear_abi_falls_back_before_materializing(monkeypatch) -> None:
+    class NewGroupedLinear:
+        @staticmethod
+        def forward(ctx, inp, m_splits, non_tensor_args, out, dgrad_out, *weights_and_biases):
+            raise AssertionError("Private ABI must not be called")
+
+    monkeypatch.setattr(frozen_quantized, "_TEGroupedLinearAutograd", NewGroupedLinear)
+    monkeypatch.setattr(frozen_quantized, "_uses_frozen_quantized_storage", lambda _: True)
+
+    result = frozen_quantized.try_frozen_quantized_to_bf16_forward(
+        object(), None, [], is_first_microbatch=None
+    )
+
+    assert result is None
+
 
 def _frozen_fp8_grouped_linear(num_gemms=2, features=128):
     qparams = te_ext.te.common.recipe.QParams(power_2_scale=False)
@@ -114,6 +135,7 @@ def test_dequantize_nvfp4_weights_to_bf16_matches_te_dequantize() -> None:
     not te_ext.is_te_min_version("2.7.0.dev0"),
     reason="NVFP4 tensors require Transformer Engine 2.7.0.dev0 or later.",
 )
+@requires_legacy_grouped_linear
 def test_frozen_nvfp4_to_bf16_forward_matches_reference() -> None:
     grouped_linear = _frozen_nvfp4_grouped_linear()
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
@@ -261,6 +283,7 @@ def test_without_frozen_fp8_recipe_defers_to_normal_te() -> None:
     assert output is None
 
 
+@requires_legacy_grouped_linear
 def test_temporary_bf16_weights_follow_autograd_lifetime() -> None:
     grouped_linear = _frozen_fp8_grouped_linear()
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
@@ -312,6 +335,7 @@ def test_temporary_bf16_weights_follow_autograd_lifetime() -> None:
     assert all(weight.grad is None for weight in grouped_linear.parameters())
 
 
+@requires_legacy_grouped_linear
 def test_frozen_fp8_to_bf16_forward_matches_reference() -> None:
     grouped_linear = _frozen_fp8_grouped_linear()
     input_tensor = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)

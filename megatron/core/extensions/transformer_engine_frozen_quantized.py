@@ -24,6 +24,7 @@ trainers stack is expected to satisfy the runtime contract below.
 from __future__ import annotations
 
 from functools import cache
+from inspect import signature
 from typing import Any, Callable
 
 import torch
@@ -47,6 +48,13 @@ _NVFP4_E4M3_MAX = 448.0
 
 # Three magnitude bits index this table; the fourth bit carries the sign.
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+@cache
+def _supports_grouped_linear_abi(autograd_function: type) -> bool:
+    # Newer TE takes splits/output buffers separately; use its public path instead.
+    expected = ("ctx", "inp", "non_tensor_args", "weights_and_biases")
+    return tuple(signature(autograd_function.forward).parameters) == expected
 
 
 def _dequantize_fp8_weights_to_bf16(
@@ -262,6 +270,8 @@ def try_frozen_quantized_to_bf16_forward(
 ) -> Tensor | None:
     """Return the optimized output, or ``None`` to use TE's public forward path."""
     if not _uses_frozen_quantized_storage(grouped_linear):
+        return None
+    if not _supports_grouped_linear_abi(_TEGroupedLinearAutograd):
         return None
 
     assert grouped_linear.training
