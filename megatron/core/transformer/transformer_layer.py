@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
-    from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import (
-        DSATopKCache,
+    from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+        DSAForwardContext,
     )
 
 import torch
@@ -769,9 +769,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+<<<<<<< HEAD
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         dsa_topk_cache: DSATopKCache | None = None,
+=======
+        dsa_forward_context: DSAForwardContext | None = None,
+>>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -795,12 +799,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
+<<<<<<< HEAD
             input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
                 signature for the MLP phase. Self-attention does not consume them; hash-routed
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
             dsa_topk_cache (DSATopKCache, optional): Top-k state for this microbatch's DSA layers.
+=======
+            dsa_forward_context (DSAForwardContext, optional): State shared by this
+                microbatch's DSA layers.
+>>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -825,7 +834,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self._set_proj_residual(residual)
 
         dsa_kwargs = (
-            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+            {"dsa_forward_context": dsa_forward_context} if dsa_forward_context is not None else {}
         )
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
