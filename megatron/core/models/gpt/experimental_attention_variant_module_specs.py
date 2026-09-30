@@ -11,7 +11,6 @@ from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
 )
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -22,7 +21,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+<<<<<<< HEAD
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+=======
+from megatron.core.transformer.experimental_attention_variant.glm_absorbed_mla import (
+    GlmAbsorbedMLASelfAttention,
+)
+>>>>>>> 5f6cd05e4 ([baseten] support LoRA on absorbed GLM MLA)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -113,7 +118,7 @@ def get_dsa_module_spec_for_backend(
     )
 
     attention = ModuleSpec(
-        module=AbsorbedMLASelfAttention,
+        module=GlmAbsorbedMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
         submodules=AbsorbedMLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
