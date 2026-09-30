@@ -384,6 +384,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+<<<<<<< HEAD
                     **layer_kwargs,
                 )
             if layer_config.enable_mhc_connections and not getattr(
@@ -393,6 +394,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     f"{type(module).__name__} does not implement mHC residual streams. Build "
                     "TransformerBlock with HyperConnectionTransformerLayer when "
                     "enable_mhc_connections=True."
+=======
+                    name=f"decoder.layers.{global_layer_number - 1}",
+>>>>>>> f1c7d602b (feat(te): support frozen blockwise FP8 parameters (#67))
                 )
             return module
 
