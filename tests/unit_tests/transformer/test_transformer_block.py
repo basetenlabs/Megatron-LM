@@ -21,14 +21,11 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
-<<<<<<< HEAD
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
-=======
 from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
     TransformerLayer,
     get_transformer_layer_offset,
 )
->>>>>>> a7234ad55 (fix(pp): honour the explicit pp_rank under a custom pipeline layout)
 from tests.unit_tests.test_utilities import Utils
 
 
