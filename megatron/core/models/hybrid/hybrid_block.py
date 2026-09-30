@@ -41,14 +41,11 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
-<<<<<<< HEAD
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-=======
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
@@ -521,13 +518,10 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
-<<<<<<< HEAD
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
-=======
         dsa_topk_cache: DSATopKCache | None = None,
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
     ):
         """
         Forward function of the HybridStack class.
@@ -676,12 +670,9 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
-<<<<<<< HEAD
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-=======
                     transformer_layer_kwargs=dsa_layer_kwargs,
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
@@ -691,7 +682,6 @@ class HybridStack(MegatronModule):
                         self.layers,
                         strict=True,
                     )
-<<<<<<< HEAD
                 ):
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[layer_idx]
@@ -709,19 +699,6 @@ class HybridStack(MegatronModule):
                         if residual_stream_recompute_context is not None:
                             raise TypeError(
                                 "Residual-stream recomputation does not support ShortcutMoEBlock."
-=======
-                    with inner_quant_context:
-                        if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
-                                padding_mask=padding_mask,
-                                **dsa_layer_kwargs,
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
                             )
                         hidden_states = layer(
                             hidden_states=hidden_states,
@@ -779,6 +756,8 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
+                                if isinstance(layer, TransformerLayer):
+                                    layer_kwargs.update(dsa_layer_kwargs)
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(

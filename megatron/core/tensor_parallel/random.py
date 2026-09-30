@@ -672,17 +672,8 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-<<<<<<< HEAD
-            _set_in_recompute_phase()
-            try:
-                with torch.enable_grad(), suspend_tensor_observations():
-                    outputs = ctx.run_function(*detached_inputs)
-            finally:
-                _unset_in_recompute_phase()
-=======
-            with torch.enable_grad():
+            with torch.enable_grad(), suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

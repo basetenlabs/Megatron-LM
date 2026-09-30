@@ -439,20 +439,16 @@ class MultiLatentAttention(Attention):
 
         core_attention_extra_kwargs = {}
         if getattr(self.core_attention, "requires_dsa_inputs", False):
-<<<<<<< HEAD
-            core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
-        if self._use_fused_q_uproj and self.training:
-            # Fused path fed pre-quantized MXFP8 q/k/v (is_input_fp8). Return bf16
-            # grads (skip attention's backward re-quantize) so the Q/KV backward
-            # paths receive plain bf16 gradients -- no swizzled-fp8 dequant needed.
-            core_attention_extra_kwargs["bf16_backward"] = True
-=======
             core_attention_extra_kwargs = {
                 "x": hidden_states,
                 "qr": q_compressed,
                 "dsa_topk_cache": dsa_topk_cache,
             }
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
+        if self._use_fused_q_uproj and self.training:
+            # Fused path fed pre-quantized MXFP8 q/k/v (is_input_fp8). Return bf16
+            # grads (skip attention's backward re-quantize) so the Q/KV backward
+            # paths receive plain bf16 gradients -- no swizzled-fp8 dequant needed.
+            core_attention_extra_kwargs["bf16_backward"] = True
 
         # ==================================
         # core attention computation

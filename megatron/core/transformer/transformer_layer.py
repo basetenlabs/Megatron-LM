@@ -769,12 +769,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-<<<<<<< HEAD
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-=======
         dsa_topk_cache: DSATopKCache | None = None,
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -798,15 +795,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
-<<<<<<< HEAD
             input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
                 signature for the MLP phase. Self-attention does not consume them; hash-routed
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
-=======
             dsa_topk_cache (DSATopKCache, optional): Top-k state for this microbatch's DSA layers.
->>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
