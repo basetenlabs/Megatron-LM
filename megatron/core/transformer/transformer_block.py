@@ -25,6 +25,7 @@ from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     build_mhc_recompute_layer_plan,
@@ -681,6 +682,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
             use_mhc_recompute=use_mhc_recompute,
         )
+        dsa_topk_cache = (
+            DSATopKCache() if self.config.experimental_attention_variant == "dsa" else None
+        )
+        dsa_layer_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -695,6 +702,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
+                    transformer_layer_kwargs=dsa_layer_kwargs,
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
@@ -753,6 +761,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **dsa_layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(

@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+    from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import (
+        DSATopKCache,
+    )
 
 import torch
 import torch.distributed
@@ -766,8 +769,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+<<<<<<< HEAD
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+=======
+        dsa_topk_cache: DSATopKCache | None = None,
+>>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -791,11 +798,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
+<<<<<<< HEAD
             input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
                 signature for the MLP phase. Self-attention does not consume them; hash-routed
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
+=======
+            dsa_topk_cache (DSATopKCache, optional): Top-k state for this microbatch's DSA layers.
+>>>>>>> 75c97e817 (fix(dsa): bound shared top-k cache lifetime (#74))
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -819,6 +830,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
+        dsa_kwargs = (
+            {"dsa_topk_cache": dsa_topk_cache} if dsa_topk_cache is not None else {}
+        )
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
@@ -832,6 +846,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **dsa_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 
