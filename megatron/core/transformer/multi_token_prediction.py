@@ -33,16 +33,11 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-<<<<<<< HEAD
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
-from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-=======
 from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
     DSAForwardContext,
 )
-from megatron.core.transformer.module import MegatronModule
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
+from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -1749,13 +1744,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
-<<<<<<< HEAD
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
-=======
         dsa_forward_context: DSAForwardContext | None = None,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -1797,13 +1788,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
-<<<<<<< HEAD
                         packed_seq_params_by_layout=packed_seq_params_by_layout,
                         cp_layout_plan=cp_layout_plan,
-                        dsa_topk_cache=dsa_topk_cache,
-=======
                         dsa_forward_context=dsa_forward_context,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1914,13 +1901,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-<<<<<<< HEAD
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
-=======
         dsa_forward_context: DSAForwardContext | None = None,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
@@ -1965,13 +1948,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-<<<<<<< HEAD
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
-=======
                 dsa_forward_context=dsa_forward_context,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
             )
 
         # Decide the outer quantization context, matching
@@ -2065,13 +2044,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-<<<<<<< HEAD
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
-=======
                 dsa_forward_context=dsa_forward_context,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -2124,7 +2099,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-<<<<<<< HEAD
         if decoder_input is None:
             assert input_ids is not None and position_ids is not None
             (
@@ -2147,20 +2121,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             decoder_input, hidden_states = self._get_precomputed_embeddings(
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
-        dsa_topk_cache = (
-            DSATopKCache() if self.config.experimental_attention_variant == "dsa" else None
-=======
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            padding_mask=padding_mask,
-            embedding=embedding,
-            hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
-        )
         dsa_forward_context = (
             DSAForwardContext() if self.config.experimental_attention_variant == "dsa" else None
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
         )
 
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
@@ -2186,13 +2148,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-<<<<<<< HEAD
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
-=======
                 dsa_forward_context=dsa_forward_context,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -2209,13 +2167,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-<<<<<<< HEAD
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                dsa_topk_cache=dsa_topk_cache,
-=======
                 dsa_forward_context=dsa_forward_context,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask

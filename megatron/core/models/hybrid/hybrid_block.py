@@ -41,15 +41,12 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
-<<<<<<< HEAD
-from megatron.core.transformer.experimental_attention_variant.dsa_topk_cache import DSATopKCache
+from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
+    DSAForwardContext,
+)
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
-=======
-from megatron.core.transformer.experimental_attention_variant.dsa_forward_context import (
-    DSAForwardContext,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -523,14 +520,10 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
-<<<<<<< HEAD
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
-        dsa_topk_cache: DSATopKCache | None = None,
-=======
         dsa_forward_context: DSAForwardContext | None = None,
->>>>>>> 494c1d572 (perf(dsa): cache packed CP layout per microbatch (#75))
     ):
         """
         Forward function of the HybridStack class.
