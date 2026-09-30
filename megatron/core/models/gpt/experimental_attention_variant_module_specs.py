@@ -21,13 +21,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
-<<<<<<< HEAD
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
-=======
 from megatron.core.transformer.experimental_attention_variant.glm_absorbed_mla import (
     GlmAbsorbedMLASelfAttention,
 )
->>>>>>> 5f6cd05e4 ([baseten] support LoRA on absorbed GLM MLA)
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
