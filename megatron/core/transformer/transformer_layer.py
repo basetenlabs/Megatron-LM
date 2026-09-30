@@ -2182,6 +2182,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
+<<<<<<< HEAD
         unsupported_moe_cuda_graph_modules = {
             CudaGraphModule.moe,
             CudaGraphModule.moe_router,
@@ -2201,6 +2202,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self.config.cuda_graph_impl == "local":
             self.create_mcore_cudagraph_manager(self.config)
 
+=======
+>>>>>>> dee9aa669 (feat(glm5-next): GLM-5.3-Flash support)
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
             config=self.config,

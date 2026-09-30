@@ -257,6 +257,24 @@ class TestCheckpointManagerSequentialChain:
             f"With manager: {grad_ckpt}\nReference: {grad_ref}"
         )
 
+    def test_multiple_outputs_ignores_recomputed_non_grad_auxiliary(self):
+        """A detached auxiliary output contributes no input gradient."""
+
+        def func_with_auxiliary(x):
+            return x * 2, torch.ones_like(x)
+
+        input_ckpt = torch.randn(4, 4, device='cuda', requires_grad=True)
+        manager = CheckpointWithoutOutputManager()
+        value, auxiliary = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            func_with_auxiliary, input_ckpt
+        )
+        loss = (value + auxiliary).sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss)
+
+        loss.backward()
+
+        torch.testing.assert_close(input_ckpt.grad, torch.full_like(input_ckpt, 2.0))
+
 
 class TestCheckpointManagerPartialCheckpoint:
     """Test CheckpointWithoutOutputManager with partial checkpointing (some ops not checkpointed)."""
